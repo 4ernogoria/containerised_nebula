@@ -8,4 +8,6 @@ podman run -dt --ip=IPADDR --name=CONTNAME -e MYSQL_ROOT_PASSWORD=ROOTPASS -e MY
 
 The Base container contains most of apps needed, except those NGINX-PASSENGER requires. And in the nutshell other containers just start a tiny layer above, starting a defined funtion. Which are oned (by oned as the entrypoint), mm-sched (the state of it controlled by a scrypt, since its naturally daemonised nature), Nginx-passenger-sunstone (works not exactly containerly, starts a bunch of services, but the nginx's crash causes a container's death), oneflow and onegate (started as entrypoints, which means the crash is causing the containers death).
 
-Naturally command:  podman run -dt --ip=IPADDR --name=CONTAINERNAME -v VARVOLUME:/var/lib/one -v ETCVOLUME:/etc/one -p HOSTPORT:CONTAINERPORT  IMAGE_TO_USE is used to run the nebula containers
+Naturally command:
+podman run -dt --ip=IPADDR --name=CONTAINERNAME -v VARVOLUME:/var/lib/one -v ETCVOLUME:/etc/one -p HOSTPORT:CONTAINERPORT  IMAGE_TO_USE 
+is used to run the nebula containers
