@@ -14,3 +14,6 @@ The Base container contains most of apps needed, except those NGINX-PASSENGER re
 
 Naturally a command running all up is:
 podman run -dt --ip=IPADDR --name=CONTAINERNAME -v VARVOLUME:/var/lib/one -v ETCVOLUME:/etc/one -p HOSTPORT:CONTAINERPORT  IMAGE_TO_USE 
+
+NEEDS to be added:
+1) SSH no fingerprint check; Probably have to add an ssh daemon
