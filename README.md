@@ -1,7 +1,11 @@
 # containerised_nebula
 
-Basically it works like:
+!!! Since eventually the containers IP will lose the sense inside a pod, they are defined temporarily.
 
+Basically, currently it works like:
+add the execution bit to start.sh; start it from the cloned directory. It's gonna ask you a number of questions, and if the podman's IPnetwork space of yours was (10.88.0.0/24), it will build a set of images and start up containers based on them respectively, with given parameters.
+
+--- old version ---
 The Mariadb container stays aside, it is built from centos7 and contains no database by default, just needs to be set during installation a number of parameters like:
 
 podman run -dt --ip=IPADDR --name=CONTNAME -e MYSQL_ROOT_PASSWORD=ROOTPASS -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD=ONEADMINPASS -e MYSQL_DATABASE=opennebula  -v MARIADBVOLUME:/var/lib/images -p MARIADBPORT:3306 IMAGENAMEYOU'veBUILT
