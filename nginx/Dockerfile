@@ -1,4 +1,5 @@
-FROM localhost/sharx/base 
+ARG image
+FROM "$image"
 MAINTAINER SharxDC
 
 COPY *.repo /etc/yum.repos.d/

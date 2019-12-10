@@ -1,4 +1,4 @@
-FROM localhost/sharx/base 
+FROM localhost/basemg 
 MAINTAINER SharxDC
 
 COPY stnebula.sh /entrypoint.sh
