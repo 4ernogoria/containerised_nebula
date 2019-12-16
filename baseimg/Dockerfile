@@ -13,6 +13,8 @@ RUN yum -y update && yum clean all && \
                                            opennebula-node-kvm \
                                            opennebula-common  \
                                            opennebula-sunstone && \
+                                           #gem install bundler --version '<2.0' && \ not requred for v10
+                                           #/usr/share/one/install_gems --yes && \ not required for v10
                                            yum clean all && \
                                            #mkdir -p /temp/etc && \
                                            #mkdir -p /temp/var && \
