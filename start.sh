@@ -14,43 +14,47 @@
 #Oneflow vars
 #flowip=10.88.0.204
 
-read -p 'mariadb img name? (default=mdb)' mdbnm
+read -p 'mariadb img name? (default=mdb): ' mdbnm
 if [ -z $mdbnm ]
 then mdbnm=mdb
 fi
-read -p 'mariadb root passwd? (default=passwd)' mdbroot
+read -p 'mariadb root passwd? (default=passwd): ' mdbroot
 if [ -z $mdbroot ]
 then mdbroot=passwd
 fi
-read -p 'mariadb oneadmin passwd? (default=passwd)' mdbusr
+read -p 'mariadb oneadmin passwd? (default=passwd): ' mdbusr
 if [ -z $mdbusr ]
 then mdbusr=passwd
 fi
-read -p 'mariadb db volume? (default=/data/mysql)' mdbvol
+read -p 'mariadb db volume? (default=/data/mysql): ' mdbvol
 if [ -z $mdbvol ]
 then mdbvol=/data/mysql
 fi
-read -p 'log volume? (default=/data/mysql)' logvol
+read -p 'log volume? (default=/data/mysql): ' logvol
 if [ -z $logvol ]
 then logvol=/data/log
 fi
-read -p 'base img name? (default=baseimg)' basenm
+read -p 'base img name? (default=baseimg): ' basenm
 if [ -z $basenm ]
 then basenm=baseimg
 fi
-read -p 'oned img name? (default=oned)' onednm
+read -p 'oned img name? (default=oned): ' onednm
 if [ -z $onednm ]
 then onednm=oned
 fi
-read -p 'nginx img name? (default=nginx)' nginxnm
+read -p 'scheduler img name? (default=sched): ' schednm
+if [ -z $schednm ]
+then schednm=sched
+fi
+read -p 'nginx img name? (default=nginx): ' nginxnm
 if [ -z $nginxnm ]
 then nginxnm=nginx
 fi
-read -p 'flow img name? (default=flow)' flownm
+read -p 'flow img name? (default=flow): ' flownm
 if [ -z $flownm ]
 then flownm=flow
 fi
-read -p 'gate img name? (default=gate)' gatenm
+read -p 'gate img name? (default=gate): ' gatenm
 if [ -z $gatenm ]
 then gatenm=gate
 fi
@@ -83,6 +87,8 @@ cd ../baseimg
 podman build -t "$basenm" .
 cd ../oned
 podman build --build-arg image="$fullbasenm" -t "$onednm" .
+cd ../sched
+podman build --build-arg image="$fullbasenm" -t "$schednm" .
 cd ../nginx 
 podman build --build-arg image="$fullbasenm" -t "$nginxnm" .
 cd ../flow
@@ -95,8 +101,8 @@ podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYS
 sleep 5
 podman run -dt --pod $podsnm --name=onedpod -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -v "$logvol":/var/log/one "$onednm"
 sleep 5
+podman run -dt --pod $podsnm --name=schedpod -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -v "$logvol":/var/log/one "$schednm"
 podman run -dt --pod $podsnm --name=nginxpod -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -v "$logvol":/var/log/one "$nginxnm"
-podman run -dt --pod $podsnm --name=onedpod -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -v "$logvol":/var/log/one "$onednm"
 podman run -dt --pod $podsnm --name=gatepod -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -v "$logvol":/var/log/one "$gatenm"
 podman run -dt --pod $podsnm --name=flowpod -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -v "$logvol":/var/log/one "$flownm"
 #podman run -dt --ip="$mdbip" --name=mariadb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$mdbvol":/var/lib/mysql -p $mdbport:3306 "$mdbnm"

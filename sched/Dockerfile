@@ -1,4 +1,5 @@
-FROM localhost/basemg 
+ARG image
+FROM "$image"
 MAINTAINER SharxDC
 
 COPY stnebula.sh /entrypoint.sh

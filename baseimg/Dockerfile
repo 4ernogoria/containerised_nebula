@@ -13,12 +13,11 @@ RUN yum -y update && yum clean all && \
                                            opennebula-node-kvm \
                                            opennebula-common  \
                                            opennebula-sunstone && \
-                                           gem install bundler --version '<2.0' && \
-                                           /usr/share/one/install_gems --yes && \
                                            yum clean all && \
-                                           mkdir -p /temp/etc && \
-                                           mkdir -p /temp/var && \
-                                           chown -R 9869:9869 /etc/one /temp && \
-                                           mv /etc/one/* /temp/etc && \
-                                           mv /var/lib/one/* /temp/var
+                                           #mkdir -p /temp/etc && \
+                                           #mkdir -p /temp/var && \
+                                           chown -R 9869:9869 /etc/one
+                                           #chown -R 9869:9869 /temp
+                                           #mv /etc/one/* /temp/etc && \
+                                           #mv /var/lib/one/* /temp/var
 
