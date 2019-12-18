@@ -90,8 +90,8 @@ mkdir -p -m 777 "$deffold" "$deffold"/"$logvol"
 mkdir -p "$deffold"/"$varfiles"/.one && echo "oneadmin:Sonic2005" > "$deffold"/"$varfiles"/.one/one_auth
 mkdir -p "$deffold"/"$etcfiles" && chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
 mkdir -p "$deffold"/"$mdbvol" && chown -R 27:27 "$deffold"/"$mdbvol"
-cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etc_v10.tar
-cd "$deffold"/"$varfiles" && tar -xvf $currpath/var_v10.tar
+cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar
+cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar
 
 podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb "$mdbnm"
