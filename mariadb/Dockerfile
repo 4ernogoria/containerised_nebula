@@ -1,9 +1,9 @@
 FROM centos:7
 
 MAINTAINER SharxDC
-
+COPY mariadb.repo /etc/yum.repos.d/mariadb.repo
 RUN yum -y install --setopt=tsflags=nodocs epel-release && \ 
-    yum -y install --setopt=tsflags=nodocs mariadb-server pwgen psmisc hostname && \ 
+    yum -y install --setopt=tsflags=nodocs MariaDB-server pwgen psmisc hostname && \ 
     yum -y erase vim-minimal && \
     yum -y update && yum clean all
 

@@ -6,6 +6,7 @@ COPY *.repo /etc/yum.repos.d/
 RUN yum -y update && yum clean all && \
     yum -y install --setopt=tsflags=nodocs epel-release && \
     yum -y install --setopt=tsflags=nodocs opennebula-server \
+                                           MariaDB-shared \
                                            redhat-lsb-core \
                                            opennebula-gate \
                                            opennebula-flow \

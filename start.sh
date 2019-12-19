@@ -1,5 +1,9 @@
 #!/bin/bash
-read -p 'pods data folder? (default=/data): ' deffold
+read -p 'oneadmin default password? (default=Sonic2005): ' onedpass
+if [ -z $onedpass ]
+then onedpass=Sonic2005
+fi
+read -p 'pod's volume data folder? (default=/data): ' deffold
 if [ -z $deffold ]
 then deffold=/data
 fi
@@ -7,13 +11,13 @@ read -p 'mariadb img name? (default=mdb): ' mdbnm
 if [ -z $mdbnm ]
 then mdbnm=mdb
 fi
-read -p 'mariadb root passwd? (default=passwd): ' mdbroot
+read -p 'mariadb root passwd? (default=Sonic2005): ' mdbroot
 if [ -z $mdbroot ]
-then mdbroot=passwd
+then mdbroot=Sonic2005
 fi
-read -p 'mariadb oneadmin passwd? (default=passwd): ' mdbusr
+read -p 'mariadb oneadmin passwd? (default=Sonic2005): ' mdbusr
 if [ -z $mdbusr ]
-then mdbusr=passwd
+then mdbusr=Sonic2005
 fi
 read -p 'mariadb db volume? (default=mysql): ' mdbvol
 if [ -z $mdbvol ]
@@ -47,11 +51,11 @@ read -p 'gate img name? (default=gate): ' gatenm
 if [ -z $gatenm ]
 then gatenm=gate
 fi
-read -p 'volume for etc files (default=etc)' etcfiles
+read -p 'volume for etc/one files (default=etc)' etcfiles
 if [ -z $etcfiles ]
 then etcfiles="etc"
 fi
-read -p 'volume for var files (default=var)' varfiles
+read -p 'volume for var/lib/one files (default=var)' varfiles
 if [ -z $varfiles ]
 then varfiles="var"
 fi
@@ -70,6 +74,7 @@ fi
 
 fullbasenm=localhost/"$basenm"
 currpath=$(/bin/pwd)
+
 cd mariadb
 podman build -t "$mdbnm" .
 cd ../baseimg
@@ -87,7 +92,7 @@ podman build --build-arg image="$fullbasenm" -t "$gatenm" .
 cd ../
 
 mkdir -p -m 777 "$deffold" "$deffold"/"$logvol"
-mkdir -p "$deffold"/"$varfiles"/.one && echo "oneadmin:Sonic2005" > "$deffold"/"$varfiles"/.one/one_auth
+mkdir -p "$deffold"/"$varfiles"/.one && echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
 mkdir -p "$deffold"/"$etcfiles" && chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
 mkdir -p "$deffold"/"$mdbvol" && chown -R 27:27 "$deffold"/"$mdbvol"
 cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar
