@@ -1,7 +1,7 @@
 # containerised_nebula
 
 Basically, it works like:
-add the an execution bit to start.sh; start it from the cloned directory. It's gonna ask you a number of questions, generate images: 
+add the execution bit to start.sh; start it from the cloned directory. It's gonna ask you a number of questions, generate images: 
 - MariaDB10.4 presetted DB's settings;
 - Baseimage(containing OpenNebula's 5.10 all necessary components);
 - Oned/scheduler/flow/gate images having the baseimg as a foundation, just starting a particular service above;
