@@ -3,7 +3,7 @@ read -p 'oneadmin default password? (default=Sonic2005): ' onedpass
 if [ -z $onedpass ]
 then onedpass=Sonic2005
 fi
-read -p 'pod's volume data folder? (default=/data): ' deffold
+read -p 'pods volume data folder? (default=/data): ' deffold
 if [ -z $deffold ]
 then deffold=/data
 fi
