@@ -7,6 +7,10 @@ read -p 'pods volume data folder? (default=/data): ' deffold
 if [ -z $deffold ]
 then deffold=/data
 fi
+read -p 'mariadb backup folder? (default=mback): ' mbackvol
+if [ -z $mbackvol ]
+then mbackvol=mback
+fi
 read -p 'mariadb img name? (default=mdb): ' mdbnm
 if [ -z $mdbnm ]
 then mdbnm=mdb
@@ -89,12 +93,15 @@ cd ../flow
 podman build --build-arg image="$fullbasenm" -t "$flownm" .
 cd ../gate
 podman build --build-arg image="$fullbasenm" -t "$gatenm" .
+cd ../mdbbackup
+podman build --build-arg dbpass="$mdbusr" -t "mdback" .
 cd ../
+
 
 mkdir -p -m 777 "$deffold" "$deffold"/"$logvol"
 mkdir -p "$deffold"/"$varfiles"/.one && echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
 mkdir -p "$deffold"/"$etcfiles" && chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
-mkdir -p "$deffold"/"$mdbvol" && chown -R 27:27 "$deffold"/"$mdbvol"
+mkdir -p "$deffold"/"$mdbvol" "$deffold"/"$mbackvol" && chown -R 27:27 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol"
 cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar
 cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar
 
@@ -107,6 +114,7 @@ podman run -dt --pod $podsnm --name=schedpod -v "$deffold"/"$etcfiles":/etc/one 
 podman run -dt --pod $podsnm --name=nginxpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$nginxnm"
 podman run -dt --pod $podsnm --name=gatepod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$gatenm"
 podman run -dt --pod $podsnm --name=flowpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$flownm"
+podman run -dt --pod $podsnm --name=mback -v "$deffold"/"$logfiles":/var/log/ -v "$deffold"/"$mbackvol":/opt/mysql/backup "$mdback"
 
 #podman run -dt --ip="$mdbip" --name=mariadb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$mdbvol":/var/lib/mysql -p $mdbport:3306 "$mdbnm"
 #sleep 5
