@@ -20,7 +20,7 @@ RUN yum -y update && yum clean all && \
                                            mkdir -p /temp/etc && \
                                            mkdir -p /temp/var && \
                                            chown -R 9869:9869 /etc/one && \
-                                           echo -e "StrictHostKeyChecking no \nUserKnownHostsFile=/dev/null" >> /etc/ssh/ssh_config
-                                           chown -R 9869:9869 /temp
+                                           echo -e "StrictHostKeyChecking no \nUserKnownHostsFile=/dev/null" >> /etc/ssh/ssh_config && \
+                                           chown -R 9869:9869 /temp && \
                                            mv /etc/one/{.[!.],}* /temp/etc/ && \
                                            mv /var/lib/one/{.[!.],}* /temp/var/

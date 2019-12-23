@@ -3,9 +3,9 @@ read -p 'oneadmin default password? (default=Sonic2005): ' onedpass
 if [ -z $onedpass ]
 then onedpass=Sonic2005
 fi
-read -p 'pods volume data folder? (default=/data): ' deffold
+read -p 'pods volume data folder? (default=/opt): ' deffold
 if [ -z $deffold ]
-then deffold=/data
+then deffold=/opt
 fi
 read -p 'mariadb backup folder? (default=mback): ' mbackvol
 if [ -z $mbackvol ]
@@ -98,14 +98,25 @@ cd ../mdbbackup
 podman build --build-arg dbpass="$mdbusr" --build-arg image="$fullbasenm" -t "mdback" .
 cd ../
 
+if [ -d "$deffold" ]
+then
+        echo "main folder exists"
+else
+        mkdir -p -m 777 "$deffold"
+fi
+mkdir "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one
+echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
+if [ "$(ls $deffold"/"$varfiles/.one | grep -v one_auth | wc -l)" -gt 0 ]
+then
+        echo "something has found in var/.one, probably you've gotten a previous config"
+else
+        cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar && \
+        cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar && \
+        chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles" && \
+        chown -R 27:27 "$deffold"/"$mdbvol" && \
+        chmod -R 777 "$deffold"/"$logvol"
+fi
 
-mkdir -p -m 777 "$deffold" "$deffold"/"$logvol"
-mkdir -p "$deffold"/"$varfiles"/.one && echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
-mkdir -p "$deffold"/"$etcfiles" && chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
-mkdir -p "$deffold"/"$mdbvol" "$deffold"/"$mbackvol" && chown -R 27:27 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol"
-cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar
-cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar
-chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
 podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb "$mdbnm"
 sleep 5
@@ -117,10 +128,3 @@ podman run -dt --pod $podsnm --name=gatepod -v "$deffold"/"$etcfiles":/etc/one  
 podman run -dt --pod $podsnm --name=flowpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$flownm"
 podman run -dt --pod $podsnm --name=mback -v "$deffold"/"$logfiles":/var/log/ -v "$deffold"/"$mbackvol":/opt/mysql/backup "$mdback"
 
-#podman run -dt --ip="$mdbip" --name=mariadb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$mdbvol":/var/lib/mysql -p $mdbport:3306 "$mdbnm"
-#sleep 5
-#podman run -dt --ip="$onedip" --name=oned -v "$logfiles":/var/log/one -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -p $onedport:2633 "$onednm"
-#sleep 5
-#podman run -dt --ip="$nginxip" --name=nginx -v "$logfiles":/var/log/one -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -p "$novncport":29876 -p $nginxport:80 "$nginxnm"
-#podman run -dt --ip="$flowip" --name=flow -v "$logfiles":/var/log/one -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one  "$flownm"
-#podman run -dt --ip="$gateip" --name=gate -v "$logfiles":/var/log/one -v "$etcfiles":/etc/one  -v "$varfiles":/var/lib/one -p $gateport:5030 "$gatenm"
