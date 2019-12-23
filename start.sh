@@ -95,7 +95,7 @@ podman build --build-arg image="$fullbasenm" -t "$flownm" .
 cd ../gate
 podman build --build-arg image="$fullbasenm" -t "$gatenm" .
 cd ../mdbbackup
-podman build --build-arg dbpass="$mdbusr" --build-arg image="$fullbasenm" -t "mdback" .
+podman build --build-arg dbpass="$mdbusr" -t "mdback" .
 cd ../
 
 if [ -d "$deffold" ]
@@ -104,7 +104,7 @@ then
 else
         mkdir -p -m 777 "$deffold"
 fi
-mkdir "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one
+mkdir "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
 echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
 if [ "$(ls $deffold"/"$varfiles/.one | grep -v one_auth | wc -l)" -gt 0 ]
 then
@@ -113,13 +113,13 @@ else
         cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar && \
         cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar && \
         chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles" && \
-        chown -R 27:27 "$deffold"/"$mdbvol" && \
+        chown -R 27:27 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol" && \
         chmod -R 777 "$deffold"/"$logvol"
 fi
 
 podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb "$mdbnm"
-sleep 5
+sleep 10
 podman run -dt --pod $podsnm --name=onedpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$onednm"
 sleep 5
 podman run -dt --pod $podsnm --name=schedpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$schednm"
