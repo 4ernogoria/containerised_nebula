@@ -78,7 +78,8 @@ fi
 
 fullbasenm=localhost/"$basenm"
 currpath=$(/bin/pwd)
-
+setenforce 0
+sed 's/SELINUX=disabled/SELINUX=disabled/' /etc/selinux/config
 cd mariadb
 podman build -t "$mdbnm" .
 cd ../baseimg
@@ -94,7 +95,7 @@ podman build --build-arg image="$fullbasenm" -t "$flownm" .
 cd ../gate
 podman build --build-arg image="$fullbasenm" -t "$gatenm" .
 cd ../mdbbackup
-podman build --build-arg dbpass="$mdbusr" -t "mdback" .
+podman build --build-arg dbpass="$mdbusr" --build-arg image="$fullbasenm" -t "mdback" .
 cd ../
 
 
@@ -104,7 +105,7 @@ mkdir -p "$deffold"/"$etcfiles" && chown -R 9869:9869 "$deffold"/"$etcfiles" "$d
 mkdir -p "$deffold"/"$mdbvol" "$deffold"/"$mbackvol" && chown -R 27:27 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol"
 cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar
 cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar
-
+chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
 podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb "$mdbnm"
 sleep 5
