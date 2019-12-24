@@ -9,6 +9,6 @@ RUN apk update && \
     chmod a+x /check.sh && \
     echo -e "[mysqldump] \nuser=oneadmin \npassword=$dbpass \n[client] \nuser=oneadmin \npassword=Sonic2005" > /etc/my.cnf.d/mysqldump.cnf
 
-USER 27
+
 
 ENTRYPOINT ["/check.sh"]

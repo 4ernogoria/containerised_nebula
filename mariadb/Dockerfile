@@ -3,6 +3,7 @@ FROM centos:7
 MAINTAINER SharxDC
 COPY mariadb.repo /etc/yum.repos.d/mariadb.repo
 RUN yum -y install --setopt=tsflags=nodocs epel-release && \ 
+    useradd -u 9870 mysql && \
     yum -y install --setopt=tsflags=nodocs MariaDB-server pwgen psmisc hostname && \ 
     yum -y erase vim-minimal && \
     yum -y update && yum clean all
@@ -17,7 +18,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN /bin/chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
-USER 999 
+USER 9871 
 
 EXPOSE 3306
 CMD ["mysqld_safe"]
