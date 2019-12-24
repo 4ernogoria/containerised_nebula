@@ -1,21 +1,21 @@
 #!/bin/bash
 set -e
 
-if [ "${1:0:1}" = '-' ]; then
-	set -- mysqld_safe "$@"
+if [ "${1:0:1}" = '-' ]; then # extracts the first simbol of the very first argument if its "-"
+	set -- mysqld_safe "$@" # set the argument to mysql_safe list_of_arguments
 fi
 
-if [ "$1" = 'mysqld_safe' ]; then
+if [ "$1" = 'mysqld_safe' ]; then # if the previous one went OK
 	DATADIR="/var/lib/mysql"
 	
-	if [ ! -d "$DATADIR/mysql" ]; then
-		if [ -z "$MYSQL_ROOT_PASSWORD" -a -z "$MYSQL_ALLOW_EMPTY_PASSWORD" ]; then
+	if [ ! -d "$DATADIR/mysql" ]; then # if there is no mysql folder in DATADIR consider database not created yet, going to create
+		if [ -z "$MYSQL_ROOT_PASSWORD" -a -z "$MYSQL_ALLOW_EMPTY_PASSWORD" ]; then # checks if mysql_root_pass and allow_epmty_password not defined
 			echo >&2 'error: database is uninitialized and MYSQL_ROOT_PASSWORD not set'
 			echo >&2 '  Did you forget to add -e MYSQL_ROOT_PASSWORD=... ?'
 			exit 1
 		fi
 		
-		echo 'Running mysql_install_db ...'
+		echo 'Running mysql_install_db ...' # no databases were created yet
 		mysql_install_db --force --datadir="$DATADIR"
 		echo 'Finished mysql_install_db'
 		
@@ -31,7 +31,7 @@ if [ "$1" = 'mysqld_safe' ]; then
 			DROP DATABASE IF EXISTS test ;
 		EOSQL
 		
-		if [ "$MYSQL_DATABASE" ]; then
+		if [ "$MYSQL_DATABASE" ]; then # ifdefined mysql_database create it if not yet
 			echo "CREATE DATABASE IF NOT EXISTS \`$MYSQL_DATABASE\` ;" >> "$tempSqlFile"
 			if [ "$MYSQL_CHARSET" ]; then
 				echo "ALTER DATABASE \`$MYSQL_DATABASE\` CHARACTER SET \`$MYSQL_CHARSET\` ;" >> "$tempSqlFile"
@@ -42,11 +42,12 @@ if [ "$1" = 'mysqld_safe' ]; then
 			fi
 		fi
 		
-		if [ "$MYSQL_USER" -a "$MYSQL_PASSWORD" ]; then
+		if [ "$MYSQL_USER" -a "$MYSQL_PASSWORD" ]; then #if defined a mysql_user and his password make him the owner
 			echo "CREATE USER '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD' ;" >> "$tempSqlFile"
 			
 			if [ "$MYSQL_DATABASE" ]; then
 				echo "GRANT ALL ON \`$MYSQL_DATABASE\`.* TO '$MYSQL_USER'@'%';" >> "$tempSqlFile"
+				echo "GRANT select ON *.* TO '$MYSQL_USER'@'%';" >> "$tempSqlFile"
 			fi
 		fi
 		
