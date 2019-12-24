@@ -1,0 +1,6 @@
+mkdir: cannot create directory ‘/opt/log’: File exists
+mkdir: cannot create directory ‘/opt/var’: File exists
+mkdir: cannot create directory ‘/opt/etc’: File exists
+mkdir: cannot create directory ‘/opt/mysql’: File exists
+mkdir: cannot create directory ‘/opt/var/.one’: File exists
+mkdir: cannot create directory ‘/opt/mback’: File exists
