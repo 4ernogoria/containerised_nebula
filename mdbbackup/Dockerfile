@@ -5,10 +5,11 @@ ARG dbpass
 
 RUN apk update && \
     apk add --no-cache mariadb-client && \
+    adduser -u 9869 -D  oneadmin && \
     chmod a+x /etc/periodic/daily/* && \
     chmod a+x /check.sh && \
     echo -e "[mysqldump] \nuser=oneadmin \npassword=$dbpass \n[client] \nuser=oneadmin \npassword=Sonic2005" > /etc/my.cnf.d/mysqldump.cnf
 
-
+USER 9869
 
 ENTRYPOINT ["/check.sh"]

@@ -18,7 +18,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN /bin/chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
-USER 9871 
+USER 9869 
 
 EXPOSE 3306
 CMD ["mysqld_safe"]

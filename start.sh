@@ -99,19 +99,19 @@ if [ -f /opt/log/check.file ] ## the file, if created, by mdbbackup container sh
 then
         echo "the /opt/log/check.file has been found, preconfiguration is required" 2>&1 | logger
         mkdir -p "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol" 2>&1 | logger
-        chown -R 9869:9890 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
+        chown -R 9869:9869 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
         chmod -R 660 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
         echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
         useradd -u 9869 -M -s /sbin/nologin oneadmin 2>&1 | logger
-        useradd -u 999 -M -s /sbin/nologin mariadb 2>&1 | logger
-        groupadd -g 9890 podsgroup 2>&1 | logger
-        usermod -a -G podsgroup oneadmin 
-        usermod -a -G podsgroup mariadb
+#        useradd -u 9871 -M -s /sbin/nologin mdb 2>&1 | logger
+#        groupadd -g 9890 podsgroup 2>&1 | logger
+#        usermod -a -G podsgroup oneadmin 
+#        usermod -a -G podsgroup mariadb
         cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar 2>&1 | logger
         cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar 2>&1 | logger
-        chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
-        chown -R 999:999 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol"
-        chown -R 9869:9890 "$deffold"/"$logvol"
+        chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles" "$deffold"/"$mdbvol" "$deffold"/"$mbackvol" "$deffold"/"$logvol"
+#        chown -R 999:999 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol"
+#        chown -R 9869:9890 "$deffold"/"$logvol"
 else
 	echo "file has not been found, no need to do anything, just start containers" 2>&1 | logger
 fi
