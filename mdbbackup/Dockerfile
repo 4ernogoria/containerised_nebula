@@ -5,6 +5,7 @@ ARG dbpass
 ENV userpass $dbpass
 RUN apk update && \
     apk add --no-cache mariadb-client && \
+    apk add --no-cache tzdata && \
     adduser -u 9869 -D  oneadmin && \
     mkdir -p /var/log/mariadb/ && \
     chmod 777 /var/log/mariadb && \
