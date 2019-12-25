@@ -18,4 +18,4 @@ MUSER=oneadmin
 [ ! -d $BACKUP_FOLDER_W ] && mkdir -p $BACKUP_FOLDER_W
 
 FILE=$BACKUP_FOLDER/backup-$NOW.sql.gz
-$MYSQLDUMP -h $MHOST -u $MUSER --log-error=/var/log/mysql --databases opennebula | $GZIP -9 > $FILE
+$MYSQLDUMP -h $MHOST -u $MUSER --log-error=/var/log/mariadb --databases opennebula | $GZIP -9 > $FILE

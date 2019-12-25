@@ -1,7 +1,7 @@
 #!/bin/bash
-read -p 'backup imgname? (default=mdbacknm): ' backnm
+read -p 'backup imgname? (default=backup): ' backnm
 if [ -z $backnm ]
-then backnm=mdbacknm
+then backnm=backup
 fi
 read -p 'oneadmin default password? (default=Sonic2005): ' onedpass
 if [ -z $onedpass ]
@@ -100,22 +100,15 @@ then
         echo "the /opt/log/check.file has been found, preconfiguration is required" 2>&1 | logger
         mkdir -p "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol" 2>&1 | logger
         chown -R 9869:9869 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
-        chmod -R 660 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
+        chmod 770 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
         echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
         useradd -u 9869 -M -s /sbin/nologin oneadmin 2>&1 | logger
-#        useradd -u 9871 -M -s /sbin/nologin mdb 2>&1 | logger
-#        groupadd -g 9890 podsgroup 2>&1 | logger
-#        usermod -a -G podsgroup oneadmin 
-#        usermod -a -G podsgroup mariadb
         cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar 2>&1 | logger
         cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar 2>&1 | logger
-        chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles" "$deffold"/"$mdbvol" "$deffold"/"$mbackvol" "$deffold"/"$logvol"
-#        chown -R 999:999 "$deffold"/"$mdbvol" "$deffold"/"$mbackvol"
-#        chown -R 9869:9890 "$deffold"/"$logvol"
+        chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
 else
 	echo "file has not been found, no need to do anything, just start containers" 2>&1 | logger
 fi
-#mysql -sN -u oneadmin -p -e "select count(table_name) from INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA='opennebula';"
 #dbquerry=$(mysql -sNe "select count(table_name) from INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA='opennebula';")
 cd $currpath/mariadb
 podman build -t "$mdbnm" .
@@ -134,10 +127,11 @@ podman build --build-arg image="$fullbasenm" -t "$gatenm" .
 cd  $currpath/mdbbackup
 podman build --build-arg dbpass="$mdbusr" -t "$backnm" .
 cd  $currpath/
-podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876 --publish 3306:3306
+
+podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula  -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb "$mdbnm"
 sleep 5
-podman run -dt --pod $podsnm --name=mback -v "$deffold"/"$logfiles":/var/log/ -v "$deffold"/"$mbackvol":/opt/mysql/backup -v "$deffold"/"$varfiles":/opt/var "$backnm"
+podman run -dt --pod $podsnm --name=mbackup -v "$deffold"/"$logfiles":/var/log/mariadb -v "$deffold"/"$mbackvol":/opt/mysql/backup -v "$deffold"/"$varfiles":/opt/var "$backnm"
 sleep 5
 podman run -dt --pod $podsnm --name=onedpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one "$onednm"
 sleep 5
