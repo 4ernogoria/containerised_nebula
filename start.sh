@@ -1,21 +1,23 @@
 #!/bin/bash
-read -p 'backup imgname? (default=backup): ' backnm
+read -p 'backup container img name? (default=backup): ' backnm
 if [ -z $backnm ]
 then backnm=backup
 fi
+#Presence of the check.file in a certain place means that Opennebula hasn't been properly extantiated yet, and during the start of containers it's going to be deployed
+#on a predeployed system this file shouldn't exist, or it triggers rewriting of /etc/one and /var/lib/one files 
 read -p 'oneadmin default password? (default=Sonic2005): ' onedpass
 if [ -z $onedpass ]
 then onedpass=Sonic2005
 fi
-read -p 'pods volume data folder? (default=/opt): ' deffold
+read -p 'pods volume data folder(where the data folders required by containers are stored)? (default=/opt): ' deffold
 if [ -z $deffold ]
 then deffold=/opt
 fi
-read -p 'mariadb backup folder? (default=mback): ' mbackvol
+read -p 'mariadb backup folder, inside the just defined pods volume? (default=mback): ' mbackvol
 if [ -z $mbackvol ]
 then mbackvol=mback
 fi
-read -p 'mariadb img name? (default=mdb): ' mdbnm
+read -p 'mariadb container img name? (default=mdb): ' mdbnm
 if [ -z $mdbnm ]
 then mdbnm=mdb
 fi
@@ -27,55 +29,55 @@ read -p 'mariadb oneadmin passwd? (default=Sonic2005): ' mdbusr
 if [ -z $mdbusr ]
 then mdbusr=Sonic2005
 fi
-read -p 'mariadb db volume? (default=mysql): ' mdbvol
+read -p 'mariadb folder to store database into? (default=mysql): ' mdbvol
 if [ -z $mdbvol ]
 then mdbvol=mysql
 fi
-read -p 'log volume? (default=log): ' logvol
+read -p 'folder to store logs into? (default=log): ' logvol
 if [ -z $logvol ]
 then logvol=log
 fi
-read -p 'base img name? (default=baseimg): ' basenm
+read -p 'base image name? (default=baseimg): ' basenm
 if [ -z $basenm ]
 then basenm=baseimg
 fi
-read -p 'oned img name? (default=oned): ' onednm
+read -p 'oned container img name? (default=oned): ' onednm
 if [ -z $onednm ]
 then onednm=oned
 fi
-read -p 'scheduler img name? (default=sched): ' schednm
+read -p 'scheduler container img name? (default=sched): ' schednm
 if [ -z $schednm ]
 then schednm=sched
 fi
-read -p 'nginx img name? (default=nginx): ' nginxnm
+read -p 'nginx container img name? (default=nginx): ' nginxnm
 if [ -z $nginxnm ]
 then nginxnm=nginx
 fi
-read -p 'flow img name? (default=flow): ' flownm
+read -p 'flow container img name? (default=flow): ' flownm
 if [ -z $flownm ]
 then flownm=flow
 fi
-read -p 'gate img name? (default=gate): ' gatenm
+read -p 'gate container img name? (default=gate): ' gatenm
 if [ -z $gatenm ]
 then gatenm=gate
 fi
-read -p 'volume for etc/one files (default=etc)' etcfiles
+read -p 'folder to store etc/one files into? (default=etc):' etcfiles
 if [ -z $etcfiles ]
 then etcfiles="etc"
 fi
-read -p 'volume for var/lib/one files (default=var)' varfiles
+read -p 'volume to store var/lib/one files into? (default=var) :' varfiles
 if [ -z $varfiles ]
 then varfiles="var"
 fi
-read -p "pod's name (default=onepod)" podsnm
+read -p "the pod's name (default=onepod) :" podsnm
 if [ -z $podsnm ]
 then podsnm="onepod"
 fi
-read -p "pod's publised to the host web port (default=8080)" podwport
+read -p "the pod's web port publised at the host? (default=8080) :" podwport
 if [ -z $podwport ]
 then podwport="8080"
 fi
-read -p "pod's publushed to the host noVNC port (default=29876)" podvncport
+read -p "the pod's noVNC port publushed at the host? (default=29876) :" podvncport
 if [ -z $podvncport ]
 then podvncport="29876"
 fi
@@ -87,7 +89,7 @@ sed 's/SELINUX=disabled/SELINUX=disabled/' /etc/selinux/config
 ## needed for user root to connect to db
 #echo -e "[client] \nuser=root \npassword='mdbroot'" > /root/.my.cnf && chmod 400 /root/.my.cnf
 
-if [ -d "$deffold" ]
+if [ -d "$deffold" ] #folder containing all the data of Opeenebula and MariaDB plus logging and logic triggers
 then
         echo "main folder exists, proceed"
 else
@@ -96,7 +98,13 @@ else
 fi
 
 if [ -f /opt/log/check.file ] ## the file, if created, by mdbbackup container shows the need to instatiate a prestart configuration  
+
 then
+#Creates a folder tree, which was required during the installation step on testing phase
+#uid 9869 is one used by user in the containers, therefore folders must have right permissions, and user is being created.
+#This step also creates one_auth file, which in a main one defining oneadmin credentials.
+#Copies main Opennebula configs and /var/lib/one directory stucture
+
         echo "the /opt/log/check.file has been found, preconfiguration is required" 2>&1 | logger
         mkdir -p "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol" 2>&1 | logger
         chown -R 9869:9869 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
@@ -109,7 +117,8 @@ then
 else
 	echo "file has not been found, no need to do anything, just start containers" 2>&1 | logger
 fi
-#dbquerry=$(mysql -sNe "select count(table_name) from INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA='opennebula';")
+
+#stage creates the container images
 cd $currpath/mariadb
 podman build -t "$mdbnm" .
 cd  $currpath/baseimg
@@ -128,9 +137,12 @@ cd  $currpath/mdbbackup
 podman build --build-arg dbpass="$mdbusr" -t "$backnm" .
 cd  $currpath/
 
+#stage creates a pod the containers themselves, had no need to publish any more port since everything else communicates through localhost tcp sockets
 podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb -v /etc/localtime:/etc/localtime:ro "$mdbnm"
 sleep 5
+#/var/log/mariadb folder is a place for the check.file  which presence triggers the config deployment; /opt/var folder is checked during the pod start to figure it's current state, deployed or not (contains
+#/var/lib/one/.one files explicitly, along with the mysql querry, showing the current state)
 podman run -dt --pod $podsnm --name=mbackup -v "$deffold"/"$logfiles":/var/log/mariadb -v "$deffold"/"$mbackvol":/opt/mysql/backup -v "$deffold"/"$varfiles":/opt/var "$backnm"
 sleep 5
 podman run -dt --pod $podsnm --name=onedpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one -v /etc/localtime:/etc/localtime:ro "$onednm"
