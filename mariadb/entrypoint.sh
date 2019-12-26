@@ -47,7 +47,7 @@ if [ "$1" = 'mysqld_safe' ]; then # if the previous one went OK
 			
 			if [ "$MYSQL_DATABASE" ]; then
 				echo "GRANT ALL ON \`$MYSQL_DATABASE\`.* TO '$MYSQL_USER'@'%';" >> "$tempSqlFile"
-				echo "GRANT select ON *.* TO '$MYSQL_USER'@'%';" >> "$tempSqlFile"
+				echo "GRANT select,reload,process ON *.* TO '$MYSQL_USER'@'%';" >> "$tempSqlFile"
 			fi
 		fi
 		

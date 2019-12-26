@@ -142,8 +142,10 @@ podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport
 podman run -dt --pod $podsnm --name=mdb -e MYSQL_ROOT_PASSWORD="$mdbroot" -e MYSQL_USER=oneadmin -e MYSQL_PASSWORD="$mdbusr" -e MYSQL_DATABASE=opennebula -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logvol":/var/log/mariadb -v /etc/localtime:/etc/localtime:ro "$mdbnm"
 sleep 5
 #/var/log/mariadb folder is a place for the check.file  which presence triggers the config deployment; /opt/var folder is checked during the pod start to figure it's current state, deployed or not (contains
-#/var/lib/one/.one files explicitly, along with the mysql querry, showing the current state)
-podman run -dt --pod $podsnm --name=mbackup -v "$deffold"/"$logfiles":/var/log/mariadb -v "$deffold"/"$mbackvol":/opt/mysql/backup -v "$deffold"/"$varfiles":/opt/var "$backnm"
+#/var/lib/one/.one files explicitly, along with the mysql querry, showing the current state); For some reason mariabackup demands DB folder to be mounted backing container (seems to me it uses a fileoriented way backup), also
+#it requires /xtrabackup_files folder be created and having write permission into it in the current folder of your position, so you have to define folder as a working directory as the exact the same place you've mounted backup
+#volume to; /opt/mysql/backup - mounting path also is used at the backup container as a path target to use during mariadb backup and a working directory in the Dockerfile, so if changed here, be aware!
+podman run -dt --pod $podsnm --name=mbackup -v "$deffold"/"$mdbvol":/var/lib/mysql -v "$deffold"/"$logfiles":/var/log/mariadb -v "$deffold"/"$mbackvol":/opt/mysql/backup -v "$deffold"/"$varfiles":/opt/var "$backnm"
 sleep 5
 podman run -dt --pod $podsnm --name=onedpod -v "$deffold"/"$etcfiles":/etc/one  -v "$deffold"/"$varfiles":/var/lib/one -v "$deffold"/"$logvol":/var/log/one -v /etc/localtime:/etc/localtime:ro "$onednm"
 sleep 5
