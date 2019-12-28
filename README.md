@@ -9,6 +9,6 @@ add the execution bit to start.sh; start it from the cloned directory. It's gonn
   
   Starts up a POD with a number of binded ports (inside NGINX, noVNC).
 
-  Create folders for the MariaDB database, logs, /etc/one, /var/lib/one.
+  Creates folders for the MariaDB database, logs, /etc/one, /var/lib/one.
   
   Starts up all the needed containers inside the POD, communicating one another through network ports on shared LOCALHOST, with apropriately mounted volumes.
