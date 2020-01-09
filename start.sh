@@ -1,7 +1,11 @@
 #!/bin/bash
-read -p 'backup container img name? (default=backup): ' backnm
+read -p "Choose is it necesssary to create the basic configs? (default=No) :" configcrt
+#if [ -z $configcrt ]
+#then podvncport="Yes"
+#fi
+read -p 'backup container img name? (default=4ernogoria/backup): ' backnm
 if [ -z $backnm ]
-then backnm=backup
+then backnm=4ernogoria/backup
 fi
 #Presence of the check.file in a certain place means that Opennebula hasn't been properly extantiated yet, and during the start of containers it's going to be deployed
 #on a predeployed system this file shouldn't exist, or it triggers rewriting of /etc/one and /var/lib/one files 
@@ -17,9 +21,9 @@ read -p 'mariadb backup folder, inside the just defined pods volume? (default=mb
 if [ -z $mbackvol ]
 then mbackvol=mback
 fi
-read -p 'mariadb container img name? (default=mdb): ' mdbnm
+read -p 'mariadb container img name? (default=4ernogoria/mdb): ' mdbnm
 if [ -z $mdbnm ]
-then mdbnm=mdb
+then mdbnm=4ernogoria/mdb
 fi
 read -p 'mariadb root passwd? (default=Sonic2005): ' mdbroot
 if [ -z $mdbroot ]
@@ -37,29 +41,29 @@ read -p 'folder to store logs into? (default=log): ' logvol
 if [ -z $logvol ]
 then logvol=log
 fi
-read -p 'base image name? (default=baseimg): ' basenm
+read -p 'base image name? (default=4ernogoria/baseimg): ' basenm
 if [ -z $basenm ]
-then basenm=baseimg
+then basenm=4ernogoria/baseimg
 fi
-read -p 'oned container img name? (default=oned): ' onednm
+read -p 'oned container img name? (default=4ernogoria/baseimg): ' onednm
 if [ -z $onednm ]
-then onednm=oned
+then onednm=4ernogoria/oned
 fi
-read -p 'scheduler container img name? (default=sched): ' schednm
+read -p 'scheduler container img name? (default=4ernogoria/sched): ' schednm
 if [ -z $schednm ]
-then schednm=sched
+then schednm=4ernogoria/sched
 fi
-read -p 'nginx container img name? (default=nginx): ' nginxnm
+read -p 'nginx container img name? (default=4ernogoria/nginx): ' nginxnm
 if [ -z $nginxnm ]
-then nginxnm=nginx
+then nginxnm=4ernogoria/nginx
 fi
-read -p 'flow container img name? (default=flow): ' flownm
+read -p 'flow container img name? (default=4ernogoria/flow): ' flownm
 if [ -z $flownm ]
-then flownm=flow
+then flownm=4ernogoria/flow
 fi
-read -p 'gate container img name? (default=gate): ' gatenm
+read -p 'gate container img name? (default=4ernogoria/gate): ' gatenm
 if [ -z $gatenm ]
-then gatenm=gate
+then gatenm=4ernogoria/gate
 fi
 read -p 'folder to store etc/one files into? (default=etc):' etcfiles
 if [ -z $etcfiles ]
@@ -81,7 +85,7 @@ read -p "the pod's noVNC port publushed at the host? (default=29876) :" podvncpo
 if [ -z $podvncport ]
 then podvncport="29876"
 fi
-fullbasenm=localhost/"$basenm"
+
 currpath=$(/bin/pwd)
 
 setenforce 0
@@ -93,49 +97,34 @@ if [ -d "$deffold" ] #folder containing all the data of Opeenebula and MariaDB p
 then
         echo "main folder exists, proceed"
 else
-        echo "the folder does not exist, check if the volume mounted correctly" | logger
+	mkdir /opt
+#        echo "the folder does not exist, check if the volume mounted correctly" | logger
 	exit
 fi
 
-if [ -f /opt/log/check.file ] ## the file, if created, by mdbbackup container shows the need to instatiate a prestart configuration  
-
-then
+#if [ -f /opt/log/check.file ] ## the file, if created, by mdbbackup container shows the need to instatiate a prestart configuration  
+if [ -z $configcrt ]
+	then
+		echo "you've chosen not to create configs"
+	else
 #Creates a folder tree, which was required during the installation step on testing phase
 #uid 9869 is one used by user in the containers, therefore folders must have right permissions, and user is being created.
 #This step also creates one_auth file, which in a main one defining oneadmin credentials.
 #Copies main Opennebula configs and /var/lib/one directory stucture
 
-        echo "the /opt/log/check.file has been found, preconfiguration is required" 2>&1 | logger
-        mkdir -p "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol" 2>&1 | logger
-        chown -R 9869:9869 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
-        chmod 770 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
-        echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
-        useradd -u 9869 -M -s /sbin/nologin oneadmin 2>&1 | logger
-        cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar 2>&1 | logger
-        cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar 2>&1 | logger
-        chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
-else
-	echo "file has not been found, no need to do anything, just start containers" 2>&1 | logger
+#        	echo "the /opt/log/check.file has been found, preconfiguration is required" 2>&1 | logger
+        	mkdir -p "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol" 2>&1 | logger
+        	chown -R 9869:9869 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
+        	chmod 770 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
+        	echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
+        	useradd -u 9869 -M -s /sbin/nologin oneadmin 2>&1 | logger
+        	cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar 2>&1 | logger
+        	cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar 2>&1 | logger
+        	chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
+#else
+#	echo "file has not been found, no need to do anything, just start containers" 2>&1 | logger
 fi
 
-#stage creates the container images
-cd $currpath/mariadb
-podman build -t "$mdbnm" .
-cd  $currpath/baseimg
-podman build -t "$basenm" .
-cd  $currpath/oned
-podman build --build-arg image="$fullbasenm" -t "$onednm" .
-cd  $currpath/sched
-podman build --build-arg image="$fullbasenm" -t "$schednm" .
-cd  $currpath/nginx 
-podman build --build-arg image="$fullbasenm" -t "$nginxnm" .
-cd  $currpath/flow
-podman build --build-arg image="$fullbasenm" -t "$flownm" .
-cd  $currpath/gate
-podman build --build-arg image="$fullbasenm" -t "$gatenm" .
-cd  $currpath/mdbbackup
-podman build --build-arg dbpass="$mdbusr" -t "$backnm" .
-cd  $currpath/
 
 #stage creates a pod the containers themselves, had no need to publish any more port since everything else communicates through localhost tcp sockets
 podman pod create --name $podsnm --publish "$podwport":80 --publish "$podvncport":29876
