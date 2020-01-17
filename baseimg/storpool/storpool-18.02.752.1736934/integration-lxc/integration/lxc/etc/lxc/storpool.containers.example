@@ -1,0 +1,26 @@
+##########################################
+# OpenVSwitch integration comment out to enable
+#
+# used by /etc/network/if-{up,down}.d/lxc-if{up,down} scripts
+# LXC 'Network' configuration:
+#lxc.network.type = veth
+#lxc.network.flags = up
+#lxc.network.script.up = /etc/network/if-up.d/lxc-ifup
+#lxc.network.script.down = /etc/network/if-down.d/lxc-ifdown
+#lxc.network.hwaddr = 00:16:3e:xx:xx:xx
+#
+#Default: not set /disabled/
+#ovsbridge=ovsbr0
+
+##########################################
+# StorPool handled clients should be configured here
+#
+# used by /usr/share/lxc/hooks/storpool-{pre,post}-{start,stop}
+#<LXC_NAME>=<storpool volume create details>
+#
+# LXC 'Hook' configuration:
+#lxc.hook.pre-start = /usr/share/lxc/hooks/storpool-pre-start
+#lxc.hook.post-stop = /usr/share/lxc/hooks/storpool-post-stop
+#
+#example:
+#lxcTest1="size 10G replication 2 placeAll hdd"

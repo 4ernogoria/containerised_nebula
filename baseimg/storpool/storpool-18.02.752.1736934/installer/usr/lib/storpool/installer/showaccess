@@ -1,0 +1,26 @@
+#!/bin/bash
+
+if [[ -z $1 ]]; then
+	if [[ ! -r ./storpool.conf ]]; then
+		echo './storpool.conf missing or not readable, please check' 1>&2
+		exit 1
+	fi
+
+
+	eval "$(grep -Fe SP_CLUSTER_NAME ./storpool.conf)"
+
+	if [[ -z $SP_CLUSTER_NAME ]]; then
+		echo 'SP_CLUSTER_NAME not configured in ./storpool.conf, please check' 1>&2
+		exit 1
+	fi
+else
+	SP_CLUSTER_NAME="$1"
+fi
+
+echo -e "\nhttps://analytics.storpool.com"
+echo -e "\nUser: $SP_CLUSTER_NAME"
+echo "Pass: $(echo -n storpool."${SP_CLUSTER_NAME}" | md5sum | awk '{ print $1 }')"
+
+echo -e "\nhttps://spnagios.storpool.com"
+echo -e "\nUser: $SP_CLUSTER_NAME"
+echo -e "Pass: $(echo -n spnagios."${SP_CLUSTER_NAME}" | md5sum | awk '{ print $1 }')\n"

@@ -1,0 +1,800 @@
+#!/bin/bash
+
+me="$(basename -- "$0")"
+usage(){
+	cat <<EOUSAGE
+
+	Usage: $me
+
+ Should be installed on hosts running the StorPool API.
+ Checks for a valid configuration for access to the StorPool API and for running storpool_mgmt service.
+ Runs every minute executed by crontab via the /etc/cron.d/storpool_genreport file.
+ Generates different types of report depending on the state of the running StorPool cluster.
+
+EOUSAGE
+}
+
+if [[ -n $@ ]]; then
+	usage
+	exit
+fi
+
+unset output_redirected
+
+say(){
+	if [ -t 0 ]; then
+		if [[ -n $output_redirected ]]; then
+			echo 1>&3 "$@"
+		else
+			echo "$@"
+		fi
+	fi
+
+	logger "$me[$$]: $@"
+}
+
+saylines(){
+	local out="$1"
+	while read -r line; do
+		say "$line"
+	done <<< "$out"
+}
+
+jsonify(){
+	local arr=();
+	while read x y;	do
+			arr=("${arr[@]}" $x $y)
+	done <<<$(echo "$@")
+
+	local vars=(${arr[@]})
+	local len=${#arr[@]}
+
+	printf '{'
+	for (( i=0; i<len; i+=2 ))
+	do
+			printf '"%s": %s' "${vars[i]}" "${vars[i+1]}"
+			if [ $i -lt $((len-2)) ] ; then
+					printf ', '
+			fi
+	done
+	printf '}\n'
+}
+
+confget=/usr/lib/storpool/storpool_confget.sh
+if [[ ! -x $confget ]]; then
+	say "$confget is missing?"
+	exit 1
+fi
+
+. "$confget"
+
+mainconfig="/etc/storpool/${me}.conf"
+lastlog="/tmp/storpool_genreport-last.log"
+
+# Default configuration
+mgmt_timeout=45
+servicelist_timeout=25
+vstatus_timeout=25
+disklist_timeout=15
+relocator_timeout=50
+sptree_timeout=10
+netlist_timeout=10
+tasklist_timeout=10
+ignored_services=
+diskfull_info_threshold=90
+diskfull_critical_threshold=97
+diskentries_info_threshold=100000
+diskentries_critical_threshold=70000
+dobj_info_threshold=90
+dobj_critical_threshold=97
+debug_log=
+disable_netlist=
+critical_alert_interval=$((30*60))
+alert_interval=$((60*60))
+disable_chain_alert=
+chainlen=64
+emergency_disable_relocator=0
+services_down_disable=1
+disk_checks_disable=
+disks_missing_disable=1
+disks_full_info_disable=1
+disks_full_critical_disable=1
+disks_entries_info_disable=1
+disks_entries_alert_disable=1
+disk_objects_info_disable=1
+disk_objects_critical_disable=1
+disks_errors_info_disable=
+relocator_check_disable=1
+net_list_check_disable=1
+tasks_check_disable=1
+info_checks_disabled=0
+alert_checks_disabled=0
+crit_checks_disabled=0
+unset clusterdown
+
+# Reading configuration from $mainconfig for changes
+if [[ -f $mainconfig ]]; then
+	. "$mainconfig"
+fi
+
+unset vdownchkflag
+
+hostname=$(hostname)
+hostname_short=$(hostname -s)
+tstamp=$(date -u +%Y%m%d-%H%M%S)
+tstampepoch=$(date -u +%s)
+# cleanup old tmp directories
+me=$(basename -- $0)
+find /tmp -type d -name "$me-*" -mmin +15 -exec rm -vrf {} \; &>"$lastlog"
+
+# cleanup old delay files
+find "$SP_REPORTDIR" -mindepth 1 -maxdepth 1 -type f -name 'delay' -mmin +20 -delete
+tmpdir=$(mktemp -d -t $me-XXXXX)
+mainlog="$tmpdir/mainlog"
+mv "$lastlog" "$tmpdir"
+exec 3>&1 4>&2 >"$mainlog" 2>&1
+if [[ -n $debug_log ]]; then
+	set -xv
+fi
+output_redirected=1
+
+tmpcritical="$tmpdir/critical-output.txt"
+tmpalert="$tmpdir/alerts-output.txt"
+tmpinfo="$tmpdir/info-output.txt"
+tmpreport="$tmpdir/report-info.txt"
+critreport="$SP_REPORTDIR/report-critical-$hostname_short-$tstamp.txt"
+alertreport="$SP_REPORTDIR/report-alerts-$hostname_short-$tstamp.txt"
+inforeport="$SP_REPORTDIR/report-info-$hostname_short-$tstamp.txt"
+
+sptree=/usr/sbin/storpool_tree
+if [[ ! -x $sptree ]]; then
+	say "storpool_tree not executable or missing at $sptree"
+fi
+
+shorten=/usr/sbin/storpool_shorten
+if [[ ! -x $shorten ]]; then
+	say "storpool_shorten not executable or missing at $shorten"
+fi
+
+check_rootcgp=/usr/lib/storpool/check_rootcgp
+if [[ ! -x $check_rootcgp ]]; then
+	say "check_rootcgp not executable or missing at $check_rootcgp"
+fi
+
+delay="$( find "$SP_REPORTDIR" -mindepth 1 -maxdepth 1 -type f -name 'delay' -mmin -10)"
+
+if [[ -n $delay ]]; then
+	say "'$delay' file has been created at $(stat -L --format %y $delay )"
+	say "I will remain silent for the next ~10 minutes"
+	exit
+fi
+
+setinfo(){
+	local name="${FUNCNAME[1]}"
+	local info="$@"
+	echo -e "===$name start\n" &>> "$tmpinfo"
+	echo "$info" &>> "$tmpinfo"
+	echo -e "===$name end\n" &>> "$tmpinfo"
+}
+
+setalert(){
+	local name="${FUNCNAME[1]}"
+	local alert="$@"
+	echo -e "===$name start\n" &>> "$tmpalert"
+	echo "$alert" &>> "$tmpalert"
+	echo -e "===$name end\n" &>> "$tmpalert"
+}
+
+setcritical(){
+	local name="${FUNCNAME[1]}"
+	local critical="$@"
+	echo -e "===$name start\n" &>> "$tmpcritical"
+	echo "$critical" &>> "$tmpcritical"
+	echo -e "===$name end\n" &>> "$tmpcritical"
+}
+
+mgmt_check(){
+	local slistout="$tmpdir/service-list-output.txt"
+	rootcgprocesses
+	if [[ -z $SP_OURID || -z $SP_CLUSTER_NAME ]]; then
+		# not proceeding as SP_OURID and SP_CLUSTER_NAME has not yet been set, log and exit
+		logger "${me}: SP_CLUSTER_NAME not set in /etc/storpool.conf or /etc/storpool.conf.d/, exiting..."
+		exit
+	fi
+	if ! storpool -h > /dev/null 2>&1; then
+		# exit silently; no CLI kind of implies no mgmt
+		logger "${me}: no StorPool CLI, assuming no active mgmt"
+		exit
+	fi
+	if [[ -z $SP_AUTH_TOKEN || -z $SP_API_HTTP_HOST || -z $SP_API_HTTP_PORT ]]; then
+		# exit silently as I'm not configured to reach the API
+		logger "${me}: Either SP_AUTH_TOKEN, SP_API_HTTP_HOST or SP_API_HTTP_PORT are not set in /etc/storpool.conf or /etc/storpool.conf.d/"
+		logger "${me}: Cannot reach StorPool API, exiting..."
+		exit
+	fi
+	if [[ -e /var/run/storpool/cluster_stopped ]]; then
+		setinfo "# One or more services has already been suspended with '/root/bin/state stop', please continue with '/root/bin/state cont'"
+		exit
+	fi
+	if ! timeout "$mgmt_timeout" bash -c "cat 2>/dev/null < /dev/null > /dev/tcp/$SP_API_HTTP_HOST/$SP_API_HTTP_PORT" ; then
+		# exit verbosely as I should and cannot reach the API
+		setcritical "# Cannot reach the configured $SP_API_HTTP_HOST $SP_API_HTTP_PORT for more than $mgmt_timeout seconds (check $mainconfig)"
+		exit
+	fi
+	timeout "$servicelist_timeout" storpool service list &> "$slistout"
+	ACTIVE_MGMT=$( awk '/mgmt.*active/ { print $2 }' "$slistout"  )
+	if [[ -z $ACTIVE_MGMT ]]; then
+		setcritical "# No active API detected or an attempt to reach it timed out ($servicelist_timeout seconds - check $mainconfig)"
+		exit
+	fi
+	# badly disabled until we find a way not to lag the whole controller
+	#chkbbustatus
+	if [[ $SP_OURID != $ACTIVE_MGMT ]]; then
+		# I'm not on the node with the active API, so exit quietly
+		exit
+	fi
+}
+
+services_down(){
+	if [[ -n $services_down_disable ]]; then
+		# silently return
+		alert_checks_disabled="$((alert_checks_disabled+1))"
+		crit_checks_disabled="$((crit_checks_disabled+3))"
+		return
+	fi
+	local slistout="$tmpdir/service-list-output.txt"
+	# slistout is already filled from mgmt_check
+	servicesdown="$tmpdir/service-list-down.txt"
+	serverblocked="$tmpdir/server-blocked.txt"
+	# check for cluster running first
+	if ! grep cluster "$slistout" | grep running; then
+		clusterdown=1
+		timeout "$servicelist_timeout" storpool server blocked &> "$serverblocked"
+		setcritical "$( echo "# Cluster not running - $(grep cluster "$slistout")" ; cat -- "$serverblocked" )"
+		return
+	fi
+	if [[ -n $ignored_services ]]; then
+		grep down "$slistout" | egrep -ve "$ignored_services" &> "$servicesdown"
+	else
+		grep down "$slistout" &> "$servicesdown"
+	fi
+	local slistcheck=$( wc -l < "$servicesdown" )
+	if [[ $slistcheck -gt 0 && $slistcheck -lt 2 ]]; then
+		stype=$(awk '{ print $1 }' $servicesdown)
+			case $stype in
+				client)
+					setcritical "$( echo "# A $stype service down detected" ; cat -- "$servicesdown" )"
+					;;
+				server|mgmt)
+					vdownchkflag=1
+					setalert	"$( echo "# A $stype service down detected" ; cat -- "$servicesdown" )"
+					;;
+				*)
+					setalert	"$( echo "# Something unexpected occured - $stype" ; cat -- "$servicesdown" )"
+					;;
+			esac
+	elif [[ $slistcheck -ge 2 ]]; then
+		export vdownchkflag=1
+		setcritical "$( echo "# More than one service down detected" ; cat -- "$servicesdown" )"
+	fi
+}
+
+volumes_down(){
+	local vstatusout="$tmpdir/volume-status-output.txt"
+	local volumesdown="$tmpdir/volumes-down.txt"
+	if [[ -n $clusterdown ]]; then
+		# no reason to proceed with these checks before the cluster gets up
+		setcritical "Cluster not running, skipping volume status checks"
+		return
+	fi
+	timeout "$vstatus_timeout" storpool volume status &> "$vstatusout"
+	if [[ $? -eq 124 ]]; then
+		setcritical '"storpool volume status" took more than '$vstatus_timeout' seconds (check '$mainconfig') '
+		return
+	fi
+	awk '/down/ && !/drives down/' "$vstatusout" &> "$volumesdown"
+	if [[ -s $volumesdown ]]; then
+		setcritical "$( echo "# Volumes down detected" ; cat -- "$volumesdown" )"
+	fi
+}
+
+disk_checks(){
+	local disklistout="$tmpdir/disk-list-output.txt"
+	local disksdown="$tmpdir/disks-down.txt"
+	local disksfullinfo="$tmpdir/disks-full-info.txt"
+	local disksfullcritical="$tmpdir/disks-full-critical.txt"
+	local disksentriesinfo="$tmpdir/disks-entries-info.txt"
+	local disksentriesalert="$tmpdir/disks-entries-alert.txt"
+	local diskerrorsinfo="$tmpdir/disks_errors_info.txt"
+	local diskerrorsreport="$tmpdir/disks_errors_report.txt"
+	local diskobjectsinfo="$tmpdir/disks_objects_info.txt"
+	local diskobjectscritical="$tmpdir/disks_objects_critical.txt"
+	local diskobjectsreport="$tmpdir/disks_objects_report.txt"
+	if [[ -n $disk_checks_disable ]]; then
+		# return silently
+		info_checks_disabled="$((info_checks_disabled+5))"
+		alert_checks_disabled="$((alert_checks_disabled+1))"
+		crit_checks_disabled="$((crit_checks_disabled+2))"
+		return
+	fi
+	if [[ -n $clusterdown ]]; then
+		# no reason to proceed with these checks before the cluster gets up
+		setcritical "Cluster not running, skipping disk checks"
+		return
+	fi
+	timeout "$disklist_timeout" storpool disk list &> "$disklistout"
+	if [[ $? -eq 124 ]]; then
+		setcritical '"storpool disk list" took more than '$disklist_timeout' seconds (check '$mainconfig')'
+		return
+	fi
+	disks_missing(){
+		if [[ -n $disks_missing_disable ]]; then
+			#silently return
+			info_checks_disabled="$((info_checks_disabled+1))"
+			return 0
+		fi
+		# missing disks
+		awk '/^ +[0-9]+ .*-/' "$disklistout" &> "$disksdown"
+		if [[ -s $disksdown ]]; then
+			vdownchkflag=1
+			setinfo "$( echo "# Disk(s) missing" ; cat -- "$disksdown" )"
+		fi
+	}
+	disks_full_info(){
+		if [[ -n $disks_full_info_disable ]]; then
+			#silently return
+			info_checks_disabled="$((info_checks_disabled+1))"
+			return 0
+		fi
+		awk -F'[|%]' -vthresh="$diskfull_info_threshold" '/^ +[0-9]+ / && $6 > thresh { print $1, $6" %"; }' "$disklistout" &> "$disksfullinfo"
+		if [[ -s $disksfullinfo ]]; then
+			sed -i '1i# Disks above '$diskfull_info_threshold' % filled (configure in '$mainconfig')' "$disksfullinfo"
+			setinfo	"$(cat $disksfullinfo)"
+		fi
+	}
+	disks_full_critical(){
+		if [[ -n $disks_full_critical_disable ]]; then
+			#silently return
+			crit_checks_disabled="$((crit_checks_disabled+1))"
+			return 0
+		fi
+		awk -F'[|%]' -vthresh="$diskfull_critical_threshold" '/^ +[0-9]+ / && $6 > thresh { print $1, $6" %"; }' "$disklistout" &> "$disksfullcritical"
+		if [[ -s $disksfullcritical ]]; then
+			sed -i '1i #Disks above '$diskfull_critical_threshold' % filled (configure in '$mainconfig')' "$disksfullcritical"
+			setcritical "$(cat $disksfullcritical)"
+		fi
+	}
+	disks_entries_info(){
+		if [[ -n $disks_entries_info_disable ]]; then
+			#silently return
+			info_checks_disabled="$((info_checks_disabled+1))"
+			return 0
+		fi
+		# disks with free entries fewer than desired
+		awk -F'|' -vthresh="$diskentries_info_threshold" '!/-/ && $7 <= thresh' "$disklistout" &> "$disksentriesinfo"
+		local disknames=( $( awk '{ print $1 }' "$disksentriesinfo") )
+		if [[ -s $disksentriesinfo ]]; then
+			setinfo "# Disk(s) with fewer than $diskentries_info_threshold free entries - ${disknames[@]}"
+		fi
+	}
+	disks_entries_alert(){
+		if [[ -n $disks_entries_alert_disable ]]; then
+			#silently return
+			alert_checks_disabled="$((alert_checks_disabled+1))"
+			return 0
+		fi
+		# disks with free entries under the critical minimum
+		awk -F'|' -vthresh="$diskentries_critical_threshold" '!/-/ && $7 <= thresh' "$disklistout" &> "$disksentriesalert"
+		local disknames=( $( awk '{ print $1 }' "$disksentriesalert") )
+		if [[ -s $disksentriesalert ]]; then
+			relocatorofftrigger="$disknames"
+			setalert "# Disk(s) with fewer than $diskentries_critical_threshold free entries - ${disknames[@]}"
+		fi
+	}
+	disks_errors_info(){
+		if [[ -n $disks_errors_info_disable ]]; then
+			#silently return
+			info_checks_disabled="$((info_checks_disabled+1))"
+			return 0
+		fi
+		awk -F'[|/]' '!/-/ && $NF > 50 { print }' "$disklistout" | head -n -1 &> "$diskerrorsinfo"
+		local diskerrors="$( awk '{ print $1" - "$NF }' "$diskerrorsinfo")"
+		if [[ -s $diskerrorsinfo ]]; then
+			echo "# Disk - errors:" >> "$diskerrorsreport"
+			printf "%s\n" "${diskerrors[*]}" >> "$diskerrorsreport"
+			setinfo "$(cat $diskerrorsreport)"
+		fi
+	}
+	disk_objects_info(){
+		if [[ -n $disk_objects_info_disable ]]; then
+			#silently return
+			info_checks_disabled="$((info_checks_disabled+1))"
+			return 0
+		fi
+		awk -F'[|/]' -vthresh="$dobj_info_threshold" '/^ +[0-9]+ / && !/ - / && $9 / $10 * 100 > thresh { print $1" - "$9"/"$10; }' "$disklistout" &> "$diskobjectsinfo"
+		if [[ -s $diskobjectsinfo ]]; then
+			echo "# Disk(s) with more than ${dobj_info_threshold}% of objects depleted (configurable in $mainconfig)" >> "$diskobjectsreport"
+			cat "$diskobjectsinfo" >> "$diskobjectsreport"
+			setinfo "$(cat $diskobjectsreport)"
+		fi
+	}
+	disk_objects_critical(){
+		if [[ -n $disk_objects_critical_disable ]]; then
+			#silently return
+			crit_checks_disabled="$((crit_checks_disabled+1))"
+			return 0
+		fi
+		awk -F'[|/]' -vthresh="$dobj_critical_threshold" '/^ +[0-9]+ / && !/ - / && $9 / $10 * 100 > thresh { print $1" - "$9"/"$10; }' "$disklistout" &> "$diskobjectscritical"
+		if [[ -s $diskobjectscritical ]]; then
+			echo "# Disk(s) with more than ${dobj_critical_threshold}% of objects depleted (configurable in $mainconfig)" >> "$diskobjectsreport"
+			cat "$diskobjectscritical" >> "$diskobjectsreport"
+			setcritical "$(cat $diskobjectsreport)"
+		fi
+	}
+	disks_missing
+	disks_full_info
+	disks_full_critical
+	disks_entries_info
+	disks_entries_alert
+	disks_errors_info
+	disk_objects_info
+	disk_objects_critical
+}
+
+relocator_check(){
+	if [[ -n $relocator_check_disable ]]; then
+		# silently return
+		info_checks_disabled="$((info_checks_disabled+2))"
+		alert_checks_disabled="$((alert_checks_disabled+1))"
+		crit_checks_disabled="$((crit_checks_disabled+2))"
+		return
+	fi
+	local relocatorstatus="$tmpdir/relocatorstatus.txt"
+	timeout "$relocator_timeout" storpool relocator status &> "$relocatorstatus"
+	local esc=$?
+	if [[ $esc -eq 124 ]]; then
+		setcritical '"storpool relocator status" took more than '$relocator_timeout' seconds (check relocator_timeout in '$mainconfig') '
+		return
+	elif [[ $esc -ne 0 ]]; then
+		setcritical '"storpool relocator status" failed'
+		return
+	fi
+	if fgrep -q "off" "$relocatorstatus"; then
+		setinfo "$( echo "# Relocator disabled (to stop configure emergency_disable_relocator=0 in '$mainconfig')" ; $'\n\n' ; cat "$relocatorstatus" )"
+		return
+	fi
+	# will get here only if the relocator was not already disabled
+	if [[ -n $relocatorofftrigger ]]; then
+		if [[ -z $emergency_disable_relocator || $emergency_disable_relocator -eq 0 ]]; then
+			# emergency_disable_relocator turned off
+			return
+		fi
+		setinfo "Turning relocator off, due to low number of free entries on $relocatorofftrigger"
+		timeout "$relocator_timeout" storpool relocator off &> "$relocatorstatus"
+		local es=$?
+		if [[ $es -eq 124 ]]; then
+			setcritical 'Turning the storpool relocator off took more than '$relocator_timeout' seconds (check relocator_timeout in '$mainconfig') '
+		elif [[ $es -ne 0 ]]; then
+			setcritical '"storpool relocator off" failed'
+		fi
+	fi
+}
+
+chain_alert(){
+	local sptreeout
+	if [[ -n $clusterdown ]]; then
+		# no reason to proceed with these checks before the cluster gets up
+		setcritical "Cluster not running, skipping chain alerts"
+		return
+	fi
+	if [[ -n $disable_chain_alert ]]; then
+		setinfo "'disable_chain_alert' configured in $mainconfig, ignoring long chain checks"
+		return
+	fi
+
+	sptreeout="$(timeout "$sptree_timeout" $sptree -s $chainlen 2>&1)"
+	if [[ $? -ne 0 ]]; then
+		setcritical "$( echo "# $sptree failed"; echo "$sptreeout" )"
+	elif [[ -n "$sptreeout" ]]; then
+		say "$sptree output:"
+		saylines "$sptreeout"
+		if ! shortenout="$( timeout "$sptree_timeout" $shorten -v $chainlen 2>&1 )"; then
+			setalert "The following snapshot chains exceed $chainlen and $shorten failed:"$'\n\n'"$sptreeout'\noutput:\n'$shortenout"
+		fi
+		say "$shorten output:"
+		saylines "$shortenout"
+	fi
+}
+
+net_list_check(){
+	if [[ -n $net_list_check_disable ]]; then
+		# silently return
+		info_checks_disabled="$((info_checks_disabled+2))"
+		alert_checks_disabled="$((alert_checks_disabled+1))"
+		crit_checks_disabled="$((crit_checks_disabled+2))"
+		return
+	fi
+	# this check expects fully configured storpool.conf that has relevant configuration for each host in the cluster
+	local netlistjson="$tmpdir/netlist-output.json"
+	local hrnetlist="$tmpdir/human-readable-netlist"
+	local netreport="$tmpdir/netlist-report"
+	if ! type -f jq ; then
+		say 'jq missing or not in PATH, please check'
+		setinfo 'netlist check disabled due to missing jq'
+		return
+	fi
+	if [[ -n $disable_netlist ]]; then
+		setinfo "'disable_netlist' configured in $mainconfig, ignoring network checks"
+		return
+	fi
+	timeout "$netlist_timeout" storpool -j net list &> "$netlistjson"
+	if [[ $? -eq 124 ]]; then
+		setcritical '"storpool -j net list" took more than '$netlist_timeout' seconds (check '$mainconfig')'
+		return
+	fi
+	storpool net list &> "$hrnetlist"
+	for host in $(/usr/sbin/storpool_confget -q sections); do
+		# for each of the sections extract how much interfaces should be available
+		local expected_up="$(/usr/sbin/storpool_confshow -nes "$host" SP_IFACE | tr ',' ' ' | wc -w)"
+		# get the OURID for this section
+		local OURID="$(/usr/sbin/storpool_confshow -nes "$host" SP_OURID)"
+		# Count how many networks were listed
+		local available=$(jq --arg id "$OURID" '.data[$id].networks|length' "$netlistjson" )
+		if [[ $expected_up -gt $available ]]; then
+			echo "$host (OURID: $OURID) Expected up: $expected_up, up: $available, missing: $((expected_up-available))" >> "$netreport"
+		fi
+	done
+	if [[ -s $netreport ]]; then
+		# if this file is not empty set an alert
+		sed -i "1i# The following hosts have fewer networks up than expected, as configured in ${HOSTNAME}:/etc/storpool.conf" "$netreport"
+		sed -i "2i" "$netreport"
+		setalert "$(cat $netreport $hrnetlist)"
+	fi
+}
+
+tasks_check(){
+	if [[ -n $tasks_check_disable ]]; then
+		# silently return
+		info_checks_disabled="$((info_checks_disabled+2))"
+		crit_checks_disabled="$((crit_checks_disabled+1))"
+		return
+	fi
+	local tasklistjson="$tmpdir/tasklist-output.json"
+	if ! type -f jq ; then
+		say 'jq missing or not in PATH, please check'
+		setinfo 'tasks check disabled due to missing jq'
+		return
+	fi
+	local tasks="$(timeout "$tasklist_timeout" storpool -j task list | jq -r '.data[]|map(select("transactionId" != 1))|length' )"
+	if [[ $? -eq 124 ]]; then
+		setcritical '"storpool -j task list" took more than '$tasklist_timeout' seconds (check '$mainconfig')'
+		return
+	fi
+	if [[ -n $tasks ]]; then
+		setinfo "Cluster in recovery"
+		return
+	fi
+}
+
+dumpreport(){
+	local reporttype="$1"
+	echo "$SP_CLUSTER_NAME $hostname" &>> "$tmpreport"
+	cat "$tmpcritical" "$tmpalert" "$tmpinfo" 2>/dev/null 1>>"$tmpreport"
+	echo "" >> "$tmpreport" # adding an empty line at the end
+	if [[ $reporttype == "info" ]]; then
+		sed -i '2i# No outstanding issues' "$tmpreport"
+	fi
+	if [[ -n $ignored_services ]]; then
+		sed -i "2iignored_services set in $mainconfig. Ignoring services with the following regex - \"$ignored_services\"" "$tmpreport"
+	fi
+	if [[ $info_checks_disabled -gt 0 || $alert_checks_disabled -gt 0 || $crit_checks_disabled -gt 0 ]]; then
+		sed -i "2i($info_checks_disabled info, $alert_checks_disabled alert, $crit_checks_disabled critical checks are disabled)" "$tmpreport"
+	fi
+	chown "$SP_CRASH_USER" "$tmpreport"
+}
+
+final_check(){
+	local lastreport=$(ls -t "$SP_REPORTDIR"/report-*.txt 2>/dev/null | fgrep -ve "-json-" | head -n 1)
+	if [[ -n $lastreport ]]; then
+		local base=$( basename "${lastreport/report-}" )
+		local lasttype="${base%%-*}"
+		local seconds_from_last_report="$[ $tstampepoch - $( stat -L --format %Y "$lastreport" ) ]"
+	fi
+	if [[ -s $tmpcritical ]]; then
+		reporttype=critical
+		target="$critreport"
+	elif [[ -s $tmpalert ]]; then
+		reporttype=alerts
+		target="$alertreport"
+	else
+		reporttype=info
+		target="$inforeport"
+	fi
+	dumpreport "$reporttype"
+	if ! diff -q "$lastreport" "$tmpreport" &>/dev/null; then
+		# is different, create it now
+		mv "$tmpreport" "$target"
+		exit
+	else
+			case $reporttype in
+				critical)
+					# postpone creating the same report for critical_alert_interval (int) seconds
+					if [[ $seconds_from_last_report -ge $critical_alert_interval ]]; then
+						mv "$tmpreport" "$target"
+						exit
+					fi
+					;;
+				alerts)
+					# postpone creating the same report for $alert_interval (int) seconds
+					if [[ $seconds_from_last_report -ge $alert_interval ]]; then
+						mv "$tmpreport" "$target"
+						exit
+					fi
+					;;
+				info)
+					# cluster is in stable state with no outstanding issues
+					if fgrep -q 'No outstanding issues' "$tmpreport" ; then
+						# suppress creating new report
+						exit
+					fi
+					;;
+				*)
+					say "Something went wrong, unknown reporttype $reporttype detected"
+					;;
+			esac
+	fi
+}
+
+dailyreport(){
+	today="$(date +%Y-%m-%d)"
+	local report="report-daily-${today}.tar.xz"
+	local lockfile=".${report}.lock"
+	local lock="$( find "$SP_REPORTDIR" -mindepth 1 -maxdepth 1 -type f -name "$lockfile" -mmin -15)"
+	local target="$SP_REPORTDIR/$report"
+	if [[ -n $lock ]]; then
+		if [[ -n $debug_log ]]; then
+			say "DEBUG: $lockfile file created in the last 15 minutes, exiting"
+			say "DEBUG: $(ls -l $lockfile)"
+		fi
+		return
+	fi
+	if [[ -f $target ]]; then
+		if [[ -n $debug_log ]]; then
+			say "DEBUG: $target already exists"
+			say "DEBUG: $(ls -l $target)"
+		fi
+		return
+	fi
+	if [[ -n $clusterdown ]]; then
+		# no reason to proceed with these checks before the cluster gets up
+		setalert "Cluster not running, waiting to get up to create daily report"
+		return
+	fi
+	local rdir="report-daily-${today}"
+	touch "$SP_REPORTDIR/${lockfile}"
+	cd "$tmpdir"
+	mkdir -p "$rdir"
+	local spconf="/etc/storpool.conf"
+	local spconfd="/etc/storpool.conf.d/"
+	if [[ -e $spconf ]]; then
+		cp "$spconf" "$rdir"
+		if [[ $? -ne 0 ]]; then
+			say "failed to copy the $spconf file to $rdir"
+		fi
+	fi
+	if [[ -d $spconfd ]]; then
+		cp -a "$spconfd" "$rdir"
+		if [[ $? -ne 0 ]]; then
+			say "failed to copy the $spconfd directory to $rdir"
+		fi
+	fi
+	local cmd
+	for cmd in \
+		'service list' \
+		'attach list' \
+		'client status' \
+		'disk list' \
+		'mgmtConfig list' \
+		'volume status' \
+		'volume list' \
+		'snapshot list' \
+		'net list' \
+		'placementGroup list' \
+		'relocator status' \
+		'snapshot space' \
+		'template status' \
+		; do
+		local namebase="${cmd// /-}"
+		local fname="$rdir/${namebase}.json"
+		local errname="$rdir/${namebase}.err"
+		if ! storpool -j "$cmd" > "$fname" 2>"$errname"; then
+			say "Daily report: '$cmd' failed"
+			if [[ -n $debug_log ]]; then
+				for file in "$fname" "$errname" ; do
+					if [[ -s $file ]]; then
+						say "DEBUG: $file START"
+						say "DEBUG: ----------"
+						say "$(timeout 10 cat $file)"
+						say "DEBUG: ----------"
+						say "DEBUG: $file END"
+					fi
+				done
+			fi
+		elif [[ -s $errname ]]; then
+			say "Daily report: '$cmd' generated warnings"
+		else
+			rm -f "$errname"
+		fi
+		sleep 1
+	done
+	tar -cJvf "$target" "$rdir"
+	if [[ $? -ne 0 ]]; then
+		say 'Dailyreport failed'
+	else
+		say 'Dailyreport collected successfully for '$today''
+		rm -f "$SP_REPORTDIR/${lockfile}"
+	fi
+}
+
+rootcgprocesses(){
+	local processes="$($check_rootcgp)"
+	if [[ -n $processes ]]; then
+		setinfo "$( echo "# Processes in root cgroup (PID TID CMD) " ; echo "$processes" )"
+	fi
+}
+
+dumpjsonreport(){
+	local js="$1"
+	local suff="$2"
+	# check if there is a change from the last report
+	local lastjsreport="$(ls -t "$SP_REPORTDIR"/report-${suff}-json-* 2>/dev/null| head -n 1)"
+	local jsreport="$SP_REPORTDIR/report-${suff}-json-$hostname_short-$tstamp.txt"
+	if [[ -n ${lastjsreport} ]]; then
+		if diff -q "$lastjsreport" <(echo "$js"); then
+			# no differences, no need for a new report
+			return 0
+		fi
+	fi
+	echo "$js" > "$jsreport"
+	# cleanup older reports
+	ls $SP_REPORTDIR/report-${suff}-json-* | fgrep -ve "$lastjsreport" -e "$jsreport" | xargs rm -f
+}
+
+chkbbustatus(){
+	# check both tools
+	for ctrlcmd in storcli64 perccli64; do
+		# first detect controllers
+		if type -f "$ctrlcmd" &>/dev/null; then
+			# check number of controllers
+			local js="$("$ctrlcmd" show j)"
+			local cmdstatus="$(echo "$js" | jq -r '.Controllers|.[]|.["Command Status"]|.["Status"]')"
+			if [[ $cmdstatus == "Success" ]]; then
+				local numctrls="$(echo "$js" | jq -r '.Controllers|.[]|.["Response Data"]|.["Number of Controllers"]')"
+				if [[ $numctrls -gt 0 ]]; then
+					for i in $(seq 0 $((numctrls-1))) ; do
+						# check battery status
+						local stat="$(echo "$js" | jq -r '.Controllers|.[]|.["Response Data"]|.["System Overview"]['$i']["BBU"]')"
+						# send the whole json only if the BBU/Cachevault in failed state
+						if [[ $stat == "Fld" ]]; then
+							dumpjsonreport "$js" "bbu"
+						fi
+					done
+				fi
+			fi
+		fi
+	done
+}
+
+trap "final_check" EXIT QUIT INT HUP TERM
+
+mgmt_check
+services_down
+disk_checks
+relocator_check
+if [[ -n $vdownchkflag ]]; then
+	volumes_down
+fi
+net_list_check
+tasks_check
+chain_alert
+dailyreport

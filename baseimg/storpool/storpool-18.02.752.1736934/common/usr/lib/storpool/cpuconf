@@ -1,0 +1,107 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+my $CORES=0;
+
+if (defined $ARGV[0]){
+	if ($ARGV[0] !~ /^[1-4]$/){
+		print "Usage: cpuconf [1-4]\n";
+		exit 1;
+	}else{
+		$CORES=int($ARGV[0]);
+	}
+}	
+
+my $file = '/proc/cpuinfo';
+
+sub printCores($)
+{
+	my ($h) = @_;
+	
+	my $p = {};
+	foreach my $cpu (values %$h)
+	{
+		$p->{ $cpu->{physical_id} }->{ $cpu->{core_id} }->{ $cpu->{cpu} } = $cpu;
+	}
+	
+	foreach my $socketId (sort {$a<=>$b} keys %{$p})
+	{
+		my $pp = $p->{$socketId};
+		print "socket:$socketId\n";
+		foreach my $coreId (sort {$a<=>$b} keys %{$pp})
+		{
+			my $cc = $pp->{$coreId};
+			my $cpu = join ",", sort{$a<=>$b} keys %{$cc};
+			print "    core:$coreId cpu:$cpu\n";
+		}
+	}
+}
+
+MAIN:
+{
+	my $h = {};
+	my $cpu;
+	open my $fd, '<', $file or die "Can't open $file!\n";
+	while ( my $l=<$fd> )
+	{
+		chomp $l;
+		if( $l=~/^processor\s*\:\s*(\d+)/)
+		{
+			$cpu = $1;
+			$h->{$cpu}->{cpu} = $cpu;
+			next;
+		}
+		if( $l =~ m/^([\w\d\s]+?)\s*\:\s+(.*)/i )
+		{
+			my ($k,$v) = ($1,$2);
+			$k =~ s/\s/_/g;
+			$h->{$cpu}->{$k} = $v;
+		}
+	}
+	close($fd);
+	
+	die "No CPUs found in /proc/cpuinfo\n" unless %$h;
+	
+	printCores($h) if ($CORES == 0);
+	
+	my $tmp = {};
+	for my $cpu ( values %$h )
+	{
+		my $k = $cpu->{physical_id}."\0". $cpu->{core_id};
+		$tmp->{$k}->{physical_id} = $cpu->{physical_id};
+		$tmp->{$k}->{core_id} = $cpu->{core_id};
+		push @{ $tmp->{$k}->{cores} }, $cpu->{cpu};
+	}
+	
+	my @cores =
+		map
+			[
+				sort
+					{ $a<=>$b }
+					@{$_->{cores}}
+			],
+			sort
+				{ $a->{physical_id} <=> $b->{physical_id} || $a->{core_id} <=> $b->{core_id} }
+				values %$tmp;
+	
+	my %config;
+	my @other_cores = ();
+	
+	# 1-core config
+	if (@{$cores[0]}>1) # hyperthreading
+	{
+		$config{rdma} = $config{nic_irq} = $cores[0]->[0];
+		$config{block} = $cores[0]->[0];
+		$config{server} = $config{hba_irq} = $config{beacon} = $config{mgmt} = $cores[0]->[1];
+	}
+	else
+	{
+		$config{rdma} = $config{nic_irq} = $cores[0]->[0];
+		$config{block} = $cores[0]->[0];
+		$config{server} = $config{hba_irq} = $config{beacon} = $config{mgmt} = $cores[0]->[0];
+	}
+	@other_cores = @cores[1..$#cores];
+	
+}

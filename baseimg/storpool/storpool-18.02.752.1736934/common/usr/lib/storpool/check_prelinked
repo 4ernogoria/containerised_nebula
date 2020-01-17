@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2016  StorPool.
+# All rights reserved.
+
+set -e
+
+version()
+{
+	echo 'check_prelinked 0.1.0'
+}
+
+usage()
+{
+	cat <<EOUSAGE
+Usage:	check_prelinked [-v] progname pidfile
+	check_prelinked -V | -h
+
+	-h	display program usage information and exit
+	-V	display program version information and exit
+	-v	verbose operation; display diagnostic output
+EOUSAGE
+}
+
+unset hflag Vflag v
+
+while getopts 'hNVv' o; do
+	case "$o" in
+		h)
+			hflag=1
+			;;
+
+		V)
+			Vflag=1
+			;;
+
+		v)
+			v='-v'
+			;;
+
+		*)
+			usage 1>&2
+			exit 1
+			;;
+	esac
+done
+[ -z "$Vflag" ] || version
+[ -z "$hflag" ] || usage
+[ -z "$Vflag$hflag" ] || exit 0
+
+shift `expr "$OPTIND" - 1`
+if [ "$#" -ne 2 ]; then
+	usage 1>&2
+	exit 1
+fi
+
+prog="$1"
+pidfile="$2"
+
+if [ ! -f "$pidfile" ]; then
+	exit
+fi
+pid=`cat -- "$pidfile"`
+exelink="/proc/$pid/exe"
+if [ -z "$pid" ] || [ ! -L "$exelink" ]; then
+	exit
+fi
+lnk=`readlink -- "$exelink"`
+if expr "x$lnk" : 'x.*#prelink.*deleted' > /dev/null; then
+	echo "The $prog process $pid has had its executable file prelinked and removed" 1>&2
+	exit 1
+fi

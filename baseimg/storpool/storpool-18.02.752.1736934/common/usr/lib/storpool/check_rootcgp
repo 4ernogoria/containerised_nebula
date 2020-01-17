@@ -1,0 +1,184 @@
+#!/usr/bin/python
+'''searches and alerts for processes running in the root cgroup'''
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import sys
+import time
+
+sys.path.append('/usr/lib/storpool/python')
+from sp.cgroups import hierarchy
+from sp.process import pidutil
+from sp.util.file import parsers, readers
+
+
+def getthreads(controllers):
+    '''controllers: list of str names of the cgroup controllers to search in
+    returns set of int process PIDs in the root cgroup'''
+    cgr = hierarchy.get()
+    procs = set()
+    for ctrl in controllers:
+        procs = procs.union(set(parsers.parse_pids_file(cgr.get_option(ctrl, '.', 'tasks'))))
+
+    def _not_kernel_thread(pid):
+        try:
+            return bool(os.readlink('/proc/{0}/exe'.format(pid)))
+        except OSError:
+            return False
+
+    return set(filter(_not_kernel_thread, procs))
+
+
+def rootcgprocesses():
+    '''returns list of tasks in the root cgroup's cpuset and memory controllers'''
+    controllers = ['cpuset', 'memory']
+    # get all threads two times 75ms apart and return processes existing in both
+    pset1 = getthreads(controllers)
+    if not pset1:
+        return pset1
+    time.sleep(0.75)
+    pset2 = getthreads(controllers)
+    return pset1 & pset2
+
+
+def cgpdump(process, debug=False):
+    '''
+    process: str process id
+    Checks the Tgid from /proc/pid/status then collects the Tgid, cpuset and
+    memory cgroups from /proc/pid/cgroup
+    returns dict with 'pid', 'tgid' and cgroup contents
+    '''
+    res = {}
+    spath = '/proc/{t}/status'.format(t=process)
+    try:
+        tgid = pidutil.get_tgid(process)
+    except (OSError, IOError):
+        if debug:
+            print('{f} no longer exists, process exited?'.format(f=spath), file=sys.stderr)
+        return res
+    if tgid is None:
+        if debug:
+            print('That is extremely strange, could not find Tgid in {f}'
+                  .format(f=spath), file=sys.stderr)
+        raise ValueError()
+
+    res['tgid'] = str(tgid)
+
+    if tgid != process:
+        try:
+            res['tgidcmdline'] = pidutil.get_cmdline(tgid).replace('\x00', ' ')
+        except (OSError, IOError):
+            ctfile = '/proc/{t}/cmdline'.format(t=tgid)
+            res['tgidcmdline'] = 'Failed to read {c}, thread ({t}) or parent' \
+                                 'process ({p}) exited?'.format(c=ctfile, t=process, p=tgid)
+        cgtfile = '/proc/{t}/cgroup'.format(t=tgid)
+        try:
+            res['tgidcgroup'] = readers.getdataf(cgtfile).split('\n')
+        except AttributeError:
+            res['tgidcgroup'] = 'Failed to read {c}, thread ({t}) or parent process' \
+                                '({p}) exited?'.format(c=cgtfile, t=process, p=tgid)
+    try:
+        res['cmdline'] = pidutil.get_cmdline(process).replace('\x00', ' ')
+    except AttributeError:
+        cfile = '/proc/{t}/cmdline'.format(t=process)
+        res['cmdline'] = 'Failed to read {c}, thread ({t}) or parent process' \
+                         '({p}) exited?'.format(c=cfile, t=process, p=tgid)
+    cgfile = '/proc/{t}/cgroup'.format(t=process)
+    try:
+        res['cgroup'] = readers.getdataf(cgfile).split('\n')
+    except AttributeError:
+        res['cgroup'] = 'Failed to read {c}, thread ({t}) or parent process \
+            ({p}) exited?'.format(c=cgfile, t=process, p=tgid)
+    return res
+
+
+def dump(res):
+    '''res: dict with processes data
+    prints each process in human readable form
+    returns None'''
+    if 'data' in res.keys():
+        data = res['data']
+        for key, val in data.iteritems():
+            if key == 'snip':
+                continue
+            pid = key
+            if 'tgid' in val.keys():
+                tid = val['tgid']
+            else:
+                print("{p} {c}".format(p=key, c='value data is empty, \
+                process probably died while checking for cmdline/cgroup'))
+                continue
+            print("{p} {tgid} {c}".format(p=key, tgid=tid, c=val['cmdline']))
+            print('\n'.join(
+                sorted(
+                    [i for i in val['cgroup'] if 'cpuset' in i or 'memory' in i]
+                )
+            ))
+            if pid != tid:
+                # print parent process details
+                print("{p} is thread, details for parent {tgid}:".format(p=pid, tgid=tid))
+                print("{tgid} {tgid} {c}".format(tgid=tid, c=val['tgidcmdline']))
+                print('\n'.join(
+                    sorted(
+                        [i for i in val['tgidcgroup'] if 'cpuset' in i or 'memory' in i]
+                    )
+                ))
+            print('')
+    if 'error' in res.keys():
+        print('{e}'.format(e=res['error']['descr']), file=sys.stderr)
+
+
+def main(args):
+    '''main function, returns None'''
+    res = {'data': {}}
+    processes = []
+    try:
+        processes.extend(rootcgprocesses())
+    except ValueError as err:
+        res['error'] = {'name': type(err).__name__, 'descr': str(err)}
+    processed = 0
+    for proc in processes:
+        processed += 1
+        pdump = cgpdump(proc, debug=args.debug)
+        if not args.debug:
+            if processed > 30:
+                # stop logging after 30 processes if no debug
+                res['data']['snip'] = True
+                break
+            cmdline = pdump['cmdline'].split()
+            if any(i for i in IGNORES if cmdline[:len(i)] == i):
+                # ignored and not debug, skipping alert for this process
+                continue
+        res['data'][str(proc)] = pdump
+    if args.json:
+        json.dump(res, sys.stdout, indent=1)
+        print('')  # final new line
+    else:
+        dump(res)
+
+
+def getcmdline():
+    '''Gets command line parameters'''
+    parser = argparse.ArgumentParser(description='''Checks for processes in root
+    cgroup and prints - PID, TID, cmdline ; cgroup details for cpuset, memory
+    if Tgid is different than PID, prints Tgid cgroups as well.
+    ''')
+    parser.add_argument('-d', '--debug', action='count', help="Debug messages verbosity", default=0)
+    parser.add_argument('-j', '--json', action='store_true', help="Json output", default=0)
+    return parser.parse_args()
+
+
+# known processes that usually run in the root cgroup
+IGNORES = [
+    ['/usr/libexec/abrt-hook-ccpp'],
+    ['/usr/bin/python3', '/usr/share/apport/apport'],
+    ['nfsidmap']
+]
+ARGS = getcmdline()
+try:
+    main(ARGS)
+except KeyboardInterrupt:
+    exit('KeyboardInterrupt detected, exiting')

@@ -1,0 +1,120 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2015, 2016  StorPool.
+# All rights reserved.
+#
+
+use v5.010;
+use strict;
+use warnings;
+
+use Getopt::Std;
+
+sub confget($)
+{
+	my ($opts) = @_;
+	my @cmd = (
+		$opts->{c} // 'storpool_confget',
+		($opts->{C}? ('-C', $opts->{C}): ()),
+		($opts->{D}? ('-D', $opts->{D}): ()),
+		($opts->{s}? ('-s', $opts->{s}): ()),
+	);
+
+	my $pid = open my $f, '-|', @cmd;
+	if( !defined($pid) )
+	{
+		die "Could not fork for storpool_confget: $!\n";
+	}
+
+	my %conf;
+	while( <$f> )
+	{
+		chomp;
+		if( !/^([A-Za-z0-9_]+)=(.*)$/ )
+		{
+			die "storpool_confget returned an invalid line: $_\n";
+		}
+		$conf{$1} = $2;
+	}
+
+	close $f or
+	    die "storpool_confget failed\n";
+	return %conf;
+}
+
+sub usage($)
+{
+	my ($err) = @_;
+	my $s = <<EOUSAGE
+Usage:	storpool_confshow [-C confgetbin] [-c storpool_confget] [-D defaults-file] [-s section] [-enS] [pattern...]
+	storpool_confshow -V | -h
+
+	-C	specify the path to the confget binary
+	-c	specify the path to the storpool_confget binary
+	-D	specify the path to the storpool-defaults.conf file
+	-e	treat the patterns as exact variable names
+	-h	display program usage information and exit
+	-n	do not display the variable name, only the value
+	-S	quote the values suitably for the Bourne shell
+	-s	specify the section name (usu. the hostname) to query for
+	-V	display program version information and exit
+EOUSAGE
+	;
+
+	if ($err) {
+		die($s);
+	} else {
+		print "$s";
+	}
+}
+
+sub version()
+{
+	say 'storpool_confshow 1.2.0';
+}
+
+sub shell_escape($)
+{
+	my ($value) = @_;
+	$value =~ s/('+)/'"$1"'/g;
+	return "'$value'";
+}
+
+MAIN:
+{
+	my %opts;
+	getopts('C:c:D:ehnSs:V', \%opts) or usage(1);
+	version() if $opts{V};
+	usage(0) if $opts{h};
+	exit(0) if $opts{V} || $opts{h};
+	my ($exact, $noname, $escape) = @opts{qw(e n S)};
+
+	my %conf = confget \%opts;
+	my @display;
+	if( $exact )
+	{
+		@display = @ARGV;
+	}
+	elsif (@ARGV)
+	{
+		my @all = keys %conf;
+		my %res;
+		for my $key (@ARGV )
+		{
+			$res{$_} = 1 for grep /\Q$key\E/i, @all;
+		}
+		@display = sort keys %res;
+	}
+	else
+	{
+		@display = sort keys %conf;
+	}
+
+	for my $var (@display)
+	{
+		my $value = $conf{$var} // '';
+		$value = shell_escape $value if $escape;
+		say +($noname? '': "$var=").$value;
+	}
+}

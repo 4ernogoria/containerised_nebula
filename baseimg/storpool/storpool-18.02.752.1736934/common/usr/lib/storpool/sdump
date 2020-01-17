@@ -1,0 +1,460 @@
+#!/usr/bin/python
+
+from __future__ import print_function
+
+import argparse
+import collections
+import doctest
+import itertools
+import json
+import os
+import re
+import string
+import subprocess
+import sys
+
+def bytes2human(num, fmt='{v:.1f} {s}'):
+    '''
+    Convert n bytes into a human readable string based on fmt.
+
+    >>> bytes2human(0)
+    '0.0 B'
+    >>> bytes2human(0.9)
+    '0.0 B'
+    >>> bytes2human(1)
+    '1.0 B'
+    >>> bytes2human(1.9)
+    '1.0 B'
+    >>> bytes2human(1024)
+    '1.0 K'
+    >>> bytes2human(1048576)
+    '1.0 M'
+    >>> bytes2human(1099511627776127398123789121)
+    '909.5 Y'
+    '''
+    num = int(num)
+    symbols = ('B', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
+    if num < 0:
+        raise ValueError("num < 0")
+    prefix = {}
+    for ind, sym in enumerate(symbols[1:]):
+        prefix[sym] = 1 << (ind+1)*10
+    for symbol in reversed(symbols[1:]):
+        if num >= prefix[symbol]:
+            value = float(num) / prefix[symbol]
+            return fmt.format(s=symbol, v=value)
+    return fmt.format(s=symbols[0], v=num)
+
+def flatten(dobj, parent_key='', sep='_'):
+    '''dobj: dict of dicts
+    parent_key: string
+    sep: str separator
+    returns single dict with expanded and concatenated keys'''
+    items = []
+    for key, val in dobj.items():
+        new_key = parent_key + sep + key if parent_key else key
+        if isinstance(val, collections.MutableMapping):
+            items.extend(flatten(val, new_key, sep=sep).items())
+        else:
+            items.append((new_key, val))
+    return dict(items)
+
+def shorten(word):
+    '''s is a string key
+    returns:
+    - shortened string key if no uppercase
+    - tuple with (shortened values, uppercase values)
+
+    >>> shorten(u'networks_0_rxBytes')
+    (u'n0rx', u'B')
+    >>> shorten(u'networks_1_txBytes')
+    (u'n1tx', u'B')
+    >>> shorten(u'data_transfers_failed')
+    u'dtf'
+    '''
+    res = []
+    upper = []
+    if '_' in word:
+        for element in word.split('_'):
+            shelement = shorten(element)
+            if isinstance(shelement, tuple):
+                # add just lower case letters to res
+                for shel in shelement:
+                    if shel.islower():
+                        res.append(shel)
+                    else:
+                        upper.append(shel)
+            else:
+                res.append(shelement)
+    else:
+        res = []
+        upper = []
+        if any([(i in word) for i in string.ascii_uppercase]):
+            # add all symbols up to the first upper letter
+            # plus all uppercase letters afterwards
+            # e.g.:
+            # networks_0_rxBytes -> (n0rx, B)
+            # networks_1_txPingPackets -> (n1tx, PP)
+            for index, letter in enumerate(word):
+                if letter.islower():
+                    res.append(letter)
+                    continue
+                else:
+                    upper.append(letter)
+                    # now add only uppercase letters till the end of the word
+                    for letter in word[index+1:]:
+                        if letter.isupper():
+                            upper.append(letter)
+                    break
+        else:
+            # all letters lowercase
+            return word[0]
+    if upper:
+        return (''.join(res), ''.join(upper))
+    return ''.join(res)
+
+def getheaderlines(keys, dont_shorten=False, verbose=False):
+    '''
+    Construct header lines, depending on keys
+
+    >>> getheaderlines({'aaa': 'a'})
+    [['service', 'a'], ['', '']]
+
+    >>> getheaderlines({'aaa': 'a'}, True)
+    [['service', 'aaa']]
+
+    >>> getheaderlines({'aaa': 'a', 'bbbBB': ('bbb', 'BB')})
+    [['service', 'a', 'bbb'], ['', '', 'BB']]
+
+    >>> getheaderlines({'aaa': 'a', 'bbbBB': ('bbb', 'BB')}, True)
+    [['service', 'aaa', 'bbbBB']]
+    '''
+    if verbose > 1:
+        print('keys:\n{k}'.format(k=str(keys)))
+    fline = ['service']
+    if dont_shorten:
+        # just return all the long names, including service
+        fline.extend(keys.keys())
+        if verbose:
+            print('fline:\n{k}'.format(k=str(fline)))
+        return [fline]
+    # add non-tuple elements on the first line
+    fline.extend([el for el in keys.values() if not isinstance(el, tuple)])
+    # get first line length without dual elements
+    flinelen = len(fline)
+    # add "empty" elements for the non-tuple items in second line
+    sline = ['' for i in range(flinelen)]
+    # just count how many empty spaces to add to fline
+    stacked = {}
+    for element in keys.values():
+        if isinstance(element, tuple):
+            mkey = element[0]
+            if mkey not in stacked:
+                stacked[mkey] = 0
+            stacked[element[0]] += 1
+    # add empty spaces here
+    for header in sorted(stacked.iteritems()):
+        fline.append(header[0])
+        # add the number of elements - 1
+        fline.extend(['' for i in range(header[1]-1)])
+    # add the secondary elements to the second line
+    sline.extend(
+        [
+            e[1] for e in sorted(
+                [v for v in keys.values() if isinstance(v, tuple)],
+                key=lambda x: x[0]
+            )
+        ]
+    )
+    assert len(fline) == len(sline) == len(keys) + 1, \
+    'Unexpected number of elements, first/second/header {f}/{s}/{h}'.format(
+        f=len(fline),
+        s=len(sline),
+        h=len(keys) + 1
+    )
+    # return lines in reverse order
+    if verbose:
+        print('fline:\n{k}'.format(k=str(fline)))
+        print('sline:\n{l}'.format(l=str(sline)))
+    return [fline, sline]
+
+def getval(val, key):
+    '''just a wrapper for detecting when bytes2human is needed'''
+    if 'bytes' in key.lower():
+        return bytes2human(val)
+    return val
+
+def updatelengths(lengths, rlines, expectednumelements, separator=","):
+    '''
+    lengths: list of ints
+    lines: list of lists
+    updates the lengths with the longest value at each position
+
+    returns pfmt string
+
+    >>> updatelengths(None, [['aaaa', 'bbbbb']], 2)
+    ('{0: <4},{1: <5}', [4, 5])
+    >>> updatelengths([4, 5], [['aaaa', 'bbbbbb']], 2)
+    ('{0: <4},{1: <6}', [4, 6])
+    '''
+    minimumlength = 4
+    if lengths is None:
+        lengths = [minimumlength for i in range(expectednumelements)]
+    for line in rlines:
+        # ensure expected length
+        assert len(line) == expectednumelements, \
+        'line {l} have more elements than expected ({e})'.format(
+            l=str(line),
+            e=expectednumelements
+            # select length per element
+        )
+    for ind in range(expectednumelements):
+        lengths[ind] = max(lengths[ind], max([len(str(i[ind])) for i in rlines]))
+        pfmt = separator.join(
+            [
+                '{' + \
+                '{i}'.format(i=index) + \
+                ': <{f}'.format(f=lengths[index]) + \
+                '}' for index in range(expectednumelements)
+            ]
+        )
+    return pfmt, lengths
+
+def constructkeys(allkeys, pattern=None, dont_shorten=False, show=False):
+    '''
+    allkeys: list of string keys
+    pattern: str pattern to filter keys
+    dont_shorten: bool to decide which part to filter on (False = shortened)
+
+    returns dict with k: v -> longname: shortened_name
+    >>> constructkeys(['a', 'b'], None)
+    {'a': 'a', 'b': 'b'}
+
+    >>> constructkeys(['networks_0_rxBytes', 'networks_1_rxPackets'], 'rx')
+    keys matched with rx: n0rx, P, B, n1rx
+    {'networks_1_rxPackets': ('n1rx', 'P'), 'networks_0_rxBytes': ('n0rx', 'B')}
+
+    >>> constructkeys(['networks_0_rxBytes', 'networks_1_rxPackets'], 'net', True)
+    keys matched with net: networks_1_rxPackets, networks_0_rxBytes
+    {'networks_1_rxPackets': ('n1rx', 'P'), 'networks_0_rxBytes': ('n0rx', 'B')}
+
+    >>> constructkeys(['networks_0_rxBytes', 'networks_1_rxPackets'], 'B', True)
+    keys matched with B: networks_0_rxBytes
+    {'networks_0_rxBytes': ('n0rx', 'B')}
+
+    >>> constructkeys(['networks_0_rxBytes', 'networks_1_rxPackets'], 'B')
+    keys matched with B: n0rx, B
+    {'networks_0_rxBytes': ('n0rx', 'B')}
+
+    '''
+    keys = sorted([k for k in allkeys if k != 'service'])
+    # construct dict with key: shortened_key
+    dkeys = {}
+    for key in keys:
+        dkeys[key] = shorten(key)
+    if show:
+        lkeys = dkeys.copy()
+        lkeys['Key'] = '(common part) shortened_key'
+        for key, val in sorted(lkeys.iteritems()):
+            if isinstance(val, tuple):
+                pfmt = '{0: <32} -> ({1}) {2}'
+                print(pfmt.format(key, *val))
+            else:
+                pfmt = '{0: <32} -> {1}'
+                print(pfmt.format(key, val))
+    if not pattern:
+        return dkeys
+    else:
+        # filter keys by pattern, depending on whether they should be shortened
+        updatedkeys = {}
+        begin = '^[a-z0-9_]*' # beginning pattern
+        end = '[a-zA-Z0-9_]*$' # end pattern
+        regex = re.compile(
+            '{b}{p}{e}'.format(b=begin, p=pattern, e=end),
+            re.IGNORECASE
+        )
+        for key in dkeys:
+            if dont_shorten:
+                # filter by long names
+                if re.match(regex, key):
+                    updatedkeys[key] = dkeys[key]
+            else:
+                if isinstance(dkeys[key], tuple):
+                    if any([re.match(regex, x) for x in dkeys[key]]):
+                        updatedkeys[key] = dkeys[key]
+                else:
+                    if re.match(regex, dkeys[key]):
+                        updatedkeys[key] = dkeys[key]
+        if not updatedkeys:
+            print(
+                'No keys matched with this pattern: "{a}"'.format(
+                    a=pattern
+                ),
+                file=sys.stderr
+            )
+            exit(1)
+        if dont_shorten:
+            printitems = updatedkeys.keys()
+        else:
+            shkeys = list(itertools.chain(*updatedkeys.values()))
+            printitems = set(shkeys)
+        print(
+            'keys matched with {p}: {k}'.format(
+                k=', '.join(printitems),
+                p=pattern
+            )
+        )
+        return updatedkeys
+
+def parselines():
+    '''
+    opens stats_dump and continuously parses each line
+    prints header/values according to args'''
+    cmd = [SDUMP] + args.services
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    lcount = 0
+    try:
+        lengths = None
+        headerlines = None
+        keys = None
+        while True:
+            line = proc.stdout.readline()
+            lcount += 1
+            if args.noop:
+                print(line)
+                continue
+            if line == '' and proc.poll() is not None:
+                break
+            jout = json.loads(line.decode())
+            lines = jout['services']
+            # get all services separately
+            rlines = []
+            for service in lines.keys():
+                sdict = flatten(lines[service])
+                if not keys:
+                    # construct header and keys once
+                    keys = constructkeys(sdict.keys(), args.filter, args.dont_shorten, args.legend)
+                    if not headerlines and not args.no_header:
+                        headerlines = getheaderlines(keys, args.dont_shorten, args.verbosity)
+                    else:
+                        headerlines = []
+                values = [service]
+                if args.dont_shorten:
+                    values.extend([getval(sdict[k], k) for k in keys])
+                else:
+                    # add values in the same order they were added in the header
+                    # non-tuple shortened items first
+                    values.extend(
+                        [getval(sdict[k], k) for k in keys if not isinstance(keys[k], tuple)]
+                    )
+                    # tuple items sorted as in the header
+                    values.extend(
+                        [
+                            getval(sdict[k], k) for k in sorted(
+                                [key for key in keys if isinstance(keys[key], tuple)],
+                                key=lambda x: keys[x][0]
+                            )
+                        ]
+                    )
+                rlines.append(values)
+            expectednumelements = len(keys) + 1
+            rlines = headerlines + sorted(rlines, key=lambda x: x[0])
+            pfmt, lengths = updatelengths(lengths, rlines, expectednumelements, args.separator)
+            if args.verbosity:
+                print(pfmt)
+            for line in rlines:
+                print(pfmt.format(*line))
+            print('\n')
+            if args.count and lcount == args.count:
+                exit(0)
+    except KeyboardInterrupt:
+        print('Bye')
+
+def getargs():
+    parser = argparse.ArgumentParser(description='''
+    Parses and prints the output from {s}
+    '''.format(s=SDUMP))
+    parser.add_argument(
+        'services',
+        nargs='*',
+        help="Use this service(s) to provide as argument to {s} \
+        (available service names in '/dev/shm/storpool.stat.*')".format(
+            s=SDUMP
+        )
+    )
+    parser.add_argument(
+        '-c',
+        '--count',
+        type=int,
+        help="Print this number of lines and exit"
+    )
+    parser.add_argument(
+        '-d',
+        '--dont-shorten',
+        help="Do not abbreviate the keys in the output of {s} (Useful when \
+        the output is parsed)".format(s=SDUMP),
+        action='store_true'
+    )
+    parser.add_argument(
+        '-f',
+        '--filter',
+        help="Use this string to filter the keys shown (use -l to check for \
+        the full and abbreviated output)",
+        default=None
+    )
+    parser.add_argument(
+        '-nh',
+        '--no-header',
+        help="Do not print header (excludes legend as well)",
+        default=None,
+        action='store_true'
+    )
+    parser.add_argument(
+        '-l',
+        '--legend',
+        help="Print legend for shortened keys once",
+        action='store_true'
+    )
+    parser.add_argument(
+        '-n',
+        '--noop',
+        help="Print the output from {s} and exit (useful for debugging \
+        purposes)".format(s=SDUMP),
+        action='store_true'
+    )
+    parser.add_argument(
+        '-s',
+        '--separator',
+        type=str,
+        help="Use this separator instead of the default (' ')",
+        default=" "
+    )
+    parser.add_argument(
+        '-t',
+        '--tests',
+        help="Run internal tests and exit",
+        action='store_true'
+    )
+    parser.add_argument(
+        '-v',
+        '--verbosity',
+        action='count',
+        help="Print verbose messages"
+    )
+    return parser.parse_args()
+
+if __name__ == '__main__':
+    SDUMP = '/usr/lib/storpool/stats_dump'
+    args = getargs()
+    if args.tests:
+        if doctest.testmod():
+            print('Success')
+            exit(0)
+        else:
+            exit(1)
+    if not os.path.isfile(SDUMP):
+        print('Is {s} installed?'.format(s=SDUMP))
+        exit(1)
+    if args.services:
+        print('Showing stats for: {s}'.format(s=', '.join(args.services)))
+    parselines()

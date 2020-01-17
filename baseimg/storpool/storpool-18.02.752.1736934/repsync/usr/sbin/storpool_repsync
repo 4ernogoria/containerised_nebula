@@ -1,0 +1,300 @@
+#!/bin/bash
+#
+#-
+# Copyright (c) 2014, 2015  StorPool.
+# All rights reserved.
+#
+
+basedir="$HOME/repsync"
+mkdir -p "$basedir"
+global_lock="$basedir/repsync.lock"
+repsync_reports="$basedir/reports"
+repsync_vmcores="$basedir/vmcores"
+repsync_reports_new="$basedir/reports_new"
+repsync_text_reports="$basedir/text_reports"
+repsync_vmcores_new="$basedir/vmcores_new"
+lastlog="$basedir/lastlog"
+cputype="$basedir/cputype"
+os="$basedir/os"
+kernel="$basedir/kernel"
+unsupportedkernels="$basedir/unsupportedkernels"
+next_kernels="$basedir/next_kernels"
+revision="$basedir/revision"
+nrevision="$basedir/nrevision"
+[ -f "$repsync_reports" ] || touch "$repsync_reports"
+[ -f "$repsync_vmcores" ] || touch "$repsync_vmcores"
+
+usage() {
+cat <<EOUSAGE
+Usage:	$(basename $0)
+
+	Will sync all report files from SP_REPORTDIR to remote server
+	in StorPool for notification and further investigation.
+	Depends on '/etc/storpool.conf' and '/usr/lib/storpool/storpool_confget.sh'
+
+	-h	display this info and exit
+
+	-t	test sending an empty dummy report
+EOUSAGE
+}
+
+
+if [[ -n $* ]]; then
+	case "$1" in
+		h|-h|--help|help)
+			usage
+			exit 0
+			;;
+		-t)
+			tflag=1
+			shift
+			;;
+		*)
+			usage 1>&2
+			exit 1
+			;;
+	esac
+fi
+
+ (
+	say(){
+		 if [[ -t 0 ]]; then
+			 echo 1>&3 "$@"
+		 fi
+		 logger "$@"
+	 }
+
+ 	getunsupportedkernels(){
+ 		for kver in $(find /boot/ -mindepth 1 -maxdepth 1 -type f -name "vmlinuz-*" | sed -e "s@^.*/vmlinuz-@@" | env LANG=C sort -V | fgrep -x -A 999 -e "$(uname -r)"); do
+ 			kdir="/lib/modules/$kver"
+ 			if [ -d "$kdir/kernel/net/" ] && ! find "$kdir/extra/" -type f -name "storpool_*.ko" 2>/dev/null | egrep -qe "^"; then
+ 				echo "$kver"
+ 			fi
+ 		done
+ 	}
+
+	post_send(){
+		local exit_status="$1"
+		local file="$2"
+		local ldir="$3"
+		local sentlist="$4"
+		local glob="$5"
+		local cmd="rsync -e '$rsshopts' -ac --partial-dir=.rsync-partial --files-from='$file' $ldir/ ${rHOST}:${h}"
+		if [[ -z $exit_status || -z $file || -z $ldir ]]; then
+			say 'Something went wrong while checking for exit status'
+			say 'exit_status:'$exit_status''
+			say 'file to send:'$file''
+			say "command:"
+			say "$cmd"
+		elif [[ $exit_status -eq 0 ]]; then
+			say "Successfully sent:"
+			say "$(wc -l < "$file") text reports"
+			update_and_clean "$file" "$sentlist" "$ldir" "$glob"
+		else
+			say "Failed to send files in $file, exit status $exit_status"
+			say "command:"
+			say "$cmd"
+		fi
+	}
+
+	env_bool(){
+		case "$1" in
+			1|y|yes|t|true)
+				return 0
+				;;
+			*)
+				return 1
+		esac
+	}
+
+ 	update_and_clean(){
+		# $1 - /path/to/file with list of files sent
+		# $2 - /path/to/file with list of successfully sent files to update
+		# $3 - glob for cleaning old files
+		# $4 - dir to cleanup with the glob above
+		local files="$1"
+		local sentlist="$2"
+		local dir="$3"
+		local glob="$4"
+		if env_bool "$SP_DELETE_REPORTS"; then
+			local f=
+			for f in $(cat $files); do
+				rm -f "$f"
+				say "rm -f $f ($?)"
+			done
+		else
+			cat "$files" >> "$sentlist"
+		fi
+		find -L "$dir" -name "$glob" -ctime +14 -delete
+		if [[ $dir = $SP_REPORTDIR ]]; then
+			find -L "$dir" -name 'shm-*' -cmin +60 -delete
+		fi
+	}
+
+	process_files(){
+		local files="$1"
+		local sentlist="$2"
+		local dir="$3"
+		local glob="$4"
+		if [[ -s $files ]]; then
+			rsync -e "$rsshopts" -ac  --partial-dir=.rsync-partial --files-from="$files" "$dir"/ ${rHOST}:${h}/
+			post_send "$?" "$files" "$dir" "$sentlist" "$glob"
+		fi
+	}
+
+	# locking this instance for 3 minutes
+	exec 3>&1 4>&2 >"$lastlog" 2>&1
+	set -xv
+	flock -w 180 200
+	ret=$?
+
+	# check if locked
+	if [[ $ret -ne 0 ]]; then
+		#check if locked and exit quietly for 20 min
+		find "$global_lock" -mmin -20 1>/dev/null && exit 1
+		#on lock for more than 20 minutes exit verbosely
+		say "$0 locked."
+		touch "$global_lock"
+		exit 1
+	fi
+
+	if [[ ! -r /etc/storpool.conf ]]; then
+		say "/etc/storpool.conf not readable.
+		Please give SP_CRASH_USER read permissions for files in SP_REPORTDIR."
+		exit 1
+	fi
+
+	if [ -f /usr/lib/storpool/storpool_confget.sh ]; then
+		 . /usr/lib/storpool/storpool_confget.sh
+	else
+		say "No storpool_confget.sh found.
+		Is storpool installed?"
+		exit 1
+	fi
+
+	# set rUSER to SP_CRASH_REMOTE_USER if latter is set in /etc/storpool.conf
+	if [ -z "$SP_CRASH_REMOTE_USER" ]; then
+		say 'SP_CRASH_REMOTE_USER is not set in /etc/storpool.conf or /etc/storpool.conf.d/*'
+		exit 1
+	else
+		rUSER="$SP_CRASH_REMOTE_USER"
+	fi
+
+	if [[ $SP_CRASH_USER != $(id -un) ]]; then
+		say "Please execute as $SP_CRASH_USER, e.g. 'sudo -u $SP_CRASH_USER $(basename -- $0)'"
+		exit 1
+	fi
+
+	# check that rUSER is set
+	if [[ -z $SP_CRASH_REMOTE_ADDRESS ]]; then
+		say  'SP_CRASH_REMOTE_ADDRESS is not set in /etc/storpool.conf or /etc/storpool.conf.d/*'
+		exit 1
+	else
+		rHOST="$SP_CRASH_REMOTE_ADDRESS"
+	fi
+	if [[ -z $SP_CRASH_REMOTE_PORT ]]; then
+		say "SP_CRASH_REMOTE_PORT is not set in /etc/storpool.conf or /etc/storpool.conf.d/*"
+		exit 1
+	else
+		rPORT="$SP_CRASH_REMOTE_PORT"
+	fi
+
+	if [[ -z $SP_REPORTDIR ]]; then
+		say "SP_REPORTDIR is not set in /etc/storpool.conf or /etc/storpool.conf.d/*"
+		exit 1
+	fi
+
+	if ! getent -- hosts "$SP_CRASH_REMOTE_ADDRESS"; then
+		say "Warning: failed to resolve $SP_CRASH_REMOTE_ADDRESS, is the resolver working?"
+		exit 1
+	fi
+	if ! ping -c 2 -W 2 -- "$SP_CRASH_REMOTE_ADDRESS"; then
+		say "Warning: failed to ping $SP_CRASH_REMOTE_ADDRESS"
+	fi
+
+	# init options and arguments for rsync
+	h=$(hostname -s)
+	rsshopts="ssh -o PasswordAuthentication=no -o Port=$rPORT -o User=$rUSER -o StrictHostKeyChecking=no -o CheckHostIP=no -o UserKnownHostsFile=/dev/null"
+
+	if [[ -n $tflag ]]; then
+		tfile=/tmp/repsync-testfile
+		rm -f "$tfile"
+		touch "$tfile"
+		rsync -e "$rsshopts" -ac "$tfile" "${SP_CRASH_REMOTE_ADDRESS}":"$h"/
+		es=$?
+		rm -f "$tfile"
+		if [[ $es -eq 0 ]]; then
+			say "Successfully transfered dummy file to ${SP_CRASH_REMOTE_ADDRESS}"
+			exit 0
+		else
+			say "Failed to transfer file to ${SP_CRASH_REMOTE_ADDRESS}"
+			exit 1
+		fi
+	fi
+
+	if [[ ! -f $cputype || ! -f $os || ! -f $kernel || ! -f $next_kernels || ! -f $revision ]]; then
+		# check if cputype is not Intel
+                if grep -q AuthenticAMD /proc/cpuinfo ; then
+					if grep -Fwiq epyc /proc/cpuinfo; then
+						echo "cputype=nehalem" > "$cputype"
+					else
+						echo "cputype=amdfam10" > "$cputype"
+					fi
+                elif grep -q Atom /proc/cpuinfo ; then
+			echo "cputype=atom" > "$cputype"
+                elif egrep -qe "X3220|Q6600" /proc/cpuinfo ; then
+			echo "cputype=core2" > "$cputype"
+                elif egrep -qe POWER8 /proc/cpuinfo ; then
+			echo "cputype=power8" > "$cputype"
+                elif egrep -qi intel /proc/cpuinfo ; then
+			echo "cputype=nehalem" > "$cputype"
+                else
+                        say "Could not find architecture"
+                        exit 1
+                fi
+
+		# check OS
+		if [[ -f /etc/os-release ]]; then
+			. /etc/os-release
+			grep -qi ubuntu /etc/os-release && echo "OS=${ID}_${VERSION_ID}" > "$os"
+			grep -qi suse /etc/os-release && echo "OS=${ID}_${VERSION_ID}" > "$os"
+			grep -qi debian /etc/os-release && echo "OS=${ID}_${VERSION_ID}" > "$os"
+			grep -qi centos /etc/os-release && echo "OS=${ID}_${VERSION_ID}" > "$os"
+		elif [[ -f /etc/redhat-release ]] ; then
+			grep -qi "centos release 6" /etc/centos-release && echo "OS=centos_6" > "$os"
+		fi
+		# collect presently running kernel
+		uname -r > "$kernel"
+		# get kernels without modules for StorPool
+		getunsupportedkernels > "$next_kernels"
+		# collect the presently installed storpool_revision
+		/usr/sbin/storpool_revision &> "$revision"
+		rsync -e "$rsshopts" -ac "$os" "$cputype" "$kernel" "$next_kernels" "$revision" ${rHOST}:${h}/
+		if [[ $? -ne 0 ]]; then
+			# remove these two files and attempt to send them latter again
+			rm -f "$cputype" "$os" "$kernel" "$next_kernels" "$revision"
+		fi
+	fi
+
+	cd "$SP_REPORTDIR"
+	find -L . -mindepth 1 -maxdepth 1 -type f -name 'report*txt' 2>/dev/null |	sort | fgrep -vf "$repsync_reports" > "$repsync_text_reports"
+	process_files "$repsync_text_reports" "$repsync_reports" "$SP_REPORTDIR" "report*.txt"
+	find -L . -mindepth 1 -maxdepth 1 -type f -name 'report*iolatmon*' 2>/dev/null |	sort | fgrep -vf "$repsync_reports" > "$repsync_text_reports"
+	find -L . -mindepth 1 -maxdepth 1 -type f -name 'report*z' 2>/dev/null |	sort | fgrep -vf "$repsync_reports" > "$repsync_reports_new"
+	process_files "$repsync_text_reports" "$repsync_reports" "$SP_REPORTDIR" "report*iolatmon*"
+	process_files "$repsync_reports_new" "$repsync_reports" "$SP_REPORTDIR" "report*z"
+
+	if [ -d /var/crash ]; then
+		cd /var/crash
+		find -L . -mindepth 2 -type f -not -path "*/lost+found/*" | sort -r | fgrep -vf "$repsync_vmcores" > "$repsync_vmcores_new"
+		process_files "$repsync_vmcores_new" "$repsync_vmcores" /var/crash "*dump*"
+	fi
+	getunsupportedkernels > "$unsupportedkernels"
+	if ! diff -q "$unsupportedkernels" "$next_kernels"; then
+		rm -f "$next_kernels"
+	fi
+	/usr/sbin/storpool_revision &> "$nrevision"
+	if ! diff -q "$nrevision" "$revision"; then
+		rm -f "$revision"
+	fi
+ ) 200>"$global_lock"

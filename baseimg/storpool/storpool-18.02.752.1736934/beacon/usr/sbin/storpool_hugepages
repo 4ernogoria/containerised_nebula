@@ -1,0 +1,14 @@
+#!/usr/bin/python
+""" Invoke the main method of the StorPool hugepages tool module. """
+
+import sys
+
+
+sys.path.append('/usr/lib/storpool/python')
+
+
+from sp.tools import hugepages
+
+
+if __name__ == '__main__':
+    hugepages.main()

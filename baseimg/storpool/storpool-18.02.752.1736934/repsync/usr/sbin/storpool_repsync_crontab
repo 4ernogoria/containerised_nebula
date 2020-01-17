@@ -1,0 +1,140 @@
+#!/bin/sh
+#
+# Copyright (c) 2015  StorPool
+# All rights reserved.
+
+set -e
+
+re_val_username='[a-zA-Z0-9_.][a-zA-Z0-9_.]*$'
+
+version()
+{
+	echo 'storpool_repsync_crontab 0.1.0'
+}
+
+usage()
+{
+	cat <<EOUSAGE
+Usage:	storpool_repsync_crontab [-Nv] [-u username]
+	storpool_repsync_crontab -V | -h
+
+	-h	display program usage information and exit
+	-N	no operation mode; display what would have been done
+	-u	specify the account username to use (default: SP_CRASH_USER)
+	-V	display program version information and exit
+	-v	verbose operation; display diagnostic output
+EOUSAGE
+}
+
+conffile='/etc/storpool.conf'
+crondir='/etc/cron.d'
+cronfilename='storpool_repsync'
+libdir='/usr/lib/storpool'
+confget="$libdir/storpool_confget.sh"
+crontemplate="$libdir/storpool_repsync.cron"
+
+unset hflag noop Vflag username v
+
+while getopts 'hNu:Vv' o; do
+	case "$o" in
+		h)
+			hflag=1
+			;;
+
+		N)
+			noop='echo'
+			;;
+
+		u)
+			if [ -n "$username" ]; then
+				echo 'Duplicate username specified' 1>&2
+				exit 1
+			fi
+
+			if expr "x$OPTARG" : "x$re_val_username" > /dev/null; then
+				username="$OPTARG"
+			else
+				echo 'Invalid username specified' 1>&2
+				exit 1
+			fi
+			;;
+
+		V)
+			Vflag=1
+			;;
+
+		v)
+			v='-v'
+			;;
+
+		*)
+			usage 1>&2
+			exit 1
+			;;
+	esac
+done
+# If -V and/or -h is specified, print the request info and exit.
+[ -z "$Vflag" ] || version
+[ -z "$hflag" ] || usage
+[ -z "$Vflag$hflag" ] || exit 0
+
+# Skip to the positional arguments.
+shift `expr "$OPTIND" - 1`
+if [ "$#" -ne 0 ]; then
+	echo 'No positional arguments expected' 1>&2
+	exit 1
+fi
+
+if [ -z "$username" ]; then
+	[ -z "$v" ] || echo "Trying to obtain a username from the StorPool SP_CRASH_USER configuration setting" 1>&2
+	if [ ! -r "$conffile" ]; then
+		echo "The configuration file '$conffile' is not readable" 1>&2
+		exit 1
+	fi
+	if [ ! -x "$confget" ]; then
+		echo "The storpool_confget tool '$confget' is not executable" 1>&2
+		exit 1
+	fi
+
+	. "$confget"
+	if [ -z "$SP_CRASH_USER" ]; then
+		echo "The SP_CRASH_USER variable is not set in the StorPool configuration files" 1>&2
+		exit 1
+	elif ! expr "x$OPTARG" : "x$re_val_username" > /dev/null; then
+		echo "Invalid SP_CRASH_USER value set in the StorPool configuration files" 1>&2
+		exit 1
+	fi
+fi
+
+res=0
+if [ -z "$v" ]; then
+	getent passwd "$username" > /dev/null || res="$?"
+else
+	echo "Checking for the '$username' system account" 1>&2
+	getent passwd "$username" || res="$?"
+fi
+if [ "$res" != 0 ]; then
+	echo "The user account '$username' does not exist on this system" 1>&2
+	exit 1
+fi
+
+if [ ! -d "$crondir" ]; then
+	echo "The cron directory '$crondir' does not exist" 1>&2
+	exit 1
+fi
+if [ ! -f "$crontemplate" ]; then
+	echo "The StorPool crontab template '$crontemplate' does not exist" 1>&2
+	exit 1
+fi
+f="$crondir/$cronfilename"
+[ -z "$v" ] || echo "Generating '$f' from '$crontemplate' using username '$username'" 1>&2
+if [ -n "$noop" ]; then
+	sed -e "s/%%USERNAME%%/$username/" -- "$crontemplate" > "$f"
+	exit
+fi
+sed -e "s/%%USERNAME%%/$username/" -- "$crontemplate" > "$f"
+res="$?"
+if [ "$res" != 0 ]; then
+	echo "Could not generate '$f' from '$crontemplate'" 1>&2
+	exit 1
+fi

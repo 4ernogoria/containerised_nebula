@@ -1,0 +1,188 @@
+#!/bin/bash
+
+REPLACEBD=/usr/lib/storpool/replacebd
+UPDATE_SAFE=/usr/lib/storpool/update_safe
+
+version(){
+	echo 'time_bubble 0.1.0'
+}
+
+usage(){
+	cat <<EOUSAGE
+Attempts to unload the 'storpool_bd' kernel module by using 'replacebd' with 'update_safe'.
+
+Does not work with direct StorPool volume mounts or LVM on top of StorPool volumes.
+
+Usage:	$0 [path/to/install.sh]
+	$0 -P
+	$0 -R
+	$0 -r
+	$0 -V | -h
+
+	-h	display program usage information and exit
+	-P	print the install.sh path for the currently running version of
+		storpool_block.bin (requires gdb)
+	-R	replay any events written in the storpool_replacebd journal file
+	-r	display any events written in the storpool_replacebd journal file
+	-V	display program version information and exit
+
+	Ex.: $0 /root/storpool/storpool-4092-7-15.02.1291.efa53c0/install.sh
+
+Expects:
+ 	- The new release to be already installed
+	- 'replacebd' and 'update_safe' to be available in /usr/lib/storpool/
+	- the 'storpool_server' service to be stopped
+	- a valid path to install.sh from the last release
+EOUSAGE
+}
+
+getoldblockrevision(){
+	# returns string - revision of the running storpool_block.bin
+	# get running process PID
+	local pidfile=/var/run/storpool_block.bin.pid
+	if [[ -r $pidfile ]]; then
+		local oldblockPID=$( cat $pidfile )
+	fi
+	if [[ -z $oldblockPID ]]; then
+		echo "Cannot check for running storpool_block.bin.pid"
+		exit 1
+	fi
+	local maps=$(awk -F'[- ]' '/storpool_block.bin/ { print $1, $2 }' /proc/$oldblockPID/maps)
+	while read start end; do
+		export revision="$( gdb --pid $oldblockPID -ex "dump memory /dev/stdout 0x$start 0x$end" </dev/null 2>/dev/null | \
+		strings | \
+		fgrep -m1 storpool_revision )"
+	if [[ -n "$revision" ]]; then
+		# echo "found $revision"
+		export revision="${revision##*=}"
+		break
+	fi
+	done <<< "$maps"
+	if [[ -z $revision ]]; then
+		echo "Could not find the revision of the running storpool_block.bin service"
+		exit 1
+	fi
+}
+
+do_replacebd(){
+	echo "pkill -STOP udev"
+	pkill -STOP udev
+	ulimit -c unlimited
+	$REPLACEBD "$@"
+	res=$?
+	echo "pkill -CONT udev"
+	pkill -CONT udev
+	return $res
+}
+
+unset hflag printpath swread swreplay Vflag
+while getopts 'hPRrV' o; do
+	case "$o" in
+		h)
+			hflag=1
+			;;
+
+		P)
+			printpath=1
+			;;
+
+		r)
+			swread=1
+			;;
+
+		R)
+			swreplay=1
+			;;
+
+		V)
+			Vflag=1
+			;;
+
+		*)
+			usage 1>&2
+			exit 1
+			;;
+	esac
+done
+
+[ -z "$Vflag" ] || version
+[ -z "$hflag" ] || usage
+[ -z "$hflag$Vflag" ] || exit 0
+
+shift `expr "$OPTIND" - 1`
+
+if [[ $# -eq 1 && $1 =~ ^-*help$ ]]; then
+	echo "The 'help' argument is deprecated, please use -h"
+	hflag=1
+fi
+
+if [[ $# -eq 1 && $1 =~ ^-*print-path$ ]]; then
+	echo "The 'print-path' argument is deprecated, please use -P"
+	printpath=1
+fi
+
+if [[ -n $printpath ]]; then
+	getoldblockrevision
+	find ~/ -maxdepth 3 -type f -path "*${revision}*/install.sh"
+	exit
+fi
+
+# check for storpool_replacebd binary
+if [[ ! -x $REPLACEBD ]]; then
+	echo "$REPLACEBD not found or not executable"
+	exit 1
+fi
+
+if [[ -n $swread ]]; then
+	exec $REPLACEBD -r
+elif [[ -n $swreplay ]]; then
+	do_replacebd -R
+	exit $?
+fi
+
+# check for the update_safe tool
+if [[ -x $UPDATE_SAFE ]]; then
+	if ! $UPDATE_SAFE -h &>/dev/null; then
+		echo "$UPDATE_SAFE cannot be executed successfully, please check for proper permissions"
+		exit 1
+	fi
+else
+	echo "$UPDATE_SAFE missing or not executable"
+	exit 1
+fi
+
+# check for install.sh validity
+if [[ -z $1 ]]; then
+	echo "$1 empty, expected a valid path to install.sh"
+	exit 1
+elif [[ ! $1 =~ install\.sh$ ]]; then
+	echo "$1 does not look like a valid path to install.sh"
+	exit 1
+else
+	PRESENT_RELEASE_PATH=$(dirname "$1")
+	shift
+	cd "$PRESENT_RELEASE_PATH"
+	if [[ $? -ne 0 ]]; then
+		echo 'The attempt to cd into '$PRESENT_RELEASE_PATH' failed, exiting'
+		exit 1
+	fi
+	if ! ./install.sh -l; then
+		echo 'The attempt to execute "./install.sh -l" failed, exiting'
+		exit 1
+	fi
+fi
+
+# checking for mounts
+if mount | egrep -qe '^/dev/sp-'; then
+	 echo '/dev/sp-* mounted devices found, '$0' does not support mounts, exiting...'
+	 exit 1
+fi
+
+# check that storpool_server is stopped
+if pgrep -l storpool_server; then
+	echo 'storpool_server seems to be running, please stop it before you proceed'
+	exit 1
+fi
+
+echo "Attempting to upgrade"
+do_replacebd $UPDATE_SAFE $PRESENT_RELEASE_PATH "$@"

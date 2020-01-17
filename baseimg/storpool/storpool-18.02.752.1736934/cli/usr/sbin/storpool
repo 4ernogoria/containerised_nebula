@@ -1,0 +1,6756 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2013 - 2018  StorPool.
+# All rights reserved.
+#
+## RPM ##
+## yum install perl-Term-ReadLine-Gnu perl-JSON perl-JSON-XS
+## perl-Data-Dump
+## $Revision$
+## ## ##
+use v5.010;
+use warnings;
+use strict;
+
+# maybe unused. test and remove
+use Sys::Hostname;
+use IO::Socket::INET;
+use LWP::UserAgent;
+
+use Term::ReadLine;
+use JSON::XS;
+use Data::Dump qw( dump );
+
+use LWP::Simple;
+
+use Getopt::Std;
+use vars qw($opt_B $opt_d $opt_F $opt_f $opt_h $opt_j $opt_P $opt_R $opt_r $opt_S $opt_t);
+
+use POSIX qw( strftime floor );
+
+# ignore SIGPIPE
+$SIG{PIPE} = sub {};
+
+use constant {
+	F_SKIP_LAST_WORD => (1<<0),
+	CLI_PAGER => 'less -X -F',
+	STRIPE_WIDTH => 8,
+	MAX_CHAIN_LENGTH => 4,
+	OBJECT_SIZE => 1024*1024*32,
+	KMGT_SCALE => { ''=>1, 'B'=>1, 'K'=>1024, 'M'=>1024**2, 'G'=>1024**3, 'T'=>1024**4 },
+	TIME_SCALE => { 's'=>1, 'm'=>60, 'h'=>3600, 'd'=>3600*25 }
+};
+
+use constant {
+	OBJECT_UNDEF => 0,
+	OBJECT_OK => 1,
+	OBJECT_OUTDATED => 2,
+	OBJECT_IN_RECOVERY => 3,
+	OBJECT_WAITING_FOR_VERSION => 4,
+	OBJECT_WAITING_FOR_DISK => 5,
+	OBJECT_DATA_NOT_PRESENT => 6,
+	OBJECT_DATA_LOST => 7,
+	OBJECT_WAITING_FOR_CHAIN => 8,
+	OBJECT_WAIT_IDLE => 9,
+};
+
+my %objectStates = (
+	OBJECT_UNDEF				,=> 'undefined',
+	OBJECT_OK					,=> 'ok',
+	OBJECT_OUTDATED				,=> 'outdated',
+	OBJECT_IN_RECOVERY			,=> 'in_recovery',
+	OBJECT_WAITING_FOR_VERSION	,=> 'waiting_for_version',
+	OBJECT_WAITING_FOR_DISK		,=> 'waiting_for_disk',
+	OBJECT_DATA_NOT_PRESENT		,=> 'data_not_present',
+	OBJECT_DATA_LOST			,=> 'data_lost',
+	OBJECT_WAITING_FOR_CHAIN	,=> 'waiting_for_chain',
+	OBJECT_WAIT_IDLE			,=> 'wait_idle',
+);
+
+
+my $jsonObj = JSON::XS->new->utf8->pretty->canonical;
+
+sub jsError($; $);
+sub jsTrError($);
+
+sub post($$);
+sub lwp_request($$$);
+
+my $historyFile = ".storpool_history";
+my $historyLength = 100;
+
+my $cli_prompt = "StorPool> ";
+
+my $debug = 0;
+my $readline = 0;
+my $mode = 'normal'; # normal|test|raw
+
+my $confFile="/etc/storpool.conf";
+my $conf = {};
+my $host = '127.0.0.1';
+my $port = 80;
+my $version = '1.0';
+my $url;
+my $format = 'text'; # csv, json, pass, raw, or text
+my $no_pager = 0;
+my $csv_separator = ';';
+
+my %pager = (
+	'bin' => CLI_PAGER,
+	'lines' => [],
+);
+
+my $recvTout = 10;
+my $term;
+
+my $verbose = 0;
+my $attribs;
+
+open (my $OUT, '>-');	# replaced by readline outstream if needed
+$| = 1;					# flush after every write
+
+
+sub dbg
+{
+	return unless $debug;
+	my ($format, @args) = @_;
+	my (@c) = caller();
+	my $func = (caller(1))[3] || '';
+	$func =~ s|(main::)||;
+	if($#args)
+	{
+		#print "args:$#args\n";
+		printf STDERR "%s:%s():%d# ".$format."\n", $c[1], $func, $c[2], @args;
+	}
+	else
+	{
+		printf STDERR "%s:%s():%d> %s ($#args)\n", $c[1], $func, $c[2], $format;
+	}
+}
+
+sub round($)
+{
+	return sprintf("%.0f", $_[0]);
+}
+
+sub usage
+{
+	print STDERR <<"_EOF_";
+usage:
+	$0 [-BdjRP] [-r | -t] [-S <host>[:<port>]] [command]
+	$0 -h | --help | --version
+	
+		-B                     batch mode - retry transient errors, non-interactive
+		-d                     debug mode
+		-F character           output field separator for the csv format
+		-f csv | json | pass | raw | text
+		                       specify the output format (default human-readable 'text')
+		-h / --help            this help
+		-j                     pass the JSON response through (same as -f pass)
+		-P                     disable pager
+		-R                     raw output - display the HTTP request and response
+		                       (same as -f raw)
+		-r                     raw mode - pass commands to server without checking; implies -j
+		-S <host>[:<port>]     api host / port
+		-t                     test mode - try commands without connection to server
+		--version              CLI version
+
+More usage options:
+	$0 ... command        run command
+	$0 ... < filename     run commands from file
+	$0 ...                start interactive StorPool shell
+
+_EOF_
+	exit 0;
+}
+
+sub confget()
+{
+	unless ( exists $ENV{'SP_OURID'} )
+	{
+		my @a = `storpool_confget`;
+		my %new;
+		foreach my $env (@a)
+		{
+			$env =~ s/[\r\n]*$//;
+			my ($k,$v) = split("=", $env, 2);
+			$new{$k} = $v;
+		}
+		
+		foreach my $k (keys %new)
+		{
+			$ENV{$k} = $new{$k} unless exists($ENV{$k});
+		}
+	}
+
+	{
+		my $ps = $ENV{SP_CLI_PROMPT};
+		if( defined $ps )
+		{
+			$ps =~ s(
+				\$\{ (?<var> [^}]* ) \}
+			)(
+				$ENV{$+{var}} // ''
+			)gxe;
+			$cli_prompt = "$ps> ";
+		}
+	}
+}
+
+
+sub pagerAdd
+{
+	my($format, @args) = @_;
+	my $line = sprintf($format, @args);
+	
+	dbg"ADD '$line'";
+	
+	
+	if($no_pager)
+	{
+		print $line;
+	}
+	else
+	{
+		my ($rows, $cols) = $term->get_screen_size();
+		dbg"rows:$rows, cols:$cols";
+		
+		if( scalar @{$pager{'lines'}} >= $rows-1 )
+		{
+			if( ! exists $pager{'fh'} )
+			{
+				dbg"fh open\n";
+				if( open(my $fh, "|-", $pager{'bin'}) )
+				{
+					$pager{'fh'} = $fh;
+					print $fh @{$pager{'lines'}};
+				}
+				else
+				{
+					print STDERR "Can't open ".$pager{'bin'}.", fh:".$pager{'fh'}."\n";
+					$pager{'fh'} = 0;
+					print $OUT ( @{$pager{'lines'}} );
+				}
+			}
+			
+			if( $pager{'fh'} )
+			{
+				dbg "to PAGER $line";
+				my $fh = $pager{'fh'};
+				print $fh ( $line );
+			}
+			else
+			{
+				dbg "to STDOUT: $line";
+				print $OUT ($line);
+			}
+		}
+		else
+		{
+			push @{$pager{'lines'}}, $line;
+		}
+	}
+}
+
+sub pagerAddError($ @)
+{
+	my ($format, @args) = @_;
+
+	if( $no_pager )
+	{
+		printf STDERR $format, @args;
+	}
+	else
+	{
+		pagerAdd $format, @args;
+	}
+}
+
+sub pagerDisplay
+{
+	if( !$no_pager )
+	{
+		if( exists $pager{'fh'} )
+		{
+			close( $pager{'fh'} );
+			delete $pager{'fh'};
+			$pager{'lines'}=[];
+		}
+		else
+		{
+			print $OUT @{$pager{'lines'}};
+			$pager{'lines'}=[];
+		}
+	}
+}
+
+
+# CLI parameter validation functions
+# return 1 == valid, 0 == invalid
+#
+sub validateLong($)
+{
+	my ($arg) = @_;
+	return !!($arg =~ m/^\d+$/);
+}
+
+sub validateReplication($)
+{
+	my ($arg) = @_;
+	return $arg =~ m/^\d+$/ && $arg > 0 && $arg <= MAX_CHAIN_LENGTH;
+}
+
+
+sub parseServerId($)
+{
+	my ($arg) = @_;
+	return $arg if ($arg =~ m/^\d+$/ && $arg < 0x7fff);
+	my ($nodeId, $instanceId) = $arg =~ m/^(\d+)\.(\d+)$/;
+	return undef unless defined $instanceId;
+	return $nodeId  + $instanceId * 4096;
+}
+
+sub validateServerId($)
+{
+	my ($arg) = @_;
+	return defined parseServerId $arg;
+}
+
+
+sub validateDiskId($)
+{
+	my ($arg) = @_;
+	return $arg =~ m/^\d+$/ && $arg < 0xfff;
+}
+
+sub parseSize($)
+{
+	my ($arg) = @_;
+	
+	if( $arg !~ m/^(\+)?(\d+)([KMGT]|)?$/ )
+	{
+		return (0, -1);
+	}
+	
+	my ($addSize, $realsize, $kmgt) = ($1, $2, $3);
+	$addSize ||=0;
+	
+	$realsize *= KMGT_SCALE->{$kmgt};
+	
+	return ($addSize, $realsize);
+}
+
+sub validateVolumeSize($;$)
+{
+	my( $arg ) = @_;
+	my ($add, $realsize) = parseSize($arg);
+	
+	# OK, so we ignore add overflow here
+	return 0 < $realsize && $realsize < 1_000_000_000_000_000;
+}
+
+sub validateIopsLimit($;$)
+{
+	my ($arg ) = @_;
+	return ($arg eq "-") || (validateLong($arg) && 0 < $arg && $arg < 0xffffffff);
+}
+
+sub parseBwLimit( $ )
+{
+	my ($arg) = @_;
+	
+	if( $arg eq "-" )
+	{
+		return $arg;
+	}
+	
+	$arg =~ m/^(\d+)([BKMG])$/;
+	
+	my ($realsize, $kmgt) = ($1, $2);
+	
+	$realsize *= KMGT_SCALE->{$kmgt};
+	$realsize = floor( ( $realsize + 1024 - 1) / 1024 );
+	
+	return $realsize;
+}
+
+sub parseYesNo( $ )
+{
+	my ($arg) = @_;
+	
+	return $arg =~ /^yes$/i ? JSON::XS::true : JSON::XS::false;
+}
+
+sub validateBwLimit($;$)
+{
+	my($arg) = @_;
+	
+	if( $arg eq "-" )
+	{
+		return 1;
+	}
+	
+	if( $arg =~ m/^(\d+)([BKMG])$/ )
+	{
+		my $bw = parseBwLimit($arg);
+		return $bw <= 2*1024*1024;
+	}
+	
+	return 0;
+}
+
+sub parseTimeDelay( $ )
+{
+	my ($arg) = @_;
+	
+	return undef unless defined($arg);
+	return 0 if $arg eq "-";
+	
+	if( $arg =~ m/^(\d+)([smhd])$/ )
+	{
+		my ($realsize, $scale) = ($1, $2);
+		
+		$realsize *= TIME_SCALE->{$scale};
+		return $realsize;
+	}
+	return undef;
+}
+
+sub validateTimeDelay($)
+{
+	return defined(parseTimeDelay($_[0]));
+}
+
+sub humanBytes($)
+{
+	my ($bytes, $div) = @_;
+	my @human = (" ","K","M","G","T","P","E","Z","Y");
+	my $i=0;
+	my $ret = $bytes;
+	
+	$div = 1024 if ! defined $div;
+	while( (abs($ret)/$div) >= 1 )
+	{
+		$ret /= $div;
+		$i++;
+	}
+	
+	my $fmt;
+	if ( abs($ret) <9.95 )
+	{
+		$fmt = "%.1f";
+	}
+	else
+	{
+		$fmt = "%.0f";
+	}
+	
+	# the special 0 case
+	$fmt = '%.0f' if $ret == 0 and $i == 0;
+	
+	return sprintf($fmt,$ret).' '.$human[$i].'B';
+}
+
+
+sub humanPeriod($)
+{
+	my ($period) = @_;
+	my $sec  = int($period / 1000);
+	my $msec = $period % 1000;
+	
+	my $res = "";
+	if( $sec )
+	{
+		$res .= $sec . " sec";
+	}
+	if( $sec and $msec )
+	{
+		$res .= ", ";
+	}
+	if( $msec )
+	{
+		$res .= $msec . " msec";
+	}
+	return $res;
+}
+
+sub formatLimitBw($)
+{
+	my ($arg) = @_;
+	return $arg eq "-" ? $arg : humanBytes($arg * 1024)
+}
+
+sub formatTime($)
+{
+	my ($arg) = @_;
+	return strftime("%F %T", localtime $arg);
+}
+
+sub formatSeconds($)
+{
+	my ($t) = @_;
+	my $res = "";
+	my $s = $t % 60;
+	$t = floor(  $t / 60 );
+	my $m = $t % 60;
+	$t = floor( $t / 60 );
+	my $h = $t % 24;
+	$t = floor( $t / 24 );
+	if( $t == 1 )
+	{
+		$res = $t . " day ";
+	}
+	elsif( $t )
+	{
+		$res = $t . " days ";
+	}
+	$res .= sprintf("%02d:%02d:%02d", $h, $m, $s);
+	return $res;
+}
+
+sub formatServerId($)
+{
+	my ($id) = @_;
+	return undef unless defined $id;
+	my $instanceId = int($id / 4096);
+	my $nodeId = $id % 4096;
+	return "$nodeId.$instanceId";
+}
+
+my %blacklistedNames = (
+	'list'		=> 1,
+	'status'	=> 1,
+);
+
+sub validateVolumeName($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^[A-Za-z0-9_\-.:]+$/ && !$blacklistedNames{$arg};
+}
+
+sub validateSnapshotName($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^\*?[A-Za-z0-9_\-.:@]+$/ && !$blacklistedNames{$arg};
+}
+
+sub validateDescription($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^[A-Za-z0-9_-]+$/;
+}
+
+my %volumeTemplateBlacklistedNames = (
+	'list'		=> 1,
+);
+
+sub validateTemplateName($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^[A-Za-z0-9_\-.:]+$/ && !$volumeTemplateBlacklistedNames{$arg};
+}
+
+my %placementGroupBlacklistedNames = (
+	'list'		=> 1,
+);
+
+sub validatePlacementGroupName($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^[A-Za-z0-9_]+$/ && !$placementGroupBlacklistedNames{$arg};
+}
+
+sub validateReadWrite($;$)
+{
+	my ($arg) = @_;
+	return !!($arg =~ /^r[wo]$/);
+}
+
+sub validateYesNoChoice($;$)
+{
+	my ($arg) = @_;
+	return !!($arg =~ /^(yes|no)$/i);
+}
+
+sub validateLocationId($;$)
+{
+	my ($arg) = @_;
+	return !!($arg =~ /^[1-9a-km-z]+$/);
+}
+
+sub validateSnapshotFullId($;$)
+{
+	my ($arg) = @_;
+	return !!($arg =~ /^([1-9a-km-z]+\.){2}[1-9a-km-z]+$/);
+}
+
+sub validatePublicKey($;$)
+{
+	my ($arg) = @_;
+	
+	return !!($arg =~ /^([1-9a-km-z]+\.){3}[1-9a-km-z]+$/);
+}
+
+sub validateIP($;$)
+{
+	my ($arg) = @_;
+	my @f = split /\./, $arg, -1;
+	@f == 4 && !grep { !/^ (?: 0 | [1-9][0-9]* ) $/x || $_ > 255 } @f
+}
+
+sub validateTagNameValue($;$)
+{
+	my ($arg) = @_;
+
+	my @fields = split /=/, $arg, 2;
+	return @fields == 2 && validateVolumeName($fields[0]) &&
+		($fields[1] eq '' || validateVolumeName($fields[1]));
+}
+
+sub validatePort($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ m/^\d+$/ && $arg <= 0xffff;
+}
+
+sub validateNetPrefix($;$)
+{
+	my ($arg) = @_;
+	my ($net, $pref) = split('/', $arg);
+	return validateIP($net) && (!$pref || ( (int ($pref) >= 0 && int ($pref) <= 32 )) );
+}
+
+sub validateISCSIPGName($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^[A-Za-z0-9_\-.:]+$/ && !$blacklistedNames{$arg};
+}
+
+sub validateString($;$)
+{
+	return 1;
+}
+
+sub validateIscsiName($;$)
+{
+	my ($arg) = @_;
+	return $arg =~ /^[a-z0-9\-.:]+$/ && !$blacklistedNames{$arg};
+}
+
+sub _buildFlags($;$)
+{
+	my ($flags, $v) = @_;
+	my $s = "";
+	my $sep = ' ';
+	
+	for my $f (@{$flags}) {
+		if ($v->{$f->[1]}) {
+			$s .= $f->[0];
+		} else {
+			$s .= $sep;
+		}
+	}
+	return $s;
+}
+
+my %taskid_to_name = (
+	0 => 'RECOVERY',
+	1 => 'bridge',
+);
+
+sub format_taskid($)
+{
+	my ($arg) = @_;
+	return $taskid_to_name{$arg} // $arg;
+}
+
+my @volumeListFlags = (
+	['R', 'reuseServer', 'allow placing two disks within a replication chain onto the same server'],
+);
+
+sub buildVolumeListFlags($)
+{
+	my ($v) = @_;
+	return _buildFlags(\@volumeListFlags, $v);
+}
+
+my @volumeStatusFlags = (
+	['S', 'snapshot', 'snapshot'],
+	['B', 'balancerBlocked', 'balancer blocked on this volume'],
+	['D', 'decreasedRedundancy', 'decreased redundancy (degraded)'],
+	['M', 'migrating', 'migrating data to a new disk'],
+	['R', 'reuseServer', 'allow placing two disks within a replication chain onto the same server'],
+);
+
+sub buildVolumeStatusFlags($)
+{
+	my ($v) = @_;
+	return _buildFlags(\@volumeStatusFlags, $v);
+}
+
+my @balancerVolumeFlags = (
+	['S', 'snapshot', 'snapshot'],
+	['B', 'blocked', 'balancer blocked on this volume'],
+	['R', 'reallocated', 'this volume will be reallocated'],
+);
+
+sub buildBalancerFlags($)
+{
+	my ($v) = @_;
+	return _buildFlags(\@balancerVolumeFlags, $v);
+}
+
+my @snapshotFlags = (
+	['A', 'autoName', 'anonymous snapshot with auto-generated name'],
+	['B', 'bound', 'bound snapshot'],
+	['R', 'reuseServer', 'allow placing two disks within a replication chain onto the same server'],
+	['T', 'transient', 'transient snapshot (created during volume cloning)'],
+	['P', 'DeleteBlockedByMultipleChildren', 'snapshot delete blocked due to multiple children'],
+);
+
+sub buildSnapshotFlags($)
+{
+	my ($v) = @_;
+	$v->{DeleteBlockedByMultipleChildren} = ( $v->{deleteBlocked} // "not blocked" ) eq "multiple children";
+	
+	return _buildFlags(\@snapshotFlags, $v);
+}
+
+my @templateListFlags = (
+	['R', 'reuseServer', 'allow placing two disks within a replication chain onto the same server'],
+);
+
+sub buildTemplateListFlags($)
+{
+	my ($v) = @_;
+	return _buildFlags(\@templateListFlags, $v);
+}
+
+my @templateStatusFlags = (
+	['R', 'reuseServer', 'allow placing two disks within a replication chain onto the same server'],
+);
+
+sub buildTemplateStatusFlags($)
+{
+	my ($v) = @_;
+	return _buildFlags(\@templateStatusFlags, $v);
+}
+
+sub flagsLegend($)
+{
+	my ($flags) = @_;
+	
+	pagerAdd( "\nFlags:\n" );
+	for my $flag (@{$flags})
+	{
+		pagerAdd( "  %s - %s\n", $flag->[0], $flag->[2] );
+	}
+}
+
+sub decodeObjectStates($)
+{
+	my ($data) = @_;
+	my @ret;
+	foreach my $e (sort keys %{$data->{'objectStates'}})
+	{
+		push @ret,  $objectStates{$e} . ":" . $data->{'objectStates'}->{$e};
+	}
+	return join " ", @ret;
+}
+
+
+sub printServiceListHead($)
+{
+	my ($data) = @_;
+	
+	my $mgmtOnNode;
+	foreach my $mgmtId ( sort { $a <=> $b } keys %{$data->{'mgmt'}} )
+	{
+		if( $data->{mgmt}{$mgmtId}->{'active'} )
+		{
+			$mgmtOnNode = $data->{mgmt}{$mgmtId}->{nodeId};
+		}
+	}
+	
+	pagerAdd("cluster %s, mgmt on node %u\n", $data->{clusterStatus}, $mgmtOnNode);
+}
+
+sub calcFieldWidths($ @)
+{
+	my ($data, %fields) = @_;
+
+	for my $d (ref $data eq 'ARRAY'? @$data: ref $data eq 'HASH'? values %$data: ())
+	{
+		for my $f (keys %fields)
+		{
+			my $len = length($d->{$f} // '');
+			$fields{$f} = $len if $len > $fields{$f};
+		}
+	}
+	
+	return %fields;
+}
+
+sub buildFormatString($ @)
+{
+	my ($data, @specs) = @_;
+
+	# Only look for string fields at the moment
+	state $re_field_width = qr/^(?<name>[A-Za-z0-9_]+)=(?<spec>(?<pre>%-?)(?<width>[0-9]+)(?<fmt>s))/;
+
+	my %fields;
+	for my $s (@specs)
+	{
+		# Only look for string fields at the moment
+		next unless $s =~ $re_field_width;
+		$fields{$+{name}} = $+{width};
+	}
+
+	my %updated = calcFieldWidths($data, %fields);
+	my @res;
+	for my $s (@specs)
+	{
+		if( $s !~ $re_field_width )
+		{
+			push @res, $s;
+		}
+		else
+		{
+			push @res, "$+{pre}$updated{$+{name}}$+{fmt}";
+		}
+	}
+	return @res;
+}
+
+use constant NET_LIST_FLAGS => {
+	beaconStatus => {
+		NODE_UP => 'u',
+		NODE_DOWN => 'd',
+	},
+	clusterStatus => {
+		CNODE_UP => 'U',
+		CNODE_DOWN => 'D',
+		CNODE_DAMPING => 'M',
+	},
+};
+
+sub formatNetList($)
+{
+	my ($arg) = @_;
+	my ($data) = $arg->{nodes} // $arg;
+
+	for my $node (values %$data)
+	{
+		$node->{flags} =
+			NET_LIST_FLAGS->{beaconStatus}->{$node->{beaconStatus}}.
+			NET_LIST_FLAGS->{clusterStatus}->{$node->{clusterStatus}}.
+			($node->{nonVoting}? 'N': ' ').
+			($node->{joined}? '+': ' ').
+			($node->{networks}->{backupLink}? 'B' : ' ').
+			($node->{networks}->{accelerated} ? 'A' : ' ').
+			($node->{networks}->{jumbo} ? 'J' : ' ').
+			($node->{networks}->{oldProto} ? 'O' : ' ');
+		for my $netId (0..1)
+		{
+			if( $arg->{networks} and $arg->{networks}->{$netId}->{mode} eq "routed" )
+			{
+				$node->{"net ".($netId + 1)} =
+					($node->{networks}->{$netId} // { ip => '-' })->{ip};
+			}
+			else
+			{
+				$node->{"net ".($netId + 1)} =
+					($node->{networks}->{$netId} // { mac => '-' })->{mac};
+			}
+		}
+	}
+	
+	$data->{footer} = "";
+	if( defined($arg->{votingNodes}) )
+	{
+		$data->{footer} .= "Quorum status: ". $arg->{votingNodes}->{up} . " voting beacons up out of " . $arg->{votingNodes}->{expected} . " expected\n";
+	}
+	
+	$data->{footer} .= <<'EOFOOTER';
+Flags:
+  u - packets recently received from this node
+  d - no packets recently received from this node
+
+  U - this node has enough votes to be in the quorum
+  D - this node does not have enough votes to be in the quorum
+  M - this node is being damped by the rest of the nodes in the cluster
+  + - this node considers itself in the quorum
+  B - the connection to this node is through a backup link; check the cabling
+  A - this node is using hardware acceleration
+  J - the node uses jumbo frames
+
+  N - a non-voting node
+EOFOOTER
+	return $data;
+}
+
+sub formatIscsiInitiators($)
+{
+	my ($data) = @_;
+
+	my @found = values %{$data->{iscsi}{initiators}};
+	$_->{networksCount} = scalar @{$_->{nets}} for @found;
+	$_->{exportsCount} = scalar @{$_->{exports}} for @found;
+	return [ @found ];
+}
+
+sub by_name($ $ $)
+{
+	my ($data, $name, $type) = @_;
+	my @values = ref $data eq 'ARRAY'? @{$data}: values %{$data};
+	return @values unless defined $name;
+
+	my @found = grep { $_->{name} eq $name } @values;
+	die "No $type named '$name'\n" unless @found;
+	die "Misconfiguration: more than one $type named '$name'\n" if @found > 1;
+	return $found[0];
+}
+
+sub formatIscsiPortals($ $)
+{
+	my ($data, $params) = @_;
+	my @pgs = by_name $data->{iscsi}{portalGroups}, $params->{pgName}, 'portal group';
+
+	my @portals;
+	for my $pg (@pgs)
+	{
+		push @portals, map {
+			{
+				group => $pg->{name},
+				address => "$_->{ip}:$_->{port}",
+				%{$_}
+			}
+		} @{$pg->{portals}};
+	}
+	return [ @portals ];
+}
+
+sub formatIscsiPGNetworks($ $)
+{
+	my ($data, $params) = @_;
+	my @pgs = by_name $data->{iscsi}{portalGroups}, $params->{pgName}, 'portal group';
+
+	my @networks;
+	for my $pg (@pgs)
+	{
+		push @networks, map {
+			{
+				group => $pg->{name},
+				%{$_}
+			}
+		} @{$pg->{networks}};
+	}
+	return [ @networks ];
+}
+
+sub formatIscsiInitiatorExports($ $)
+{
+	my ($data, $params) = @_;
+	my @inits = by_name $data->{iscsi}{initiators}, $params->{initName}, 'initiator';
+
+	my @exports;
+	for my $init (@inits)
+	{
+		push @exports, map {
+			{
+				initiator => $init->{name},
+				portalGroup => $_->{portalGroup},
+				%{by_name $data->{iscsi}{targets}, $_->{target}, 'target'}
+			}
+		} @{$init->{exports}};
+	}
+	return [ @exports ];
+}
+
+sub formatIscsiInitiatorNetworks($ $)
+{
+	my ($data, $params) = @_;
+	my @inits = by_name $data->{iscsi}{initiators}, $params->{initName}, 'initiator';
+
+	my @networks;
+	for my $init (@inits)
+	{
+		push @networks, map {
+			my @fields = split m{/}, $_, 2;
+			{
+				initiator => $init->{name},
+				address => $fields[0],
+				prefix => $fields[1],
+			}
+		} @{$init->{nets}};
+	}
+	return [ @networks ];
+}
+
+sub formatKubernetesList($)
+{
+	my ($data) = @_;
+
+	return [ map { {
+		%{$_},
+		disabled => $_->{disabled} ? 'true' : 'false',
+	} } values %{$data->{kubernetes}} ];
+}
+
+sub formatKubernetesStatusClasses($)
+{
+	my ($data) = @_;
+	my $kube = $data->{kubernetes};
+
+	my @res;
+	for my $cluster (values %{$kube}) {
+		push @res, map { {
+			cluster => $cluster->{name},
+			%{$_},
+		} } values %{$cluster->{registeredStorageClasses}};
+	}
+	return \@res;
+}
+
+my %format = (
+	iscsi_basename => {
+		fields => [
+			{ name => 'basename', type => 'Str', },
+		],
+		preprocess => sub { [ { basename => $_[0]->{iscsi}{baseName} } ] },
+	},
+
+	iscsi_initiators => {
+		fields => [
+			{ name => 'name', type => 'Str', },
+			{ name => 'username', type => 'Str', },
+			{ name => 'secret', type => 'Str', },
+			{ name => 'networksCount', type => 'Int', },
+			{ name => 'exportsCount', type => 'Int', },
+		],
+		preprocess => \&formatIscsiInitiators,
+	},
+
+	iscsi_initiatorExports => {
+		fields => [
+			{ name => 'name', type => 'Str', },
+			{ name => 'volume', type => 'Str', },
+			{ name => 'currentControllerId', type => 'Int', },
+			{ name => 'portalGroup', type => 'Str', },
+			{ name => 'initiator', type => 'Str', },
+		],
+		sort_keys => [ qw(initiator portalGroup name) ],
+		preprocess => \&formatIscsiInitiatorExports,
+	},
+
+	iscsi_initiatorNetworks => {
+		fields => [
+			{ name => 'initiator', type => 'Str', },
+			{ name => 'address', type => 'Str', },
+			{ name => 'prefix', type => 'Int', },
+		],
+		sort_keys => [ qw(initiator address) ],
+		preprocess => \&formatIscsiInitiatorNetworks,
+	},
+
+	iscsi_portalGroupPortals => {
+		fields => [
+			{ name => 'group', type => 'Str', },
+			{ name => 'address', type => 'Str', },
+			{ name => 'controller', type => 'Int', },
+		],
+		sort_keys => [ qw(group address) ],
+		preprocess => \&formatIscsiPortals,
+	},
+
+	iscsi_portalGroupNetworks => {
+		fields => [
+			{ name => 'group', type => 'Str', },
+			{ name => 'address', type => 'Str', },
+			{ name => 'prefix', type => 'Int', },
+		],
+		sort_keys => [ qw(group address) ],
+		preprocess => \&formatIscsiPGNetworks,
+	},
+
+	iscsi_portalGroups => {
+		fields => [
+			{ name => 'name', type => 'Str', },
+			{ name => 'networksCount', type => 'Int', },
+			{ name => 'portalsCount', type => 'Int', },
+		],
+		preprocess => sub { [ map {
+				$_->{networksCount} = scalar @{$_->{networks}};
+				$_->{portalsCount} = scalar @{$_->{portals}};
+				$_
+			} values %{$_[0]->{iscsi}{portalGroups}} ]
+		},
+	},
+
+	iscsi_targets => {
+		fields => [
+			{ name => 'name', type => 'Str', },
+			{ name => 'volume', type => 'Str', },
+			{ name => 'currentControllerId', type => 'Int', },
+		],
+		preprocess => sub { [ values %{$_[0]->{iscsi}{targets}} ] },
+	},
+
+	kubernetesList => {
+		fields => [
+			{ name => 'name', type => 'Str', },
+			{ name => 'disabled', type => 'Str', },
+		],
+		preprocess => \&formatKubernetesList,
+	},
+
+	kubernetesStatusClasses => {
+		fields => [
+			{ name => 'cluster', type => 'Str', },
+			{ name => 'name', type => 'Str', },
+			{ name => 'template', type => 'Str', },
+			{ name => 'status', type => 'Str', },
+		],
+		preprocess => \&formatKubernetesStatusClasses,
+	},
+
+	kubernetesStatusClusters => {
+		fields => [
+			{ name => 'name', type => 'Str', },
+			{ name => 'registeredStorageClassesCount', type => 'Int', title => 'sc' },
+			{ name => 'watchers', type => 'Str', title => 'w' },
+			{ name => 'provisionsInProgress', type => 'Int', title => 'pvc' },
+			{ name => 'claimsNoResourcesTotalCount', type => 'Int', title => 'noRsrc' },
+			{ name => 'claimsNoTemplateTotalCount', type => 'Int', title => 'noTempl' },
+			{ name => 'claimsUnsupportedAccessMode', type => 'Int', title => 'mode'},
+			{ name => 'claimsMissingStorageClassCount', type => 'Int', title => 'noSC' },
+		],
+		preprocess => sub {
+			my $kub = $_[0]->{kubernetes};
+			
+			foreach my $key (keys %{$kub})
+			{
+				my $watchers = 0;
+				$watchers++ if( $kub->{$key}->{persistentVolumeWatcher} eq "connected" );
+				$watchers++ if( $kub->{$key}->{storageClassWatcher} eq "connected" );
+				$watchers++ if( $kub->{$key}->{persistentVolumeClaimsWatcher} eq "connected" );
+				
+				$kub->{$key}->{'watchers'} = "$watchers/3";
+				
+				$kub->{$key}->{'provisionsInProgress'} = $kub->{$key}->{claimsPendingCount} +
+						$kub->{$key}->{claimsProvisionedCount} +
+						$kub->{$key}->{claimsPendingAck};
+			}
+			
+			$kub->{footer} .= <<'EOFOOTER';
+Feilds:
+  sc      - registered Storage Classes
+  w       - watch connections to the kube adm
+  pvc     - persistentVolumeClaims beeing provisioned
+  noRsrc  - persistentVolumeClaims failed due to no resources
+  noTempl - persistentVolumeClaims failed due to missing template
+  mode    - persistentVolumeClaims failed due to unsupported access mode
+  noSC    - persistentVolumeClaims failed due to missing storage class
+EOFOOTER
+			
+			return $kub;
+		},
+		footer => 'footer'
+	},
+
+	net => {
+		fields => [
+			{ name => 'nodeId', type => 'Int', },
+			{ name => 'flags', type => 'Str', },
+			# 6 * 2 + 5: xx:xx:xx:xx:xx:xx
+			{ name => 'net 1', type => 'Str', width => 17, },
+			{ name => 'net 2', type => 'Str', width => 17, },
+		],
+		preprocess => \&formatNetList,
+		footer => 'footer',
+	},
+
+	locationsList => {
+		fields => [
+			{ name => 'id', type => 'Str', },
+			{ name => 'name', type => 'Str', },
+		],
+		preprocess => sub { $_[0]->{locations} },
+	},
+
+	clustersList => {
+		fields => [
+			{ name => 'id', type => 'Str', },
+			{ name => 'location', type => 'Str', },
+		],
+		preprocess => sub { $_[0]->{clusters} },
+	},
+
+	remoteBridgesList => {
+		fields => [
+			{ name => 'ip', type => 'IPv4', },
+			{ name => 'location', type => 'Str', },
+			{ name => 'minimumDeleteDelay', type => 'Int' },
+			{ name => 'publicKey', type => 'Str', },
+		],
+		preprocess => sub { $_[0]->{remoteBridges} },
+		sort_keys => [ qw(location ip) ],
+	},
+
+	snapshotsRemote => {
+		fields => [
+			{ name => 'location', type => 'Str', },
+			{ name => 'remoteId', type => 'Str', },
+			{ name => 'name', type => 'Str', },
+			{ name => 'onVolume', type => 'Str', },
+			{ name => 'size', type => 'Int', },
+			{ name => 'creationTimestamp', type => 'Str', },
+		],
+		preprocess => sub {
+			return [ map {
+				{
+					%{$_},
+					creationTimestamp => formatTime($_->{creationTimestamp}),
+				}
+			} @{$_[0]->{snapshots}} ]
+		},
+		sort_keys => [ qw(location name onVolume creationTimestamp) ],
+	},
+
+	snapshotsExports => {
+		fields => [
+			{ name => 'location', type => 'Str', },
+			{ name => 'snapshot', type => 'Str', },
+			{ name => 'globalId', type => 'Str', },
+			{ name => 'backingUp', type => 'Str', },
+		],
+		preprocess => sub {
+			return [ map {
+				{
+					%{$_},
+					backingUp => $_->{backingUp}? 'true': 'false',
+				}
+			} @{$_[0]->{exports}} ]
+		},
+		sort_keys => [ qw(location snapshot) ],
+	},
+);
+
+sub defined_sort_cmp($ $ $)
+{
+    defined($_[0])
+	? defined($_[1])
+		? $_[2]->($_[0], $_[1])
+		: 1
+	: defined($_[1])
+		? -1
+		: 0
+}
+
+my %formatTypes = (
+	Int => {
+		spec => 'd',
+		sort => sub { $_[0] <=> $_[1] },
+	},
+
+	Str => {
+		just => '-',
+		spec => 's',
+		sort => sub { $_[0] cmp $_[1] },
+	},
+
+	IPv4 => {
+		just => '-',
+		spec => 's',
+		sort => sub {
+			my @f0 = split /\./, $_[0];
+			my @f1 = split /\./, $_[1];
+
+			for( 0..$#f0 )
+			{
+				my $res = $f0[$_] <=> $f1[$_];
+				return $res if $res;
+			}
+			return 0;
+		},
+	},
+);
+
+sub format_csv_field($)
+{
+	my ($value) = @_;
+	for my $char ('"', $csv_separator, "\n") {
+		if( index($value, $char) >= 0 )
+		{
+			$value =~ s/"/""/g;
+			return "\"$value\"";
+		}
+	}
+	return $value;
+}
+
+sub print_csv_line(@)
+{
+	my (@values) = @_;
+
+	pagerAdd join($csv_separator, map format_csv_field $_, @values)."\n";
+}
+
+sub displayFormatted($ $ $ $)
+{
+	my ($mode, $fmt, $data, $params) = @_;
+	my $fields = $fmt->{fields};
+
+	if( defined $fmt->{preprocess} )
+	{
+		eval
+		{
+			$data = $fmt->{preprocess}->($data, $params);
+		};
+		if( $@ )
+		{
+			pagerAdd '%s', $@;
+			pagerDisplay();
+			return 1;
+		}
+	}
+
+	my %around;
+	for my $type (qw(header footer)) {
+		next unless defined $fmt->{$type} && exists $data->{$fmt->{$type}};
+		$around{$type} = $data->{$fmt->{$type}};
+		delete $data->{$fmt->{$type}};
+	}
+
+	if( $format eq 'json' )
+	{
+		my $output = $jsonObj->encode($data);
+		pagerAdd $output;
+		pagerAdd "\n" unless substr($output, -1) eq "\n";
+		pagerDisplay;
+		return 0;
+	}
+
+	my $idfield = $fields->[0]->{name};
+	my @values;
+	if( ref $data eq 'HASH' )
+	{
+		my $sorter = $formatTypes{$fields->[0]{type}}{sort};
+
+		my @keys = sort { defined_sort_cmp($a, $b, $sorter) } keys %$data;
+		for my $k (@keys)
+		{
+			my $old = $data->{$k}->{$idfield};
+			if( defined $old )
+			{
+				if( $old ne $k ) {
+					die "displayFormatted '$mode': key field '$idfield' ".
+						"present in entry '$k' with a different value '$old'\n";
+				}
+			}
+			else
+			{
+				$data->{$k}->{$idfield} = $k;
+			}
+		}
+		@values = @$data{@keys};
+	}
+	elsif( ref $data eq 'ARRAY' )
+	{
+		@values = @$data;
+	}
+	else
+	{
+		die "displayFormatted '$mode': unexpected data type '".ref($data)."'\n";
+	}
+
+	my @sort_keys = @{ $fmt->{sort_keys} // [ $idfield ] };
+	for my $skey (reverse @sort_keys) {
+		my $reverse;
+		if ($skey =~ /^ - (?<key> .+ ) $/x) {
+			$skey = $+{key};
+			$reverse = 1;
+		}
+		my @sfields = grep { $_->{name} eq $skey } @{$fmt->{fields}};
+		die "Internal error: bad sort key field '$skey'\n" unless @sfields;
+		die "Internal error: more than one field named '$skey'\n" if @sfields > 1;
+		my $stype = $sfields[0]{type};
+
+		# For a couple of amazing pieces of Perl history, perldoc sort
+		# (perldoc -f sort only contains a single one of those gems).
+		# Whiskey and "bang head here" poster not included.
+		use sort qw(defaults stable);
+
+		my $sorter = $formatTypes{$stype}{sort};
+		@values = sort { defined_sort_cmp($a->{$skey}, $b->{$skey}, $sorter) } @values;
+		if ($reverse) {
+			@values = reverse @values;
+		}
+	}
+
+	if( $format eq 'csv' )
+	{
+		print_csv_line map { $_->{name} } @$fields;
+		for my $line ( @values )
+		{
+			print_csv_line map { $line->{$_->{name}} } @$fields;
+		}
+		pagerDisplay;
+		return 1;
+	}
+	elsif( $format ne 'text' )
+	{
+		die "Internal error: how did we get here with format '$format'?!\n";
+	}
+
+	# Figure out the max width and the printf format specifier for each field
+	my (%width, %just);
+	for my $f (@$fields)
+	{
+		my $title = $f->{title} // $f->{name};
+		if (($f->{width} // length $title) !~ /^([1-9][0-9]*)$/)
+		{
+			die "Internal error: invalid field width for $mode:$f->{name}\n";
+		}
+		$just{$f->{name}} = $f->{just} // $formatTypes{$f->{type}}{just} // '';
+		$width{$f->{name}} = $1;
+	}
+	for my $v (@values)
+	{
+		for my $f (@$fields)
+		{
+			my $name = $f->{name};
+			my $value = $v->{$name};
+			next unless defined $value;
+			my $len = length($value);
+			$width{$name} = $len if $width{$name} < $len;
+		}
+	}
+	my $lineFmt = '| ';
+	my $titleFmt = $lineFmt;
+	my $sepWidth = length $lineFmt;
+	for my $f (@$fields)
+	{
+		# TODO: floating-point numbers, etc.
+		my $w = $width{$f->{name}};
+		$lineFmt .= "%$just{$f->{name}}${w}s | ";
+		$titleFmt .= "%-${w}s | ";
+		$sepWidth += $w + 3;
+	}
+	# Replace the final space with a newline
+	substr($lineFmt, -1) = "\n";
+	substr($titleFmt, -1) = "\n";
+	my $sep = '-' x ($sepWidth - 1);
+
+	pagerAdd '%s', $around{header} if defined $around{header};
+	pagerAdd "%s\n", $sep;
+	pagerAdd $titleFmt, map $_->{title} // $_->{name}, @$fields;
+	pagerAdd "%s\n", $sep;
+	for my $v (@values)
+	{
+		my @output = map {
+			my $value = $v->{$_->{name}};
+			defined($value)
+				? sprintf('%'.$formatTypes{$_->{type}}{spec}, $value)
+				: ''
+		} @$fields;
+		pagerAdd $lineFmt, @output;
+	}
+	pagerAdd "%s\n", $sep;
+	pagerAdd '%s', $around{footer} if defined $around{footer};
+	pagerDisplay();
+}
+
+sub splitVolumeTags($)
+{
+	my ($p) = @_;
+	
+	if( !defined $p->{tags} )
+	{
+		$p->{tags} = {};
+	} elsif( ref $p->{tags} eq 'ARRAY' )
+	{
+		$p->{tags} = { map { split /=/, $_, 2 } @{$p->{tags}} };
+	}
+}
+
+sub joinVolumeTags($)
+{
+	my ($data) = @_;
+	
+	for my $v ( @$data )
+	{
+		if( !defined $v->{tags} )
+		{
+			$v->{tags} = '';
+		} elsif( ref $v->{tags} eq 'HASH' )
+		{
+			$v->{tags} = join ' ', map {
+				"$_=$v->{tags}{$_}"
+			} sort keys %{$v->{tags}};
+		}
+	}
+}
+
+sub doDisplay($@) # called with hashref and an array containing a single arrayref. probably a mistake, but I document the calling convention anyway //bk
+{
+	my ($d, $resData) = @_;
+	my $retval = 0;
+	my $err;
+	
+	my $data = $resData->[0];
+	my $mode = $d->{mode};
+	
+	if( $resData->[1] )
+	{
+		$err = $data;
+		goto out;
+	}
+	elsif( defined $format{$mode} )
+	{
+		return displayFormatted $mode, $format{$mode}, $data, $d->{params};
+	}
+	elsif( $format ne 'text' )
+	{
+		$err = $data = { error => { descr => 'Custom output formatting not available for this command' } };
+	}
+	elsif( $mode eq 'disks' )
+	{
+		if (%$data)
+		{
+			my @keys = sort { $a <=> $b } keys( %{$data} );
+			my $agSize = 512*1024*1024 * (4096+128) / 4096;
+			my $fmt = "%8s  |  %6s  |  %8s  |  %8s  |  %8s  |  %5s  |  %12s  |  %12s  |  %16s |  %6s \n";
+			
+			pagerAdd $fmt, "disk", "server", "  size  ", "  used  ", "est.free", "%",  "free entries", "on-disk size", "allocated objects", "errors";
+			
+			my @fields = qw(entriesAllocated entriesCount agFree agCount sectorsCount objectsOnDiskSize objectsAllocated objectsCount totalErrorsDetected pendingErrorRecoveries);
+			my %totals =
+			(
+				id => 0,
+				serverId => 0,
+			);
+			$totals{$_} = 0 for @fields;
+			
+			my $printDisk;
+			$printDisk = sub ($)
+			{
+				my $disk = $_[0];
+				
+				my $id = $disk->{id};
+				my $server = formatServerId($disk->{serverId}) || '-';
+				my $objectsAllocated = $disk->{objectsAllocated} || '-';
+				my $objectsCount = $disk->{objectsCount} || '-';
+				
+				my ($rawSize, $enFree, $agPercent) = ('-') x 3;
+				my ($humanSize, $humanOnDiskSize, $humanUsed, $humanFree, $totalErrorsDetected, $pendingErrorRecoveries) = ('-') x 6;
+				
+				
+				if ( exists $disk->{entriesCount} )
+				{
+					$humanOnDiskSize = sprintf( "%7s",  humanBytes($disk->{objectsOnDiskSize}) );
+					$rawSize = $disk->{agCount} * $agSize;
+					
+					my $enAlloc = $disk->{entriesAllocated};
+					my $enCount = $disk->{entriesCount};
+					$enFree = $enCount - $enAlloc;    ###
+					
+					my $agFree = $disk->{agFree};
+					my $agCount = $disk->{agCount};
+					my $agAlloc = $agCount - $agFree;
+					$agPercent = round( 100 * $agAlloc / $agCount ) if $agCount;
+					
+					my $spaceUsed = $agAlloc * $agSize;
+					my $spaceFree = int($agSize * ($agFree - 12) / (4096+128) * 4096);
+					
+					$humanSize = sprintf( "%7s",       humanBytes($rawSize) );
+					$humanUsed = sprintf( "%7s",       humanBytes($spaceUsed) );
+					$humanFree = sprintf( "%7s",       humanBytes($spaceFree) );
+					$totalErrorsDetected = $disk->{totalErrorsDetected};
+					$pendingErrorRecoveries = $disk->{pendingErrorRecoveries};
+				}
+				
+				pagerAdd
+					$fmt,
+					
+					$id,
+					$server,
+					
+					$humanSize,
+					$humanUsed,
+					$humanFree,
+					sprintf( "%3s %%",    $agPercent),
+					
+					$enFree,
+					$humanOnDiskSize,
+					sprintf("%7s / %-7s", $objectsAllocated, $objectsCount),
+					sprintf("%s / %s", $pendingErrorRecoveries, $totalErrorsDetected);
+			}; # end sub
+			
+			my %tmp = ();
+			foreach my $diskId ( @keys )
+			{
+				my $disk = $data->{$diskId};
+				
+				if ( exists $disk->{entriesCount} )
+				{
+					$totals{$_} += $disk->{$_} for @fields;
+				}
+				$printDisk->($disk);
+				
+				# count disks and servers
+				$tmp{ $disk->{serverId} } = 1 if $disk->{serverId};
+			}
+			
+			pagerAdd "%s\n", "-"x136;
+			$totals{id} = scalar @keys;
+			$totals{serverId} = scalar keys %tmp;
+			$printDisk->(\%totals);
+		}
+	}
+	elsif( $mode eq 'disksInfo' )
+	{
+		if (%$data)
+		{
+			my @keys = sort { $a <=> $b } keys( %{$data} );
+			my $fmt = "%8s  |  %6s  |  %-10s  |  %-16s  |  %-25s  |  %-30s  |  %-20s  |\n";
+			
+			pagerAdd $fmt, "disk ", "server", "  device", "     model", "         serial", "           description",  "       flags";
+			
+			my %tmp = ();
+			foreach my $diskId ( @keys )
+			{
+				my $disk = $data->{$diskId};
+				
+				my $id = $disk->{id};
+				my ($device, $model, $serial, $description) = ('-') x 4;
+				my $server = formatServerId($disk->{serverId}) || '-';
+				
+				$device = $disk->{device} if( exists $disk->{device});
+				$model = $disk->{model} if( exists $disk->{model});
+				$serial = $disk->{serial} if( exists $disk->{serial});
+				$description = $disk->{description} if( exists $disk->{description});
+				
+				my @flags;
+				if( $disk->{ssd} )
+				{
+					push @flags, "S";
+				}
+				
+				if( $disk->{isWbc} )
+				{
+					push @flags, "W";
+				}
+				
+				if( $disk->{journaled} )
+				{
+					push @flags, "J";
+				}
+				
+				if( $disk->{noFua} )
+				{
+					push @flags, "noFua";
+				}
+				
+				if( $disk->{noFlush} )
+				{
+					push @flags, "noFlush";
+				}
+				
+				if( $disk->{noTrim} )
+				{
+					push @flags, "noTrim";
+				}
+				
+				if( $disk->{softEject} eq 'on' )
+				{
+					push @flags, "ejecting";
+				}
+				elsif( $disk->{softEject} eq 'paused' )
+				{
+					push @flags, "ejecting paused";
+				}
+				
+				pagerAdd
+					$fmt,
+					
+					$id,
+					$server,
+					$device,
+					$model,
+					$serial,
+					$description,
+					join(", ", @flags);
+			}
+		}
+	}
+	elsif( $mode eq 'disksInternal' )
+	{
+		if (%$data)
+		{
+			my $fmt = "| ". join(' | ', qw(%4s %6s %30s %24s %12s %34s %20s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x7)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, "disk", "server", "aggregate scores       ", "wbc pages       ",  "scrub bw", "scrub ETA", "last scrub completed";
+			pagerAdd "%s\n", $sep;
+			
+			my @keys = sort { $a <=> $b } keys( %{$data} );
+			foreach my $diskId ( @keys )
+			{
+				my $disk = $data->{$diskId};
+				if( $disk->{generationLeft} != -1 )
+				{
+					$disk->{aggregateScore}->{space} = $disk->{aggregateScore}->{entries} = $disk->{aggregateScore}->{total} = '-';
+				}
+				
+				if( !$disk->{isWbc} )
+				{
+					$disk->{wbc}->{pages} = $disk->{wbc}->{pagesPending} = $disk->{wbc}->{maxPages} = '-';
+				}
+				
+				my $scrubBw = "-";
+				my $scrubEta = "-";
+				if( $disk->{scrubbingStartedBefore} )
+				{
+					$scrubBw = humanBytes( $disk->{scrubbingBW} );
+					
+					if( $disk->{scrubbingFinishAfter} )
+					{
+						$scrubEta = formatTime(time() + $disk->{scrubbingFinishAfter}) . ' ( +'.formatSeconds($disk->{scrubbingFinishAfter}).' )';
+					}
+				}
+				
+				if( $disk->{lastScrubCompleted} )
+				{
+					$disk->{lastScrubCompleted} = formatTime($disk->{lastScrubCompleted})
+				}
+				else
+				{
+					$disk->{lastScrubCompleted} = "-";
+				}
+				
+				$scrubEta = "paused" if( $disk->{scrubbingPaused} );
+				
+				
+				pagerAdd $fmt,
+					$disk->{id},
+					formatServerId($disk->{serverId}),
+					sprintf("%8s | %8s | %8s", $disk->{aggregateScore}->{space}, $disk->{aggregateScore}->{entries}, $disk->{aggregateScore}->{total}),
+					sprintf("%5s + %-5s / %-5s", $disk->{wbc}->{pages}, $disk->{wbc}->{pagesPending}, $disk->{wbc}->{maxPages}),
+					$scrubBw,
+					$scrubEta,
+					$disk->{lastScrubCompleted};
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	elsif( $mode eq 'disksTargets' )
+	{
+		if( %$data )
+		{
+			my $fmt = "| ". join(' | ', qw(%8s %6s %8s %40s %40s %48s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x6)-1);
+			
+			my $printDisk = sub($)
+			{
+				my ($disk) = @_;
+				my $size = '-';
+				my ($stored, $estStored, $deltaStored, $storedToRecover) = ('-') x 4;
+				my ($objCount, $objAllocated, $objTarget, $objDelta, $objToRecover) = ('-') x 5;
+				my ($onDisk, $estOnDisk, $deltaOnDisk, $onDiskToRecover) = ('-') x 4;
+				
+				if( $disk->{generationLeft} == -1 )
+				{
+					$size = humanBytes($disk->{sectorsCount} * 512);
+					$stored = humanBytes($disk->{storedSize}->{current});
+					$estStored = humanBytes($disk->{storedSize}->{target});
+					$deltaStored = humanBytes($disk->{storedSize}->{delta});
+					$storedToRecover = humanBytes($disk->{storedSize}->{toRecover});
+					
+					$onDisk = humanBytes($disk->{onDiskSize}->{current});
+					$estOnDisk = humanBytes($disk->{onDiskSize}->{target});
+					$deltaOnDisk = humanBytes($disk->{onDiskSize}->{delta});
+					$onDiskToRecover = humanBytes($disk->{onDiskSize}->{toRecover});
+					
+					$objCount = $disk->{objectsCount};
+					$objAllocated = $disk->{objectsAllocated}->{current};
+					$objTarget = $disk->{objectsAllocated}->{target};
+					$objDelta = $disk->{objectsAllocated}->{delta};
+					$objToRecover = $disk->{objectsAllocated}->{toRecover};
+				}
+				
+				pagerAdd
+					$fmt,
+					$disk->{id},
+					formatServerId($disk->{serverId}),
+					$size,
+					sprintf("%8s -> %-8s %8s / %-8s", $stored, $estStored, sprintf("(%s", $deltaStored), sprintf("%s)", $storedToRecover)),
+					sprintf("%8s -> %-8s %8s / %-8s", $onDisk, $estOnDisk, sprintf("(%s", $deltaOnDisk), sprintf("%s)", $onDiskToRecover)),
+					sprintf("%7s -> %-7s %8s / %-8s / %-7s", $objAllocated, $objTarget,
+								$objDelta ne '-' ? sprintf("(%+d", $objDelta) : "( -",
+								$objToRecover ne '-' ? sprintf("%+d)", $objToRecover) : "- )",
+								$objCount);
+			};
+			
+			my @fields = qw(storedSize onDiskSize objectsAllocated);
+			my @vals = qw(current target delta toRecover);
+			my %totals = (
+				generationLeft => 0,
+				objectsCount => 0,
+				sectorsCount => 0,
+				map { ($_, { map { ($_, 0) } @vals }) } @fields
+			);
+			my %servers = ();
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, "disk", "server", "size  ", "stored                 ", "on-disk                 ", "objects                     ";
+			pagerAdd "%s\n", $sep;
+			
+			my @keys = sort { $a <=> $b } keys( %{$data} );
+			foreach my $diskId ( @keys )
+			{
+				my $disk = $data->{$diskId};
+				
+				$printDisk->($disk);
+				
+				$servers{$disk->{serverId}} = 1;
+				if( $disk->{generationLeft} == -1 )
+				{
+					$totals{generationLeft} = -1;
+					$totals{sectorsCount} += $disk->{sectorsCount};
+					$totals{objectsCount} += $disk->{objectsCount};
+					
+					foreach my $f ( @fields )
+					{
+						foreach my $v ( @vals )
+						{
+							$totals{$f}->{$v} += $disk->{$f}->{$v};
+						}
+					}
+				}
+			}
+			pagerAdd "%s\n", $sep;
+			
+			$totals{id} = scalar @keys;
+			$totals{serverId} = scalar keys %servers;
+			$printDisk->(\%totals);
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'disk' )
+	{
+		my $fmt = "%-20s | %12s | %12s | %12s | %12s | %-20s\n";
+		
+		pagerAdd $fmt, ' object name ', 'stored size', 'on-disk size', 'data version', 'object state', 'parent volume';
+		
+		my %tot = ();
+		
+		foreach my $s
+		(
+			sort
+			{
+				$a->{volume} cmp $b->{volume} ||
+				$a->{objectId} <=> $b->{objectId}
+			}
+			values
+				%{ $data->{'objects'} }
+		)
+		{
+			$tot{objects} ++;
+			$tot{storedSize} += $s->{storedSize};
+			$tot{onDiskSize} += $s->{onDiskSize};
+			
+			pagerAdd
+				$fmt,
+				
+				$s->{volume}.':'.$s->{objectId},
+				humanBytes $s->{storedSize},
+				humanBytes $s->{onDiskSize},
+				$s->{generation}.':'.$s->{version},
+				sprintf( '%s (%d)', $objectStates{$s->{'state'}}, $s->{'state'} ),
+				$s->{parentVolume};
+		}
+		
+		pagerAdd "%s\n", "-" x 100;
+		pagerAdd
+			$fmt ,
+			
+			$tot{objects}.' objects',
+			humanBytes $tot{storedSize},
+			humanBytes $tot{onDiskSize},
+			'',
+			'',
+			'';
+	}
+	
+	elsif( $mode eq 'diskInfo')
+	{
+		my @hdr = qw/agAllocated agCount agFree agFreeing agFull agMaxSizeFull agMaxSizePartial agPartial/;
+		my @fmt = ();
+		foreach my $e (@hdr)
+		{
+			push @fmt, sprintf("%%%ds", length($e));
+		}
+		my $fmt = join(' | ', @fmt)."\n";
+		pagerAdd ( $fmt,  @hdr);
+		pagerAdd ( $fmt,  @{$data}{@hdr});
+		pagerAdd("\n");
+		
+		@hdr = qw/ entriesAllocated entriesCount entriesFree sectorsCount/;
+		@fmt = ();
+		foreach my $e (@hdr)
+		{
+			push @fmt, sprintf("%%%ds", length($e));
+		}
+		$fmt = join(' | ', @fmt)."\n";
+		pagerAdd ( $fmt,  @hdr);
+		pagerAdd ( $fmt,  @{$data}{@hdr});
+		pagerAdd("\n");
+		
+		@hdr = qw/ objectsAllocated objectsCount objectsFree/;
+		@fmt = ();
+		foreach my $e (@hdr)
+		{
+			push @fmt, sprintf("%%%ds", length($e));
+		}
+		push @fmt, "%s";
+		$fmt = join(' | ', @fmt)."\n";
+		pagerAdd ( $fmt,  @hdr, 'objectStates');
+		pagerAdd ( $fmt,  @{$data}{@hdr}, decodeObjectStates($data) );
+		pagerAdd("\n");
+		
+		pagerAdd("%s | %d\n\n", 'serverId', formatServerId($data->{'serverId'}));
+		@hdr = qw/ id objectsCount onDiskSize storedSize /;
+		@fmt = qw( %-20s %12s %10s %10s %s) ;
+		$fmt = join(' | ', @fmt)."\n";
+		pagerAdd($fmt,@hdr, 'objectStates');
+		foreach my $e (sort keys %{$data->{'volumeInfos'}})
+		{
+#			next unless $e =~ /^(\.sys\.vol\.|\w)/i;
+			my $ref = $data->{'volumeInfos'}->{$e};
+			pagerAdd($fmt,
+					$ref->{name},
+					$ref->{objectsCount},
+					humanBytes $ref->{onDiskSize},
+					humanBytes $ref->{storedSize},
+					decodeObjectStates($ref)
+				);
+		}
+	}
+	
+	elsif( $mode eq 'activeRequests' )
+	{
+		if (%$data)
+		{
+			my $fmt = "| ". join(' | ', qw(%-30s %12s %20s %15s %10s %8s %14s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x7)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'request ID', 'request IDX', 'volume', 'address', 'size', 'op', 'time active';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $req (sort { -($a->{msecActive} <=> $b->{msecActive}) } @{$data->{requests}})
+			{
+				pagerAdd
+					$fmt,
+					$req->{requestId},
+					$req->{requestIdx},
+					$req->{volume},
+					$req->{address},
+					humanBytes $req->{size},
+					$req->{op},
+					$req->{msecActive}.' msec',
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'servers' )
+	{
+		printServiceListHead( $data );
+		
+		my $repSingle = sub ($$)
+		{
+			my ($mode, $s) = @_;
+			
+			my $srv = formatServerId($s->{id});
+			
+			my $add = '';
+			if ($s->{'missingDisks'} && @{$s->{'missingDisks'}}) {
+				$add .= ' missing:'.join(',', @{$s->{'missingDisks'}});
+			}
+			if ($s->{'pendingDisks'} && @{$s->{'pendingDisks'}}) {
+				$add .= ' pending:'.join(',', @{$s->{'pendingDisks'}});
+			}
+			if( not defined $s->{nodeId} )
+			{
+				pagerAdd "  %8s%6s%8s", $mode, $srv, $s->{'status'};
+
+			}
+			else
+			{
+				pagerAdd "  %8s%6s%8s on node %2s%s\n", $mode, $srv, $s->{'status'}, $s->{nodeId}, $add;
+			}
+		};
+		
+		foreach my $server ( sort { $a <=> $b } keys %{$data->{'servers'}} )
+		{
+			$repSingle->('server', $data->{servers}{$server});
+		}
+	}
+	elsif( $mode eq 'services' )
+	{
+		printServiceListHead( $data );
+		
+		my $now = time();
+		
+		my $repSingle = sub ($$)
+		{
+			my ($mode, $s) = @_;
+			
+			my $srv = $s->{id};
+			$srv = formatServerId($srv) if( $mode eq "server" );
+			
+			my $add = '';
+			if( $s->{'active'} )
+			{
+				$add .= ' active';
+			}
+
+			if( not defined $s->{nodeId} )
+			{
+				pagerAdd "  %8s%6s%8s", $mode, $srv, $s->{'status'};
+			}
+			else
+			{
+				pagerAdd "  %8s%6s%8s on node %2s ver %s", $mode, $srv, $s->{'status'}, $s->{nodeId}, $s->{'version'};
+			}
+			if( $s->{status} ne 'down' )
+			{
+				my $uptime = $now > $s->{'startTime'} ? ($now - $s->{'startTime'}): 0;
+				pagerAdd ", started %s, uptime %s", formatTime($s->{'startTime'}), formatSeconds($uptime);
+			}
+			pagerAdd "%s\n", $add;
+		};
+		
+		foreach my $mgmtId ( sort { $a <=> $b } keys %{$data->{'mgmt'}} )
+		{
+			$repSingle->('mgmt', $data->{mgmt}{$mgmtId});
+		}
+		foreach my $server ( sort { $a <=> $b } keys %{$data->{'servers'}} )
+		{
+			$repSingle->('server', $data->{servers}{$server});
+		}
+		foreach my $client ( sort { $a <=> $b } keys %{$data->{'clients'}} )
+		{
+			$repSingle->('client', $data->{clients}{$client});
+		}
+		foreach my $bridge ( sort { $a <=> $b } keys %{$data->{'bridges'}} )
+		{
+			$repSingle->('bridge', $data->{'bridges'}{$bridge});
+		}
+		foreach my $contrl ( sort { $a <=> $b } keys %{$data->{'controllers'}} )
+		{
+			$repSingle->('cntrl', $data->{'controllers'}{$contrl});
+		}
+		foreach my $iscsiTarget ( sort { $a <=> $b } keys %{$data->{'iscsiTargets'}} )
+		{
+			$repSingle->('iSCSI', $data->{'iscsiTargets'}{$iscsiTarget});
+		}
+	}
+	elsif( $mode eq 'clientConfiguration' )
+	{
+		my $fmt = "| %8s | %-20s |\n";
+		
+		pagerAdd "%s\n", "-"x35;
+		pagerAdd $fmt, ' client ', '      status ';
+		pagerAdd "%s\n", "-"x35;
+		
+		foreach my $client (@{$data})
+		{
+			pagerAdd $fmt,
+				$client->{'id'},
+				$client->{'configStatus'};
+		}
+		pagerAdd "%s\n", "-"x35;
+	}
+	
+	elsif( $mode eq 'templates' )
+	{
+		if (@$data)
+		{
+			my $fmt = "| ". join(' | ', qw(%-20s %7s %5s %-10s %-10s %-10s %7s %7s %-20s %-5s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x10)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'template', '  size ', 'repl.', 'placeHead', 'placeAll', 'placeTail', '  iops ', '   bw  ', 'parent', 'flags';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data )
+			{
+				my $flags = buildTemplateListFlags($v);
+				pagerAdd
+					$fmt,
+					$v->{name},
+					$v->{size} eq '-' ? '-' : humanBytes($v->{size}),
+					$v->{replication},
+					$v->{placeHead},
+					$v->{placeAll},
+					$v->{placeTail},
+					$v->{iops},
+					formatLimitBw($v->{bw}),
+					$v->{parentName},
+					$flags;
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'templatesStatus' )
+	{
+		if (@$data)
+		{
+			my $fmt = "| ". join(' | ', qw(%-20s %-10s %-10s %-10s %5s %7s %9s/%-8s %7s %8s %7s %11s %11s %11s %-5s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x15)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'template', 'place head', 'place all', 'place tail', 'repl.', 'volumes', 'snapshots', 'removing', 'size', 'capacity', 'avail.', 'avail. head', 'avail. all', 'avail. tail', 'flags';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data )
+			{
+				my $flags = buildTemplateStatusFlags($v);
+				pagerAdd
+					$fmt,
+					$v->{name},
+					$v->{placeHead},
+					$v->{placeAll},
+					$v->{placeTail},
+					$v->{replication},
+					$v->{volumesCount},
+					$v->{snapshotsCount},
+					$v->{removingSnapshotsCount},
+					humanBytes($v->{size}),
+					$v->{stored}->{capacity} ? humanBytes($v->{stored}->{capacity}): '-',
+					$v->{stored}->{free} ? humanBytes($v->{stored}->{free}) : '-',
+					humanBytes($v->{availablePlaceHead}),
+					humanBytes($v->{availablePlaceAll}),
+					humanBytes($v->{availablePlaceTail}),
+					$flags;
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'snapshotsSpace' )
+	{
+		if (@$data)
+		{
+			my $fmt = "| ". join(' | ', qw(%-20s %-20s %10s %5s %10s %10s %12s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x7)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'snapshot', 'on volume', 'size', 'repl.', 'stored', 'used', 'missing info';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data )
+			{
+				pagerAdd
+					$fmt,
+					$v->{name},
+					$v->{onVolume},
+					humanBytes($v->{size}),
+					$v->{replication},
+					humanBytes($v->{storedSize}),
+					humanBytes($v->{spaceUsed}),
+					humanBytes($v->{noDataForObjects}*OBJECT_SIZE);
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'volumesSpace' )
+	{
+		if (@$data)
+		{
+			my $fmt = "| ". join(' | ', buildFormatString $data, qw(name=%-20s %10s %5s %10s %10s %12s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x6)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'volume', 'size', 'repl.', 'stored', 'used', 'missing info';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data )
+			{
+				pagerAdd
+					$fmt,
+					$v->{name},
+					humanBytes($v->{size}),
+					$v->{replication},
+					humanBytes($v->{storedSize}),
+					humanBytes($v->{spaceUsed}),
+					humanBytes($v->{noDataForObjects}*OBJECT_SIZE);
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'volumes' )
+	{
+		if (@$data)
+		{
+			joinVolumeTags($data);
+			my $fmt = "| ". join(' | ', buildFormatString $data, qw(name=%-20s %7s %5s placeAll=%-10s placeTail=%-10s placeHead=%-10s %7s %7s parent=%-20s template=%-20s %-5s tags=%-4s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x12)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'volume', '  size ', 'repl.', 'placeHead', 'placeAll', 'placeTail', '  iops ', '   bw  ', 'parent', 'template', 'flags', 'tags';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data )
+			{
+				my $flags = buildVolumeListFlags($v);
+				pagerAdd
+					$fmt,
+					$v->{name},
+					humanBytes($v->{size}),
+					$v->{replication},
+					$v->{placeHead},
+					$v->{placeAll},
+					$v->{placeTail},
+					$v->{iops},
+					formatLimitBw($v->{bw}),
+					$v->{parentName},
+					$v->{templateName},
+					$flags,
+					$v->{tags};
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	
+	elsif( $mode eq 'snapshots' )
+	{
+		if (@$data)
+		{
+			joinVolumeTags($data);
+			my $fmt = "| " . join(' | ', buildFormatString $data, qw(name=%-20s %7s %5s %-10s %-10s %-10s %-19s onVolume=%-20s %7s %7s parentName=%-20s templateName=%-20s %-6s %-19s tags=%-4s)) . " |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x15)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'snapshot', ' size  ', 'repl.', 'placeHead', 'placeAll', 'placeTail', 'created on', 'volume', '  iops ', '   bw  ', 'parent', 'template', 'flags', 'targetDeleteDate', 'tags';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data)
+			{
+				pagerAdd
+					$fmt,
+					$v->{name},
+					humanBytes($v->{size}),
+					$v->{replication},
+					$v->{placeHead},
+					$v->{placeAll},
+					$v->{placeTail},
+					formatTime($v->{creationTimestamp}),
+					$v->{onVolume},
+					$v->{iops},
+					formatLimitBw($v->{bw}),
+					$v->{parentName},
+					$v->{templateName},
+					buildSnapshotFlags($v),
+					($v->{targetDeleteDate})?formatTime($v->{targetDeleteDate}):"-",
+					$v->{tags};
+			}
+			
+			pagerAdd "%s\n", $sep;
+			flagsLegend(\@snapshotFlags);
+		}
+	}
+	
+	elsif( $mode eq 'volume' )
+	{
+		my $placeAll = defined($data->{placeAll}) ? $data->{placeAll} :  '-';
+		my $placeTail = defined($data->{placeTail}) ? $data->{placeTail} : $placeAll;
+		my $placeHead = defined($data->{placeHead}) ? $data->{placeHead} : $placeAll;
+		
+		pagerAdd "volume %s\n", $data->{name};
+		pagerAdd "size %s\n", humanBytes $data->{size};
+		pagerAdd "replication %d\n", $data->{replication};
+		pagerAdd "placeHead %s\n", $placeHead;
+		pagerAdd "placeAll %s\n", $placeAll;
+		pagerAdd "placeTail %s\n", $placeTail;
+		
+		pagerAdd "targetDeleteDate %s\n", formatTime($data->{targetDeleteDate}) if ($data->{targetDeleteDate});
+#		pagerAdd "clientsRead %s\n", join(' ', @{$data->{'clientsRead'} || ()});
+#		pagerAdd "clientsWrite %s\n", join(' ', @{$data->{'clientsWrite'} || ()});
+		
+		pagerAdd "target disk sets:\n";
+		
+		for( my $i=0; $i < scalar @{$data->{'targetDiskSets'}}; $i++)
+		{
+			my $s = $data->{'targetDiskSets'}->[$i];
+			
+			pagerAdd "%8d: ", $i;
+			
+			for( my $j = 0; $j < scalar @$s; $j++)
+			{
+				pagerAdd "%s ", $s->[$j];
+			}
+			
+			pagerAdd "\n";
+			pagerAdd "\n" if $i % STRIPE_WIDTH == STRIPE_WIDTH - 1;
+		}
+		
+		
+		if( scalar @{$data->{objects}} )
+		{
+			#pagerAdd( "objects:\n" );
+			pagerAdd "\n";
+			pagerAdd "%8s: %s\n", 'object', 'disks';
+		}
+		
+		for( my $i =0 ; $i < scalar @{$data->{'objects'}}; $i++)
+		{
+			my $s = $data->{'objects'}->[$i];
+			
+			pagerAdd "%8d: ", $i;
+			
+			for( my $j = 0; $j < scalar @$s; $j++)
+			{
+				pagerAdd "%s ", $s->[$j];
+			}
+			
+			pagerAdd "\n";
+		}
+	}
+	
+	elsif( $mode eq 'volumeStatus' )
+	{
+		{
+			my @volumes;
+			
+			if (exists $d->{params}->{volumeName})
+			{
+				my $vol = $d->{params}->{volumeName};
+				if ( exists $data->{$vol} )
+				{
+					@volumes = ($vol);
+				}
+				else
+				{
+					$err = 1;
+					$data->{error} = {
+						descr => "volume '$vol' does not exist",
+						name => "objectDoesNotExist"
+					};
+					goto out;
+				}
+			}
+			else
+			{
+				@volumes = keys %$data;
+			}
+			
+			$data = { map { ($_ => $data->{$_}) } @volumes };
+		}
+		
+		if (%$data)
+		{
+			joinVolumeTags([values %$data]);
+			my %t = map { $_ => 0 } qw(size storedSize onDiskSize syncingDataBytes downBytes);
+			my $count = 0;
+			
+			my $fmt = '| '.join(' | ', buildFormatString $data, qw(name=%-20s %7s %5s tags=%-4s %7s %7s %7s %7s %7s %-9s %-5s downDrives=%-15s) )." |\n";
+			
+			my $sep = '-' x (length(sprintf $fmt, ('')x12)-1);
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'volume', 'size', 'repl.', 'tags', 'alloc %', 'stored', 'on disk', 'syncing', 'missing', 'status', 'flags', 'drives down';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } values %{$data} )
+			{
+				my ($name, $size, $repl, $tags, $stored, $ondisk, $syncing, $down, $status, $disksDown) = @{$v}{ qw(name size replication tags storedSize onDiskSize syncingDataBytes downBytes status downDrives) };
+				
+				do {  $t{$_} += $v->{$_} } for ( qw(size storedSize onDiskSize syncingDataBytes downBytes) );
+				$count++;
+				
+				my $allocPercent = sprintf"%.1f %%", 100 * $stored / $size;
+				do { $_ = humanBytes($_) } for ( $size, $stored, $ondisk, $syncing, $down );
+				my $flags = buildVolumeStatusFlags($v);
+				pagerAdd $fmt, $name, $size, $repl, $tags, $allocPercent, $stored, $ondisk, $syncing, $down, $status, $flags, join(' ', @{$disksDown});
+			}
+			
+			pagerAdd "%s\n", $sep;
+			{ # totals row
+				
+				my $allocPercent = sprintf "%.1f %%", 100 * $t{storedSize} / $t{size};
+				do { $_ = humanBytes($_) } for ( @t{ qw(size storedSize onDiskSize syncingDataBytes downBytes) } );
+				pagerAdd $fmt, $count." volumes", $t{size}, '', '', $allocPercent, @t{ qw(storedSize onDiskSize syncingDataBytes downBytes) }, '', '', '';
+			}
+			pagerAdd "%s\n", $sep;
+			
+			flagsLegend(\@volumeStatusFlags);
+		}
+	}
+	
+	elsif( $mode eq 'volumeStatus/failedonly' )
+	{
+		pagerAdd "%s\n", "Not implemented\n";
+	}
+	
+	elsif( $mode eq 'volumeInfo' )
+	{
+		#dump($data);
+		my $fmt = join(' | ', qw(%10s %5s) )."\n";
+		pagerAdd($fmt, 'diskId', 'count');
+		foreach my $e (sort { $a <=> $b } keys %{$data->{'objectsPerDisk'}} )
+		{
+			pagerAdd($fmt, $e, $data->{'objectsPerDisk'}->{$e});
+		}
+		pagerAdd("\n");
+		
+		$fmt = join(' | ', qw(%-20s %3s) )."\n";
+		my $hdr = {'objectsPerChain'=>['chain','count'],
+					'objectsPerDiskSet'=>['diskSet','count']
+					};
+		foreach my $t ( sort keys %{$hdr} )
+		{
+			pagerAdd($fmt, @{$hdr->{$t}});
+			
+			# This sorts the disk sets lexicographically.
+			# If somebody wants a numerical sort, it'll be just a little bit
+			# harder, but it's possible.
+			#
+			my %sets = map { (join('-', @{$_->{'disks'}}), $_->{'count'}) } @{$data->{$t}};
+			foreach my $k ( sort keys %sets )
+			{
+				pagerAdd($fmt, $k, $sets{$k})
+			}
+			pagerAdd("\n");
+		}
+	}
+	
+	elsif( $mode eq 'transaction' )
+	{
+		pagerAdd "OK\n" unless $opt_B;
+		if( defined($data->{info}) )
+		{
+			pagerAdd $data->{info}."\n";
+		}
+	}
+	
+	elsif( $mode eq 'tasks' )
+	{
+		{
+			my $disksRes = load("DisksList");
+			my $disks = $disksRes->[0];
+
+			if( $disksRes->[1] )
+			{
+				$err = $disks;
+				$data = $disks;
+				goto out;
+			}
+
+			my $missingDisksCount = grep { $_->{generationLeft} != -1 } values %{$disks};
+			if( $missingDisksCount > 0 )
+			{
+				pagerAddError " Warning: %d disk%s missing. Incomplete output!\n", $missingDisksCount, $missingDisksCount < 2 ? " is" : "s are";
+
+				my $volumesRelocatorRes = load("VolumeRelocatorStatus");
+
+				if( $volumesRelocatorRes->[1] )
+				{
+					$data = $volumesRelocatorRes->[0];
+					$err = $data;
+					goto out;
+				}
+
+				my $volumesToRelocate = $volumesRelocatorRes->[0]->{'volumesToRelocate'};
+				pagerAddError " %d volume%s to relocate.\n", $volumesToRelocate, $volumesToRelocate == 1 ? "" : "s";
+			}
+		}
+
+		if (@$data)
+		{
+			my %rows = ();
+			
+			for my $task (@$data)
+			{
+				my ($diskId, $taskId, $sz, $st, $compl) = @{ $task }{ qw(diskId transactionId allObjects dispatchedObjects completedObjects) };
+				next if $sz == 0; # ignore tasks which have only unresolvedObjects
+				
+				my $pct = sprintf("%d%%",100*$compl/$sz);
+				my $rem = $sz - $compl;
+				
+				
+				my $key;
+				if (exists $d->{params}->{groupBy})
+				{
+					$key = join
+						':',
+						($d->{params}->{groupBy} eq 'disk' ? $diskId : '*'),
+						($d->{params}->{groupBy} eq 'id'   ? $taskId : '*');
+				}
+				else
+				{
+					$key = join
+						':',
+						$diskId,
+						$taskId;
+				}
+				
+				$rows{$key}->[$_] += ($sz, $compl, $st, $rem)[$_] for (0..3);
+				
+			}
+			
+			my $fmt = "| %8s | %8s | %10s | %10s | %10s | %10s | %10s |\n";
+			my $pline = sub { pagerAdd "%88s\n", "-" x 88 };
+			
+			$pline->();
+			pagerAdd $fmt, 'disk', 'task id', 'total obj', 'completed', 'started', 'remaining', '% complete';
+			$pline->();
+			
+			# regular rows
+			for my $rowKey (
+				sort {
+					my @a = split /:/, $a;
+					my @b = split /:/, $b;
+					my $cmp =0;
+					$cmp ||= $a[0] <=> $b[0]  unless $a[0] eq '*';
+					$cmp ||= $a[1] <=> $b[1]  unless $a[1] eq '*';
+					$cmp;
+				}
+				keys %rows
+			)
+			{
+				my ($diskId, $taskId) = split /:/,$rowKey;
+				my @row = @{$rows{$rowKey}};
+				
+				pagerAdd
+					$fmt,
+					$diskId,
+					format_taskid($taskId),
+					@row,
+					( 0 != $row[0] ? sprintf("%d%%",100*$row[1]/$row[0]) : '-');
+			}
+			
+			$pline->();
+			
+			{ # totals row
+				my @tot = (0) x 4;
+				for my $row (values %rows)
+				{
+					$tot[$_] += $row->[$_] for (0..3);
+				}
+				
+				pagerAdd
+					$fmt,
+					'total',
+					'',
+					@tot,
+					( 0 != $tot[0] ? sprintf("%d%%",100*$tot[1]/$tot[0]) : '-');
+			}
+			
+			$pline->();
+		}
+	}
+	
+	elsif( $mode eq 'placementGroups' )
+	{
+		my $printed = 0;
+		for my $id (sort {$a cmp $b} keys %{$data} )
+		{
+			my $fmt = " %s\n";
+			if ( $printed == 0 )
+			{
+				pagerAdd $fmt, 'name';
+				$printed = 1;
+			}
+			
+			pagerAdd $fmt, $data->{$id}->{name};
+		}
+	}
+	
+	elsif( $mode eq 'placementGroup' )
+	{
+		if( @{$data->{'disks'}} )
+		{
+			my $fmt = " %-6s | %-8s\n";
+			pagerAdd $fmt, 'type', 'id';
+			pagerAdd $fmt, 'disk', join(' ', sort { $a <=> $b } @{$data->{'disks'}}) if @{$data->{'disks'}};
+		}
+	}
+	
+	elsif( $mode eq 'relocator' )
+	{
+		pagerAdd "relocator %s, %s volumes to relocate\n", $data->{status}, $data->{volumesToRelocate} ? $data->{volumesToRelocate} : "no";
+	}
+	elsif( $mode eq 'balancer' )
+	{
+		pagerAdd "balancer %s, auto %s\n", $data->{status}, $data->{auto} ? "on" : "off";
+	}
+	elsif( $d->{mode} eq 'faultSets' )
+	{
+		if( %$data )
+		{
+			my $fmt = "| ". join(' | ', qw(%-20s %40s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x5)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'name', 'servers';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $name (sort {$a cmp $b} keys %{$data} )
+			{
+				pagerAdd
+					$fmt,
+					$data->{$name}->{name},
+					join(' ', @{$data->{$name}->{servers}}),
+			}
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	elsif( $mode eq 'balancerGroups' )
+	{
+		if( @$data )
+		{
+			my $fmt = "| ". join(' | ', qw(%-20s %-10s %-10s %5s %7s %7s %8s %-60s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x8)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'root', 'place head', 'place all', 'place tail', 'repl.', 'size', 'stored', 'objects', 'volumes';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{placeAll} cmp $b->{placeAll} || $a->{placeTail} cmp $b->{placeTail} || $a->{placeHead} cmp $b->{placeHead} || $a->{replication} <=> $b->{replication} } @$data )
+			{
+				pagerAdd
+					$fmt,
+					$v->{root},
+					$v->{placeHead},
+					$v->{placeAll},
+					$v->{placeTail},
+					$v->{replication},
+					humanBytes($v->{size}),
+					humanBytes($v->{storedSize}),
+					$v->{objectsCount},
+					join(", ", @{$v->{volumes}});
+			}
+			
+			pagerAdd "%s\n", $sep;
+		}
+	}
+	elsif( $mode eq 'balancerVolumes' )
+	{
+		if (@$data)
+		{
+			my $fmt = "| ". join(' | ', buildFormatString $data, qw(name=%-20s %7s %10s %5s %-10s %-10s %7s))." |\n";
+			my $sep = '-' x (length(sprintf $fmt, ('')x7)-1);
+			
+			pagerAdd "%s\n", $sep;
+			pagerAdd $fmt, 'volume', '  size ', 'obj. count', 'repl.', 'placeHead', 'placeAll', 'placeTail', 'flags';
+			pagerAdd "%s\n", $sep;
+			
+			foreach my $v ( sort { $a->{name} cmp $b->{name} } @$data )
+			{
+				pagerAdd
+					$fmt,
+					$v->{name},
+					humanBytes($v->{size}),
+					$v->{objectsCount},
+					$v->{replication},
+					$v->{placeHead},
+					$v->{placeAll},
+					$v->{placeTail},
+					buildBalancerFlags($v);
+			}
+			pagerAdd "%s\n", $sep;
+			flagsLegend(\@balancerVolumeFlags);
+		}
+	}
+	elsif( $mode eq 'balancerDiskSets' )
+	{
+		if (%$data)
+		{
+			pagerAdd "%s %s\n", ($data->{snapshot} ? "volume" : "snapshot"), $data->{name};
+			pagerAdd "size %s\n", humanBytes($data->{size});
+			pagerAdd "objects count %s\n", $data->{objectsCount};
+			pagerAdd "replication %d\n", $data->{replication};
+			pagerAdd "placeHead %s\n", $data->{placeHead};
+			pagerAdd "placeAll %s\n", $data->{placeAll};
+			pagerAdd "placeTail %s\n", $data->{placeTail};
+			pagerAdd "reallocated %s, blocked %s\n", ($data->{reallocated} ? "yes" : "no"), ($data->{blocked} ? "yes" : "no");
+			pagerAdd "disk sets:\n\n";
+			
+			for(my $i = 0; $i < scalar @{$data->{'currentDiskSets'}}; $i++)
+			{
+				pagerAdd "%8d: ", $i;
+				
+				foreach my $d (@{$data->{'currentDiskSets'}->[$i]})
+				{
+					pagerAdd "%s ", $d;
+				}
+				
+				pagerAdd "-> ";
+				
+				foreach my $d (@{$data->{'balancerDiskSets'}->[$i]})
+				{
+					pagerAdd "%s ", $d;
+				}
+				
+				pagerAdd "\n";
+				pagerAdd "\n" if $i % STRIPE_WIDTH == STRIPE_WIDTH - 1;
+			}
+		}
+	}
+	elsif( $mode eq 'attachments' )
+	{
+		my $fmt = "| ".join(" | ", buildFormatString $data, qw(%6s volume=%-20s %-4s))." |\n";
+		my $sep = '-' x (length(sprintf $fmt, ('')x3)-1);
+		pagerAdd "%s\n", $sep;
+		pagerAdd $fmt, "client", "volume", "mode";
+		pagerAdd "%s\n", $sep;
+		
+		my @attachmentList = @{$data};
+		@attachmentList = sort { $a->{'client'} <=> $b->{'client'} || $a->{'volume'} cmp $b->{'volume'} } @attachmentList;
+		foreach my $element (@attachmentList)
+		{
+			my $volume = $element->{'volume'};
+			my $rights = ($element->{'rights'} eq 'ro' ? 'RO': 'RW');
+			my $client = $element->{'client'};
+			pagerAdd $fmt, $client, $volume, $rights;
+		}
+		
+		pagerAdd "%s\n", $sep;
+	}
+	elsif( $mode eq 'mgmtConfig' )
+	{
+		pagerAdd "relocator %s, interval %s\n", $data->{relocator}->{status}, humanPeriod($data->{relocator}->{interval});
+		pagerAdd "relocator transaction: min objects %s, max objects %s\n", $data->{relocator}->{minTrObjects}, $data->{relocator}->{maxTrObjects};
+		pagerAdd "relocator recovery: max tasks per disk %s, max objects per disk %s\n", $data->{relocator}->{maxRecoveryTasksPerDisk}, $data->{relocator}->{maxRecoveryObjectsPerDisk};
+		pagerAdd "relocator recovery objects trigger %s\n", $data->{relocator}->{recoveryObjectsTrigger};
+		pagerAdd "relocator min free %s GB\n", $data->{relocator}->{GBFreeBeforeAdd};
+		pagerAdd "balancer auto %s, interval %s\n", $data->{balancer}->{auto}, humanPeriod($data->{balancer}->{interval});
+		pagerAdd "snapshot delete interval %s\n", humanPeriod($data->{snapshotDelete}->{interval});
+		pagerAdd "disks soft-eject interval %s\n", humanPeriod($data->{disksSoftEject}->{interval});
+		pagerAdd "snapshot delayed delete %s\n", $data->{delayedSnapshotDelete}->{enabled} ? "on" : "off";
+		pagerAdd "snapshot dematerialize interval %s\n", humanPeriod($data->{snapshotDematerialize}->{interval});
+	}
+	else
+	{
+		dump($d);
+		dump($data);
+	}
+	
+out:
+	if( $err )
+	{
+		pagerAddError " Error: %s\n", $data->{'error'}->{'descr'};
+		$retval = 1;
+	}
+	
+	pagerDisplay();
+	return $retval;
+}
+
+
+sub load($;$)
+{
+	my ($addr, $params) = @_;
+	
+	return lwp_request('GET', $addr, $params);
+}
+
+sub post($$)
+{
+	my ($addr, $params) = @_;
+	
+	return lwp_request('POST', $addr, $params);
+}
+
+my ($resLastLoad, $jsonLastLoad);
+
+sub lwp_request($$$)
+{
+	my ($method, $addr, $params) = @_;
+	
+	if( $opt_t)
+	{
+		printf $OUT "[$method] %s%s\n%s\n",$url, $addr, defined( $params )? encode_json( $params ): "";
+		return jsError('testing mode only');
+	}
+	
+	my $h = HTTP::Headers->new;
+	$h->header('Authorization' => 'Storpool v1:'.$ENV{'SP_AUTH_TOKEN'} );
+	
+	my $p = HTTP::Request->new($method, $url.$addr, $h);
+	$p->content( encode_json( $params ) ) if defined( $params );
+	print $p->as_string."\n" if $format eq 'raw';
+	
+	my $ua = new LWP::UserAgent;
+	$ua->timeout(2 * 60 * 60);
+	my $response = $ua->request($p);
+	print $response->as_string."\n" if $format eq 'raw';
+	my $err = $response->code != 200;
+	my $contentType = $response->header('Content-Type');
+	$contentType = '(none)' unless defined($contentType);
+	my $data = $response->content;
+	
+	if( !$data )
+	{
+		return jsTrError("No data received! Probably communication error.");
+	}
+	elsif ($contentType eq 'text/plain')
+	{
+		chomp $data;
+		if (defined $response->header('Client-Warning'))
+		{
+			$data =~ s/^\d+ //s;
+			return jsTrError($data);
+		}
+		else
+		{
+			return jsError($data);
+		}
+	}
+	elsif ($contentType ne 'application/json')
+	{
+		return jsError("Unexpected Content-Type: $contentType");
+	}
+	
+	my $res;
+	eval {
+		$res = decode_json($data);
+		if( !$err && ( ref($res) ne 'HASH' || !defined( $res->{data} ) ) )
+		{
+			$res = jsError("Unexpected JSON format, not an object with a 'data' member")->[0];
+			$err = 1;
+		}
+	};
+	if( $@ )
+	{
+		return jsError("Could not parse the JSON reply from the server: $@");
+	}
+	eval {
+		$jsonLastLoad = $jsonObj->encode($res);
+	};
+	if( $@ )
+	{
+		$jsonLastLoad = $data;
+	}
+	if( !$err )
+	{
+		$res = $res->{data};
+	}
+	$resLastLoad = $res;
+	return [$res, $err];
+}
+
+sub readfile($) {
+	my ($file) = @_;
+	open my $f, '<', $file or die "Could not open $file: $!\n";
+	my $s;
+	{
+		local $/;
+		$s = <$f>;
+	}
+	close $f or die "Could not close $file: $!\n";
+	return $s;
+}
+
+sub loadJsonFile($)
+{
+	my $s = readfile($_[0]);
+	return decode_json($s);
+}
+
+sub loadConst($)
+{
+	my ($data) = @_;
+	
+	$jsonLastLoad = $jsonObj->encode($data);
+	return [$data, undef];
+}
+
+sub jsError($; $)
+{
+	my ($str, $tr) = @_;
+	
+	return [{'error' => {'descr' => $str, 'transient' => $tr? JSON::XS::true: JSON::XS::false } }, 1];
+}
+
+sub jsTrError($)
+{
+	return jsError($_[0], 1);
+}
+
+sub filterHash($$)
+{
+	my ($hash, $fields) = @_;
+	my $k;
+	my %res;
+	
+	foreach $k (@{$fields})
+	{
+		next unless defined($hash->{$k});
+		$res{$k} = $hash->{$k};
+	}
+	return %res;
+}
+
+sub dumpHashref($$);
+sub dumpHashref($$)
+{
+	no strict 'refs';
+	my ($p, $ref) = @_;
+	
+	my $type = ref $ref;
+	
+	if( $type eq "HASH" )
+	{
+		foreach my $key (sort keys %{$ref})
+		{
+			$type = ref($ref->{$key});
+			if( $type =~ /HASH|ARRAY/ )
+			{
+				dumpHashref($p."|$key", $ref->{$key});
+			}
+			else
+			{
+				print "$p|$key=$ref->{$key}\n";
+			}
+		}
+	}
+	elsif( $type eq "ARRAY" )
+	{
+		my $i=0;
+		foreach my $key (@{$ref})
+		{
+			$type = ref $key;
+			if( $type =~ /HASH|ARRAY/ )
+			{
+				dumpHashref($p."[$i]" , $key);
+			}
+			else
+			{
+				print "$p=$key\n";
+			}
+			$i++;
+		}
+	}
+	else
+	{
+		print"$p=$ref\n";
+	}
+}
+
+sub snapshotVolume($)
+{
+	my ($p) = @_;
+
+	splitVolumeTags $p;
+
+	return post("VolumeSnapshot/".$p->{'volumeName'}, {
+		'name' => $p->{'snapshotName'},
+		'deleteAfter' => parseTimeDelay($p->{'deleteAfter'}),
+		'tags' => $p->{tags},
+	});
+}
+
+sub updateVolume($)
+{
+	my ($p) = @_;
+	my $res;
+	
+	my %attrspec = filterHash($p, [qw/rename replication size placeHead placeAll placeTail parent iops bw template shrinkOk bind baseOn remote deleteAfter reuseServer tags _mgmtOp/]);
+	my %mapspec = filterHash($p, [qw/mapClientsRead mapClientsWrite unmapClientsRead unmapClientsWrite/]);
+	
+	my $snapshot = 0;
+	my $id = $p->{'volumeName'};
+	if (!defined($id) || $id eq '')
+	{
+		$id = $p->{'snapshotName'};
+		if( !defined($id) || $id eq '' )
+		{
+			return jsError('No volume name specified');
+		}
+		
+		$snapshot = 1;
+	}
+	
+	# Some quick checks...
+	if (!%attrspec && !%mapspec)
+	{
+		return jsError('No volume action specified');
+	}
+	
+	if (%mapspec) {
+		return jsError('FIXME: Implement volume rights mapping');
+	}
+	
+	if (%attrspec)
+	{
+		my $op;
+		if( $snapshot )
+		{
+			return jsError('"baseOn/parent" defined only for volumes') if defined($attrspec{baseOn}) || defined($attrspec{'parent'});
+			
+			my $v = load("Snapshot/$id");
+			if( $v->[1] )
+			{
+				return jsError("Snapshot '$id' does not exist");
+			}
+			
+			$op = 'SnapshotUpdate/'.$id;
+		}
+		else
+		{
+			return jsError('"bind/unbind" defined only for snapshots') if defined($attrspec{bind});
+			return jsError('"deleteAfter" defined only for snapshots') if defined($attrspec{deleteAfter});
+			
+			my $mop = $attrspec{'_mgmtOp'};
+			delete $attrspec{'_mgmtOp'};
+			if( !defined $mop )
+			{
+				# TODO: deprecate this in the next release.
+				my $v = load("Volume/$id");
+				if( $v->[1] )
+				{
+					$mop = 'create';
+				}
+				else
+				{
+					$mop = 'update';
+				}
+			}
+			if( $mop ne 'create' && $mop ne 'update' )
+			{
+				die "Internal StorPool CLI error: unexpected mgmtOp value '$mop'; please contact the StorPool support team!\n";
+			}
+
+			$op = 'VolumeUpdate/'.$id;
+			
+			if( $mop eq 'create' )
+			{
+				$op = 'VolumeCreate';
+				$attrspec{'name'} = $id;
+				
+				if( defined($attrspec{'parent'}) && defined($attrspec{'baseOn'}) )
+				{
+					return jsError("Must specify either parent or baseOn");
+				}
+			}
+			elsif( defined($attrspec{'parent'}) )
+			{
+				return jsError("Cannot modify parent in volume update");
+			}
+			elsif( defined($attrspec{'baseOn'}) )
+			{
+				return jsError("Cannot modify base volume in volume update");
+			}
+			elsif( defined($attrspec{'remote'}) )
+			{
+				return jsError("Cannot recreate remote snapshot");
+			}
+		}
+		
+		if( defined( $attrspec{'size'} ) )
+		{
+			if( $snapshot ) {
+				return jsError("Can't change snapshot size");
+			}
+			
+			if( $attrspec{'size'} !~ /^([+]?)(.*)/ ) {
+				return jsError("Invalid size specified");
+			}
+			my ($add, $realSize) = parseSize( $attrspec{'size'} );
+			
+			delete $attrspec{'size'};
+			$attrspec{$add ? 'sizeAdd': 'size'} = $realSize;
+		}
+		
+		$attrspec{'deleteAfter'} = parseTimeDelay( $attrspec{'deleteAfter'} ) if $attrspec{'deleteAfter'};
+		
+		if( defined( $attrspec{bw} ) )
+		{
+			$attrspec{bw} = parseBwLimit( $attrspec{bw} );
+		}
+		
+		if( defined( $attrspec{reuseServer} ) )
+		{
+			$attrspec{reuseServer} = parseYesNo( $attrspec{reuseServer} );
+		}
+
+		splitVolumeTags \%attrspec;
+
+		$res = post($op, { %attrspec });
+		return $res if $res->[1];
+	}
+	
+	# Out of specs, I guess.
+	return $res;
+}
+
+sub deleteVolume($)
+{
+	my ($p) = @_;
+	
+	my $snapshot = 0;
+	
+	my $id = $p->{'volumeName'};
+	
+	if (!defined($id) || $id eq '')
+	{
+		$id = $p->{'snapshotName'};
+		if( !defined($id) || $id eq '' )
+		{
+			return jsError('No volume name specified');
+		}
+		
+		$snapshot = 1;
+	}
+	
+	my $id2 = $p->{'delete'};
+	if ( !defined($id2) || ($id2 ne $id) )
+	{
+		return jsError('Incorrect volume name confirmation in a delete request');
+	}
+	
+	my $res;
+	if ($snapshot) {
+		$res = post("SnapshotDelete/$id", {});
+	}
+	else
+	{
+		$res = post("VolumeDelete/$id", {});
+	}
+	return $res
+}
+
+sub snapshotFromRemote($)
+{
+	my ($p) = @_;
+	
+	splitVolumeTags($p);
+	return post("SnapshotFromRemote", {
+		name => $p->{'snapshotName'},
+		replication => $p->{'replication'},
+		remoteLocation => $p->{'remoteLocation'},
+		placeHead => $p->{'placeHead'},
+		placeAll => $p->{'placeAll'},
+		placeTail => $p->{'placeTail'},
+		remoteId => $p->{'remoteId'},
+		template => $p->{'template'},
+		tags => $p->{tags},
+	});
+}
+
+sub snapshotRemoteUnexport($)
+{
+	my ($p) = @_;
+	return post("SnapshotsRemoteUnexport", { 'remoteSnapshots' => [ { "location" => $p->{'remoteLocation'}, "globalSnapshotId" => $p->{'remoteId'}, "deleteAfter" => parseTimeDelay($p->{'deleteAfter'}) } ] } );
+}
+
+sub updatePlacementGroup($)
+{
+	my ($p) = @_;
+	
+	my %attrspec = filterHash($p, [qw/diskIdAdd diskIdRm serverIdAdd serverIdRm rename/]);
+	my %delspec = filterHash($p, [qw/delete/]);
+	
+	# Some quick checks...
+	if (%delspec && %attrspec)
+	{
+		return jsError('Deleting a placement group must be a separate operation');
+	}
+	
+	my $pg = load("PlacementGroupDescribe/".$p->{'groupName'});
+	if( $pg->[1] )
+	{
+		$pg = post("PlacementGroupUpdate/".$p->{'groupName'}, { 'description' => '' });
+	}
+	
+	my $changed = 0;
+	my $query = { };
+	
+	if( defined $p->{'diskIdAdd'} )
+	{
+		$query->{'addDisks'} = $p->{'diskIdAdd'};
+		$changed = 1;
+		
+	}
+	if( defined $p->{'diskIdRm'} )
+	{
+		$query->{'rmDisks'} = $p->{'diskIdRm'};
+		$changed = 1;
+	}
+	if( defined $p->{'rename'} )
+	{
+		$query->{'rename'} = $p->{'rename'};
+		$changed = 1;
+	}
+	
+	if( $changed )
+	{
+		$pg = post("PlacementGroupUpdate/".$p->{'groupName'}, $query);
+		return $pg if $pg->[1];
+	}
+	
+	if( !%delspec )
+	{
+		return $pg;
+	}
+	
+	if (%delspec)
+	{
+		if ($delspec{'delete'} ne $p->{'groupName'})
+		{
+			return jsError('Incorrect placement group name confirmation in a delete request');
+		}
+		$pg = post("PlacementGroupDelete/".$p->{'groupName'}, {});
+		return $pg if $pg->[1];
+	}
+	
+	
+	return $pg;
+}
+
+sub updateAttachment($ $)
+{
+	my ($attach, $p) = @_;
+	my ($clientId, $vol, $snap, $mode, $force, $all, $here, $noWait, $timeout) = @{$p}{qw/clientId volume snapshot mode force all here noWait timeout/};
+	my $volumeDefined = defined($vol);
+	my $snapshotDefined = defined($snap);
+	
+	if( !$volumeDefined && !$snapshotDefined )
+	{
+		return jsError('Must specify either volume or snapshot');
+	}
+	elsif( $volumeDefined && $snapshotDefined )
+	{
+		return jsError('Only one of volume or snapshot must be specified!');
+	}
+	
+	my %args = ();
+	my $clients;
+	
+	if( defined($here) )
+	{
+		if( defined($clientId) )
+		{
+			return jsError('Cannot specify client ID and "here" at the same time');
+		}
+		
+		if( !defined($ENV{'SP_OURID'}) )
+		{
+			return jsError('SP_OURID undefined.');
+		}
+		
+		$clientId = $ENV{'SP_OURID'};
+	}
+	
+	if( $attach )
+	{
+		return jsError('"all" defined only for detach') if defined($all);
+		return jsError('"force" defiend only for detach') if defined($force);
+		return jsError('"timeout" and "noWait" are mutually exclusive') if defined($timeout) && defined($noWait);
+		
+		if( $snapshotDefined )
+		{
+			if( defined($mode) && $mode eq 'rw' )
+			{
+				return jsError('snapshots may only be attached read-only');
+			}
+			$mode = 'ro';
+		}
+		else
+		{
+			$mode = 'rw' unless defined($mode);
+		}
+		
+		if( !defined($clientId) )
+		{
+			return jsError('Must specify either client ID or "here"');
+		}
+
+		$clients = [$clientId];
+	}
+	else
+	{
+		return jsError('"mode" defined only for attach') if defined($mode);
+		return jsError('"timeout" defined only for attach') if defined($timeout);
+		
+		$args{force} = defined($force) && ($force =~ /^yes$/i) ? JSON::XS::true : JSON::XS::false;
+		
+		if( (defined($all) && defined($clientId)) || (!defined($all) && !defined($clientId)) )
+		{
+			return jsError('Must specify either client ID or "here" or "all"');
+		}
+		
+		$clients = defined($clientId) ? [$clientId] : "all";
+		$mode = 'detach';
+	}
+	
+	$args{$mode} = $clients;
+	
+	if( $volumeDefined )
+	{
+		$args{volume} = $vol;
+	}
+	else
+	{
+		$args{snapshot} = $snap;
+	}
+	
+		
+	if( defined $noWait )
+	{
+		return post('VolumesReassign', [\%args]);
+	}
+	else
+	{
+		return post('VolumesReassignWait', {
+			'reassign' => [\%args],
+			(defined $timeout? ('attachTimeout' => $timeout): ()),
+		});
+	}
+}
+
+sub attachVolume($)
+{
+	return updateAttachment(1, $_[0]);
+}
+
+sub detachVolume($)
+{
+	return updateAttachment(0, $_[0]);
+}
+
+sub listAttachments($)
+{
+	my ($p) = @_;
+	my $loadStr='AttachmentsList';
+	
+	if (keys %$p)
+	{
+		$loadStr .= '?' . join '&', map { $_ . '=' . $p->{$_} } keys %$p;
+	}
+	
+	return load($loadStr);
+}
+
+sub updateTemplate($)
+{
+	my ($p) = @_;
+	my %attrspec = filterHash($p, [qw/rename replication size placeHead placeAll placeTail reuseServer parent iops bw propagate/]);
+	
+	my $id = $p->{'name'};
+	if (!defined($id) || $id eq '')
+	{
+		return jsError('No template name specified');
+	}
+	
+	# Some quick checks...
+	if (!%attrspec)
+	{
+		return jsError('No template action specified');
+	}
+	else
+	{
+		my $op = 'VolumeTemplateUpdate/'.$id;
+		my $v = load("VolumeTemplateDescribe/$id");
+		if ( $v->[1] )
+		{
+			$op = 'VolumeTemplateCreate';
+			$attrspec{'name'} = $id;
+		}
+		
+		if( defined($attrspec{'size'}) )
+		{
+			if( $attrspec{'size'} !~ /^([+]?)(.*)/ )
+			{
+				return jsError('Invalid size specified');
+			}
+			
+			my ($add, $realSize) = parseSize( $attrspec{'size'} );
+			$attrspec{'size'} = $realSize;
+		}
+		
+		if( defined( $attrspec{bw} ) )
+		{
+			$attrspec{bw} = parseBwLimit( $attrspec{bw} );
+		}
+		
+		if( defined( $attrspec{reuseServer} ) )
+		{
+			$attrspec{reuseServer} = parseYesNo( $attrspec{reuseServer} );
+		}
+
+		my $res = post($op, { %attrspec });
+		return $res;
+	}
+}
+
+sub deleteTemplate($)
+{
+	my ($p) = @_;
+	my $id = $p->{'name'};
+	
+	if (!defined($id) || $id eq '')
+	{
+		return jsError('No template name specified');
+	}
+	
+	my $id2 = $p->{'delete'};
+	if ( !defined($id2) || ($id2 ne $id) )
+	{
+		return jsError('Incorrect template name confirmation in a delete request');
+	}
+	
+	my $res = post("VolumeTemplateDelete/$id", {});
+	return $res;
+}
+
+sub iscsiCreatePortalGroup($)
+{
+	my ($params) = @_;
+	
+	my $pgName = $params->{'pgName'};
+	my $cmd = [
+		{ "createPortalGroup" => { name => $pgName } },
+		(
+			defined( $params->{'netAdd'} )
+				? { "portalGroupAddNetwork" => { 'portalGroup' => $pgName, 'net' => $params->{'netAdd'} } }
+				: ()
+		),
+	];
+	
+	return post("iSCSIConfig", { commands => $cmd });
+}
+
+sub iscsiDeletePortalGroup($)
+{
+	my ($params) = @_;
+	
+	
+	return post("iSCSIConfig", { commands => [ { "deletePortalGroup" => { name => $params->{'pgName'} } } ] });
+}
+
+sub iscsiPortalGroupAddNetwork($)
+{
+	my ($params) = @_;
+	
+	my $cmd = [ { "portalGroupAddNetwork" => { 'portalGroup' => $params->{'pgName'}, 'net' => $params->{'netAdd'} } } ];
+	
+	return post("iSCSIConfig", { commands => $cmd });
+}
+
+sub iscsiConfigCreatePortal($)
+{
+	my ($params) = @_;
+	
+	my $pgName = $params->{'pgName'};
+	my $ip = $params->{'ip'};
+	my $port = $params->{'port'} || 3260;
+	my $controller = $params->{'controller'};
+	if( !defined($pgName) || !defined($ip) || !defined($controller) ) {
+		return jsError( "The portal group name, controller ID, and IP address are required" );
+	}
+	return post("iSCSIConfig", { commands => [ { "createPortal" => { portalGroup => $pgName, ip => $ip, port => $port, controller => $controller } } ] });
+}
+
+sub iscsiConfigPortalDelete($)
+{
+	my ($params) = @_;
+	
+	my $ip = $params->{'ip'};
+	my $port = $params->{'port'} || 3260;
+	if( !defined($ip) ) {
+		return jsError( "The portal IP address is required" );
+	}
+	return post("iSCSIConfig", { commands => [ { "deletePortal" => { ip => $ip, port => $port } } ] });
+}
+
+sub iscsiTargetCreate($)
+{
+	my ($params) = @_;
+	
+	my $volumeName = $params->{'volumeName'};
+	
+	return post("iSCSIConfig", { commands => [ { "createTarget" => { volumeName => $volumeName } } ] });
+}
+
+sub iscsiTargetDelete($)
+{
+	my ($params) = @_;
+	
+	my $volumeName = $params->{'volumeName'};
+	
+	return post("iSCSIConfig", { commands => [ { "deleteTarget" => { volumeName => $volumeName } } ] });
+}
+
+sub iscsiExport($)
+{
+	my ($params) = @_;
+	if( !defined($params->{volumeName}) || !defined($params->{initiator}) || !defined($params->{portalGroup}) ) {
+		return jsError( "The portal group, volume, and initiator names are required" );
+	}
+	return post("iSCSIConfig", { commands => [ { "export" => $params } ] });
+}
+
+sub iscsiUnexport($)
+{
+	my ($params) = @_;
+	if( !defined($params->{volumeName}) || !defined($params->{initiator}) || !defined($params->{portalGroup}) ) {
+		return jsError( "The portal group, volume, and initiator names are required" );
+	}
+	return post("iSCSIConfig", { commands => [ { "exportDelete" => $params } ] });
+}
+
+sub iscsiCreateInitiator($)
+{
+	my ($params) = @_;
+	
+	
+	my $cmd = [
+		{ "createInitiator" => { name => $params->{'name'}, 'username' => $params->{'username'}, 'secret' => $params->{'secret'} } },
+		(
+			defined( $params->{'netAdd'} )
+				? { "initiatorAddNetwork" => { 'initiator' => $params->{'name'}, 'net' => $params->{'netAdd'} } }
+				: ()
+		),
+	];
+
+	return post("iSCSIConfig", { commands => $cmd } );
+}
+
+sub iscsiDeleteInitiator($)
+{
+	my ($params) = @_;
+	
+	
+	return post("iSCSIConfig", { commands => [ { "deleteInitiator" => { name => $params->{'name'} } } ] } );
+}
+
+
+sub iscsiInitiatorAddNet($)
+{
+	my ($params) = @_;
+	
+	
+	my $cmd = [ { "initiatorAddNetwork" => { 'initiator' => $params->{'name'}, 'net' => $params->{'netAdd'} } } ];
+
+	return post("iSCSIConfig", { commands => $cmd } );
+}
+
+sub iscsiSetBaseName($)
+{
+	my ($params) = @_;
+	
+	my $name = $params->{'name'};
+	
+	return post("iSCSIConfig", { commands => [ { "setBaseName", { name => $name } } ] });
+
+}
+
+sub locationAdd($)
+{
+	my ($params) = @_;
+	
+	return post("LocationAdd", {id => $params->{'locationId'}, name => $params->{'name'}});
+}
+
+sub clusterAdd($)
+{
+	my ($params) = @_;
+	
+	return post("ClusterAdd", {id => $params->{'id'}, location => $params->{'locationName'}});
+}
+
+sub remoteBridgeAdd($)
+{
+	my ($params) = @_;
+	
+	return post("RemoteBridgeAdd", { location => $params->{'locationName'}, ip => $params->{'ip'}, publicKey => $params->{'publicKey'}, minimumDeleteDelay => parseTimeDelay($params->{'minimumDeleteDelay'}) });
+}
+
+sub remoteBridgeRemove($)
+{
+	my ($params) = @_;
+	
+	return post("RemoteBridgeRemove", { ip => $params->{'ip'}});
+}
+
+sub snapshotExport($)
+{
+	my ($params) = @_;
+	
+	return post("SnapshotExport", { location => $params->{'remoteLocation'}, snapshot => $params->{'snapshotName'}});
+}
+
+sub snapshotUnexport($)
+{
+	my ($params) = @_;
+	return post("SnapshotUnexport", { snapshot => $params->{'snapshotName'}, location => $params->{'remoteLocation'}, all => $params->{'all'}, force => $params->{'force'}});
+}
+
+sub volumeBackup($)
+{
+	my ($params) = @_;
+	splitVolumeTags($params);
+	return post("VolumeBackup", {
+		location => $params->{'remoteLocation'},
+		volume => $params->{'volumeName'},
+		tags => $params->{tags},
+	});
+}
+
+sub volumesBackup($)
+{
+	my ($params) = @_;
+	splitVolumeTags($params);
+	return post("VolumesGroupBackup", {
+		location => $params->{'remoteLocation'},
+		volumes => $params->{'volume'},
+		tags => $params->{tags},
+	});
+}
+
+sub updateFaultSet($)
+{
+	my ($p) = @_;
+	
+	my $name = $p->{name};
+	my $op = "FaultSetUpdate/".$name;
+	
+	my $r = load("FaultSetDescribe/".$name);
+	if( $r->[1] )
+	{
+		$op = "FaultSetCreate";
+		
+		if( defined $p->{rename} )
+		{
+			return jsError("cannot rename fault set during creation");
+		}
+	}
+	else
+	{
+		delete $p->{name};
+	}
+	
+	return post($op, $p);
+}
+
+sub deleteFaultSet($)
+{
+	my ($p) = @_;
+	my $name = $p->{'name'};
+	
+	if( !defined($name) || $name eq '')
+	{
+		return jsError('No fault set name specified');
+	}
+	
+	my $name2 = $p->{'delete'};
+	if ( !defined($name2) || ($name2 ne $name) )
+	{
+		return jsError('Incorrect fault set name confirmation in a delete request');
+	}
+	
+	my $res = post("FaultSetDelete/$name", {});
+	return $res;
+}
+
+
+sub iscsiGetConfig($)
+{
+	return load("iSCSIConfig");
+}
+
+### CLI commands structure
+my %PARAM_DEFS = (
+	ServerId => { validate => \&validateServerId, parse => \&parseServerId, hint => '1..'.(0x7fff), },
+	DiskId => { validate => \&validateDiskId, hint => '1..'.(0xfff), },
+	DiskDescription => { validate => \&validateDescription, hint => 'description(string(30))([A-Za-z0-9_-])', },
+	ClientId => { validate => \&validateLong, hint => '1..'.(0xfff), },
+	TemplateName => { validate => \&validateTemplateName, hint => 'a single word (letters, numbers, _ -)', },
+	PlacementGroupName => { validate => \&validatePlacementGroupName, hint => 'a single word (letters, numbers, _)', },
+	FaultSetName => { validate => \&validatePlacementGroupName, hint => 'a single word (letters, numbers, _)', },
+	SnapshotName => { validate => \&validateSnapshotName, hint => 'a single word (letters, numbers, _ - . : )', },
+	VolumeName => { validate => \&validateVolumeName, hint => 'a single word (letters, numbers, _ - . : )', },
+	VolumeSize => { validate => \&validateVolumeSize, hint => '[+]number[KMGT] > 0', },
+	VolumeRights => { validate => \&validateReadWrite, hint => 'either rw (read/write) or ro (read-only)', },
+	VolumeReplication => { validate => \&validateReplication, hint => '0 < number < '.MAX_CHAIN_LENGTH, },
+	IOPS => { validate => \&validateIopsLimit, hint => 'number > 0 or "-" for unlimited', },
+	BW => { validate => \&validateBwLimit, hint => ' number[KMGT] > 0 or "-" for unlimited', },
+	Period => { validate => \&validateLong, hint => 'number of milliseconds', },
+	Positive => { validate => \&validateLong, hint => 'positive number', },
+	LocationId => { validate => \&validateLocationId, hint => 'StorPool-provided unique location id' },
+	ClusterId => { validate => \&validateLocationId, hint => 'StorPool-provided unique cluster id' },
+	SnapshotFullId => { validate => \&validateSnapshotFullId, hint => 'StorPool unique snapshot id' },
+	IP => { validate => \&validateIP, hint => 'xxx.xxx.xxx.xxx' },
+	PublicKey => { validate => \&validatePublicKey, hint => 'bridge public key from bridge list' },
+	TimeDelay => { validate => \&validateTimeDelay, hint => 'time period X[smhd]' },
+	
+	YesNo => { validate => \&validateYesNoChoice, hint => 'yes or no' },
+	FileName => { validate => sub ($) { return 1; }, hint => "path" },
+	TagNameValue => { validate => \&validateTagNameValue, hint => 'name=value (set) or name= (remove)' },
+	PgName => { validate => \&validateISCSIPGName, hint => 'a single word (letters, numbers, _ - . : )' },
+	IP => { validate => \&validateIP, hint => 'xxx.xxx.xxx.xxx' },
+	Port => { validate => \&validatePort, hint => '1..'.(0xffff) },
+	IscsiName => { validate => \&validateIscsiName, hint => 'iqn.XXXX-YY.aaa.bbb:opt' },
+	NetPrefix => { validate => \&validateNetPrefix, hint => 'xxx.xxx.xxx.xxx/yy' },
+	String => { validate => \&validateString, hint => "somesymbols" }
+);
+
+our $cmd = {
+	'help' => { desc => 'show this help', load => \&cliCmdHelp, },
+	'exit' => { desc => 'Exit CLI', load => \&cliCmdExit, },
+	'quit' => { desc => 'Exit CLI', load => \&cliCmdExit, },
+	'mode' => { desc => 'Set cli display mode',
+		next => {
+			'csv' => { desc => 'Semicolon-separated values for some commands', load => sub { $format = 'csv'; return loadConst({}); } },
+			'json' => { desc => 'Processed JSON output for some commands', load => sub { $format = 'json'; return loadConst({}); } },
+			'pass' => { desc => 'Pass the JSON response through', load => sub { $format = 'pass'; return loadConst({}); } },
+			'raw' => { desc => 'Raw output (display the HTTP request and response)', load => sub { $format = 'raw'; return loadConst({}); } },
+			'text' => { desc => 'Human readable output (default)', load => sub { $format = 'text'; return loadConst({}); } },
+		}
+	},
+	'net' => { desc => 'Network management',
+		next => {
+			'list' => { desc => 'List network configuration',
+				load => sub { return load("NetworkPeersList", { version => 2 } ) },
+				display => 'net',
+			}
+		}
+	},
+	'snapshot' => { desc => 'Snapshot managment',
+		next => {
+			'snapshotName' => { 'multiBegin'=>1, param => 'SnapshotName', desc => 'snapshot name',
+				next => {
+					'rename' => { desc => 'set Name ([A-Za-z0-9_]{200})', 'multi'=>1,
+						next => {
+							'rename' => { 'multiEnd'=>1, param => 'VolumeName',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'replication' => { desc => 'set Replication', 'multi'=>1,
+						next => {
+							'replication' => { 'multiEnd'=>1, param => 'VolumeReplication',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeHead' => { desc => 'name of placementGroup for first write', 'multi' => 1,
+						next => {
+							'placeHead' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeAll' => { desc => 'place all objects in placementGroup', 'multi' => 1,
+						next => {
+							'placeAll' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeTail' => { desc => 'name of placementGroup for reader', 'multi' => 1,
+						next => {
+							'placeTail' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'template' => { desc => 'use template', 'multi' => 1,
+						next => {
+							'template' => { 'multiEnd' => 1, param => 'TemplateName', desc => 'volume template name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'iops' => { desc => 'set iops limit', 'multi' => 1,
+						next => {
+							'iops' => { 'multiEnd' => 1, param => 'IOPS', desc => 'IOs per second',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'bw' => { desc => 'set bandwidth limit', 'multi' => 1,
+						next => {
+							'bw' => { 'multiEnd' => 1, param => 'BW', desc => 'Bytes/s. Use suffix B, K, M or G. e.g. 2M for 2MB/s. Max 2GB/s.',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'tag' => { 'multi' => 1, desc => 'set or remove a snapshot tag',
+						next => {
+							'tags' => { desc => 'the tag to set or remove',
+								'multiEnd' => 1, param => 'TagNameValue',
+								'list' => 1,
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'bind' => { desc => 'bind this snapshot', 'multi' => 1, 'multiEnd' => 1,
+						inject => { 'bind' => JSON::XS::true },
+						load => \&updateVolume,
+						display => 'transaction',
+					},
+					'unbind' => { desc => 'unbind this snapshot', 'multi' => 1, 'multiEnd' => 1,
+						inject => { 'bind' => JSON::XS::false },
+						load => \&updateVolume,
+						display => 'transaction',
+					},
+					'rebase' => { desc => 'detach snapshot from parent snapshots',
+						load => sub { my ($p) = @_; return post("SnapshotRebase/".$p->{'snapshotName'}, {}); },
+						display => 'transaction',
+						next => {
+							'parentName' => { param => 'SnapshotName', desc => 'rebase to parent',
+								load => sub { my ($p) = @_; return post("SnapshotRebase/".$p->{'snapshotName'}, { 'parentName' => $p->{'parentName'} }); },
+								display => 'transaction',
+							}
+						}
+					},
+					'abandonDisk' => { desc => 'Remove specified disk from this snapshot\'s objects',
+						next => {
+							'diskId' => { param => 'DiskId',
+								next => {
+									'I_know_I_will_lose_data' => { 'noAutoComplete' => 1,
+										load => sub { my ($p) = @_; return post("SnapshotAbandonDisk/".$p->{'snapshotName'}, { 'diskId' => $p->{'diskId'} }); },
+										display => 'transaction',
+									},
+								},
+							},
+						},
+					},
+					'delete' => { desc => 'delete the snapshot',
+						next => {
+							'delete' => { param => 'SnapshotName', desc => 'mandatorily specify the snapshot name',
+								load => \&deleteVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'remote' => { desc => 'create from remote', 'multi'=>1, 'multiEnd'=>1,
+						next => {
+							'remoteLocation' => { param => 'VolumeName',
+								next => {
+									'remoteId' => { param => 'SnapshotFullId',
+										load => \&snapshotFromRemote,
+										display => 'transaction',
+										multiBegin => 1,
+										next => {
+											'tag' => { 'multi' => 1, desc => 'set or remove a snapshot tag',
+												next => {
+													'tags' => { desc => 'the tag to set or remove',
+														'multiEnd' => 1, param => 'TagNameValue',
+														'list' => 1,
+														load => \&snapshotFromRemote,
+														display => 'transaction',
+													}
+												}
+											},
+										},
+									}
+								}
+							},
+						}
+						
+					},
+					'deleteAfter' => { desc => 'specify target delete date', 'multi'=>1, 'multiEnd'=>1,
+						next => {
+							'deleteAfter' => { param => 'TimeDelay',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'export' => {
+						next => {
+							'remoteLocation' => { param => 'VolumeName',
+								load => \&snapshotExport,
+								display => 'transaction',
+							}
+						}
+					},
+					'unexport' => {
+						next => {
+							'remoteLocation' => { param => 'VolumeName',
+								load => \&snapshotUnexport,
+								display => 'transaction',
+								next => {
+									'force' => {
+										inject => { 'force' => JSON::XS::true },
+										load => \&snapshotUnexport,
+										display => 'transaction',
+									}
+								}
+							},
+							'all' => {
+								inject => { 'all' => JSON::XS::true },
+								load => \&snapshotUnexport,
+								display => 'transaction',
+								next => {
+									'force' => {
+										inject => { 'force' => JSON::XS::true },
+										load => \&snapshotUnexport,
+										display => 'transaction',
+									}
+								}
+							}
+						}
+					},
+					
+					'list' => { desc => 'list snapshot',
+						load => sub { my($p) = @_;  return load( "SnapshotDescribe/".($p->{'snapshotName'}) ); },
+						display => 'volume',
+					},
+					'info' => { desc => 'snapshot info',
+						load => sub { my($p) = @_;  return load( "SnapshotGetInfo/".($p->{'snapshotName'}) ); },
+						display => 'volumeInfo',
+					}
+				}
+			},
+			'list' => { desc => 'list Snapshots',
+				load => sub { return load("SnapshotsList") },
+				display => 'snapshots',
+				next => {
+					'remote' => {
+						load => sub { return load("SnapshotsRemoteList") },
+						display => 'snapshotsRemote',
+					},
+					'exports' => {
+						load => sub { return load("ExportsList"); },
+						display => 'snapshotsExports',
+					},
+				}
+			},
+			'remote' => { desc => 'manage remote snapshots',
+				next => {
+					'remoteLocation' => { param => 'VolumeName',
+						next => {
+							'remoteId' => { param => 'SnapshotFullId',
+								next => {
+									'unexport' => {
+										load => \&snapshotRemoteUnexport,
+										display => 'transaction',
+										next => {
+											'deleteAfter' => { desc => 'specify target delete date',
+												next => {
+													'deleteAfter' => { param => 'TimeDelay',
+														load => \&snapshotRemoteUnexport,
+														display => 'transaction',
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			},
+			'space' => { desc => 'volumes used space estimate',
+				load => sub { return load("SnapshotsSpace") },
+				display => 'snapshotsSpace',
+			},
+		}
+	},
+	'volume' => { desc => 'Volumes management',
+		next => {
+			'volumeName' => { 'multiBegin'=>1, param => 'VolumeName',
+				desc => 'VolumeName',
+				next => {
+					'create' => { desc => 'create the volume, fail if it exists',
+						'multi'=>1, 'multiEnd'=>1,
+						'inject' => { '_mgmtOp' => 'create' },
+						'load' => \&updateVolume,
+						'display' => 'transaction',
+					},
+					'update' => { desc => 'update the volume, fail if it does not exist',
+						'multi'=>1, 'multiEnd'=>1,
+						'inject' => { '_mgmtOp' => 'update' },
+						'load' => \&updateVolume,
+						'display' => 'transaction',
+					},
+					'rename' => { desc => 'set Name ([A-Za-z0-9_]{200})', 'multi'=>1,
+						next => {
+							'rename' => { 'multiEnd'=>1, param => 'VolumeName',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'size' => { desc => 'set Size', 'multi'=>1,
+						next => {
+							'size' => { 'multiEnd'=>1, param => 'VolumeSize',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'shrinkOk' => { desc => 'ok to shrink volume', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'shrinkOk' => JSON::XS::true },
+						load => \&updateVolume,
+						display => 'transaction',
+					},
+					'replication' => { desc => 'set Replication', 'multi'=>1,
+						next => {
+							'replication' => { 'multiEnd'=>1, param => 'VolumeReplication',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeHead' => { desc => 'name of placementGroup for first write', 'multi' => 1,
+						next => {
+							'placeHead' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeAll' => { desc => 'place all objects in placementGroup', 'multi' => 1,
+						next => {
+							'placeAll' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeTail' => { desc => 'name of placementGroup for reader', 'multi' => 1,
+						next => {
+							'placeTail' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'iops' => { desc => 'set iops limit', 'multi' => 1,
+						next => {
+							'iops' => { 'multiEnd' => 1, param => 'IOPS', desc => 'IOs per second',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'bw' => { desc => 'set bandwidth limit', 'multi' => 1,
+						next => {
+							'bw' => { 'multiEnd' => 1, param => 'BW', desc => 'Bytes/s. Use suffix B, K, M or G. e.g. 2M for 2MB/s. Max 2GB',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'template' => { desc => 'use template', 'multi' => 1,
+						next => {
+							'template' => { 'multiEnd' => 1, param => 'TemplateName', desc => 'volume template name',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'reuseServer' => { desc => 'place multiple copies on the same server', 'multi' => 1,
+						next => {
+							'reuseServer' => { 'multiEnd'=>1, param => 'YesNo', desc => 'place multiple copies on the same server',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'parent' => { desc => 'parent snapshot', 'multi' => 1,
+						next => {
+							'parent' => { 'multiEnd'=>1, param => 'SnapshotName', desc => 'VolumeName',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'baseOn' => { desc => 'a volume the new volume should be based on', 'multi' => 1,
+						next => {
+							'baseOn' => { 'multiEnd'=>1, param => 'VolumeName', desc => 'VolumeName',
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'tag' => { 'multi' => 1, desc => 'set or remove a volume tag',
+						next => {
+							'tags' => { desc => 'the tag to set or remove',
+								'multiEnd' => 1, param => 'TagNameValue',
+								'list' => 1,
+								load => \&updateVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'freeze' => { desc => 'freeze volume',
+						load => sub { my ($p) = @_; return post("VolumeFreeze/".$p->{'volumeName'}, {} ); },
+						display => 'transaction',
+						next => {
+							'deleteAfter' => {
+								next => {
+									'deleteAfter' => { param => 'TimeDelay',
+										load => sub { my ($p) = @_; return post("VolumeFreeze/".$p->{'volumeName'}, { deleteAfter => parseTimeDelay($p->{deleteAfter}) }); },
+										display => 'transaction',
+									}
+								}
+							}
+						}
+					},
+					'snapshot' => { desc => 'create snapshot',
+						load => \&snapshotVolume,
+						display => 'transaction',
+						next => {
+							'snapshotName' => { param => 'VolumeName', desc => 'VolumeName',
+								multiBegin => 1,
+								load => \&snapshotVolume,
+								display => 'transaction',
+								next => {
+									'deleteAfter' => { desc => 'set target delete date',
+										next => {
+											'deleteAfter' => { param => 'TimeDelay',
+												load => \&snapshotVolume,
+												display => 'transaction',
+											}
+										},
+									},
+									'tag' => { 'multi' => 1, desc => 'set or remove a snapshot tag',
+										next => {
+											'tags' => { desc => 'the tag to set or remove',
+												'multiEnd' => 1, param => 'TagNameValue',
+												'list' => 1,
+												load => \&snapshotVolume,
+												display => 'transaction',
+											}
+										}
+									},
+								}
+							},
+							'deleteAfter' => { desc => 'set target delete date',
+								next => {
+									'deleteAfter' => { param => 'TimeDelay',
+										load => \&snapshotVolume,
+										display => 'transaction',
+									}
+								},
+							},
+						}
+					},
+					'bound' => { desc => 'create a bound snapshot',
+						next => {
+							'snapshot' => { desc => 'create snapshot',
+								load => sub { my ($p) = @_; return post("VolumeSnapshot/".$p->{'volumeName'}, { 'bind' => JSON::XS::true }); },
+								display => 'transaction',
+							}
+						}
+					},
+					'rebase' => { desc => 'detach volume from parent snapshots',
+						load => sub { my ($p) = @_; return post("VolumeRebase/".$p->{'volumeName'}, {}); },
+						display => 'transaction',
+						next => {
+							'parentName' => { param => 'SnapshotName', desc => 'rebase to parent',
+								load => sub { my ($p) = @_; return post("VolumeRebase/".$p->{'volumeName'}, { 'parentName' => $p->{'parentName'} }); },
+								display => 'transaction',
+							}
+						}
+					},
+					'abandonDisk' => { desc => 'Remove specified disk from this volume\'s objects',
+						next => {
+							'diskId' => { param => 'DiskId',
+								next => {
+									'I_know_I_will_lose_data' => { 'noAutoComplete' => 1,
+										load => sub { my ($p) = @_; return post("VolumeAbandonDisk/".$p->{'volumeName'}, { 'diskId' => $p->{'diskId'} }); },
+										display => 'transaction',
+									},
+								},
+							},
+						},
+					},
+					'delete' => { desc => 'delete the volume',
+						next => {
+							'delete' => { param => 'VolumeName', desc => 'mandatorily specify the volume name',
+								load => \&deleteVolume,
+								display => 'transaction',
+							}
+						}
+					},
+					'backup' => {
+						next => {
+							'remoteLocation' => { param => 'VolumeName',
+								load => \&volumeBackup,
+								display => 'transaction',
+								multiBegin => 1,
+								next => {
+									'tag' => { 'multi' => 1, desc => 'set or remove a snapshot tag',
+										next => {
+											'tags' => { desc => 'the tag to set or remove',
+												'multiEnd' => 1, param => 'TagNameValue',
+												'list' => 1,
+												load => \&volumeBackup,
+												display => 'transaction',
+											}
+										}
+									},
+								}
+							}
+						}
+					},
+					'list' => { desc => 'list Volume',
+						load => sub { my($p) = @_;  return load( "VolumeDescribe/".($p->{'volumeName'}) ); },
+						display => 'volume',
+						next => {
+							'snapshots' => {
+								load => sub { my($p) = @_;  return load( "VolumeListSnapshots/".($p->{'volumeName'}) ); },
+								display => 'snapshots',
+							}
+						}
+					},
+					'info' => { desc => 'volume info',
+						load => sub { my($p) = @_;  return load( "VolumeGetInfo/".($p->{'volumeName'}) ); },
+						display => 'volumeInfo',
+					},
+					'status' => { desc => 'volume status',
+						load => sub { return load("VolumesGetStatus"); },
+						display => 'volumeStatus',
+					},
+				}
+			},
+			'groupBackup' => {
+				multiBegin => 1,
+				'next' => {
+					'remoteLocation' => { param => 'VolumeName',
+						'next' => { 
+							'volume' => {
+								param => 'VolumeName', desc => 'VolumeName',
+								load => \&volumesBackup,
+								display => 'transaction',
+								'list' => 1,
+							}
+						}
+					},
+					'tag' => { 'multi' => 1, desc => 'set or remove a snapshot tag',
+						next => {
+							'tags' => { desc => 'the tag to set or remove',
+								'multiEnd' => 1, param => 'TagNameValue',
+								'list' => 1,
+								load => \&volumesBackup,
+								display => 'transaction',
+							}
+						}
+					},
+				}
+			},
+			'list' => { desc => 'list Volumes',
+				load => sub { return load("VolumesList") },
+				display => 'volumes',
+			},
+			'status' => { desc => 'status of volumes',
+				load => sub { return load("VolumesGetStatus") },
+				display => 'volumeStatus',
+# XXX disabled_not_implemented
+#				next => {
+#					'failedonly' => {desc => 'display only troubled volumes',
+#						load => sub { return load("volumeStatus") },
+#						display => 'volumeStatus/failedonly',
+#					}
+#				}
+			},
+			'quickStatus' => {  desc => 'quick volume status. Size fields are not calculated',
+				load => sub { return load("VolumesGetStatusQuick"); },
+				display => 'volumeStatus',
+			},
+			'usedSpace'=>{ 'desc'=>'volumes and snapshots used space estimate',
+				load => sub { return load("VolumesSpace"); },
+				display => 'volumesSpace',
+			},
+		}
+	},
+	
+	'template' => { desc => 'Volume templates management',
+		next => {
+			'name' => { desc => 'template name', 'multiBegin'=>1, param => 'TemplateName',
+				next => {
+					'rename' => { desc => 'set Name ([A-Za-z0-9_]{200})', 'multi'=>1,
+						next => {
+							'rename' => { 'multiEnd'=>1, param => 'TemplateName',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'size' => { desc => 'set Size', 'multi'=>1,
+						next => {
+							'size' => { 'multiEnd'=>1, param => 'VolumeSize',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'replication' => { desc => 'set Replication', 'multi'=>1,
+						next => {
+							'replication' => { 'multiEnd'=>1, param => 'VolumeReplication',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeHead' => { desc => 'name of placementGroup for first write', 'multi' => 1,
+						next => {
+							'placeHead' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeAll' => { desc => 'place all objects in placementGroup', 'multi' => 1,
+						next => {
+							'placeAll' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'placeTail' => { desc => 'name of placementGroup for reader', 'multi' => 1,
+						next => {
+							'placeTail' => { 'multiEnd'=>1, param => 'PlacementGroupName', desc => 'placementGroup name',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'reuseServer' => { desc => 'place multiple copies on the same server', 'multi' => 1,
+						next => {
+							'reuseServer' => { 'multiEnd'=>1, param => 'YesNo', desc => 'place multiple copies on the same server',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'parent' => { desc => 'parent snapshot', 'multi' => 1,
+						next => {
+							'parent' => { 'multiEnd'=>1, param => 'SnapshotName', desc => 'VolumeName',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'iops' => { desc => 'set iops limit', 'multi' => 1,
+						next => {
+							'iops' => { 'multiEnd' => 1, param => 'IOPS', desc => 'IOs per second',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'bw' => { desc => 'set bandwidth limit', 'multi' => 1,
+						next => {
+							'bw' => { 'multiEnd' => 1, param => 'BW', desc => 'Bytes/s. Use suffix B, K, M or G. e.g. 2M for 2MB/s. Max 2GB',
+								load => \&updateTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+					'propagate' => { desc => 'propagate updates to volumes based on this template', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'propagate' => JSON::XS::true },
+						load => \&updateTemplate,
+						display => 'transaction',
+					},
+					'delete' => { desc => 'delete the template',
+						next => {
+							'delete' => { param => 'TemplateName', desc => 'mandatorily specify the volume name',
+								load => \&deleteTemplate,
+								display => 'transaction',
+							}
+						}
+					},
+				}
+			},
+			'list' => {
+				desc => 'list templates',
+				load => sub { return load("VolumeTemplatesList") },
+				display => 'templates',
+			},
+			'status' => {
+				desc => 'list templates',
+				load => sub { return load("VolumeTemplatesStatus") },
+				display => 'templatesStatus',
+			},
+		}
+	},
+	
+	'server' => { desc => 'Servers management',
+		next => {
+			'serverId' => { param => 'ServerId',
+				next => {
+					'disk' => {
+						next => {
+							'diskId' => { param => 'DiskId',
+								next => {
+									'list' => { desc => 'list Disk',
+										display => 'disk',
+										load => sub { my ($p) = @_; return load("ServerDiskDescribe/".$p->{'serverId'}."/".$p->{'diskId'}); }
+									},
+								}
+							},
+							'list' => { desc => 'list Disks',
+								load => sub { my ($p) = @_; return load("ServerDisksList/".$p->{'serverId'}); },
+								display => 'disks',
+							}
+						}
+					}
+				}
+			},
+			'list' => { desc => 'list Servers',
+				load => sub { return load("ServersList"); },
+				display => 'servers',
+			},
+			'blocked' => { desc => 'list blocked servers',
+				load => sub { return load("ServersListBlocked"); },
+				display => 'servers',
+			},
+		}
+	},
+	'service' => { desc => 'Service management',
+		next => {
+			'list' => { desc => 'list Services',
+				load => sub { return load("ServicesList"); },
+				display => 'services',
+			}
+		}
+	},
+	'client' => { desc => 'Client management', 'multiBegin'=>1,
+		next => {
+			'clientId' => { desc => 'Waits for client X to become in sync with the cluster.', param => 'ClientId',
+				next => {
+					'sync' => { desc => 'Waits for client X to become in sync with the cluster.',
+						load => sub { my ($p) = @_; return load("ClientConfigWait/".$p->{'clientId'}); },
+						display => 'clientConfiguration',
+					},
+					'activeRequests' => { desc => 'Show currently active Storpool requests for this client',
+						load => sub { my ($p) = @_; return load("ClientActiveRequests/".$p->{'clientId'}); },
+						display => 'activeRequests',
+					}
+				},
+			},
+			'status' => { desc => 'Displays the current state of StorPool clients (ok, updating, down).',
+				load => sub { return load("ClientsConfigDump"); },
+				display => 'clientConfiguration',
+			},
+		},
+	},
+	'task' => {
+		desc => 'Tasks management',
+		next => {
+			'list' => {
+				desc => 'List Tasks',
+				load  => sub { return load("TasksList"); },
+				display => 'tasks',
+				next => {
+					'groupBy' => {
+						desc => 'Group tasks',
+						next => {
+							'disk' => {
+								inject => { groupBy => 'disk' },
+								desc =>'Group by disk',
+								load => sub { return load("TasksList"); },
+								display => 'tasks',
+							},
+							'id' => {
+								inject => { groupBy => 'id' },
+								desc =>'Group by Task ID',
+								load => sub { return load("TasksList"); },
+								display => 'tasks',
+							}
+						}
+					}
+				}
+			}
+		}
+	},
+	'relocator' => { desc => 'Volume relocator management',
+		next => {
+			'on' => {
+				desc => 'turn on volume relocator',
+				load => sub { return post("MgmtConfig", { relocatorOn => JSON::XS::true }); },
+				display => 'transaction',
+			},
+			'off' => {
+				desc => 'turn off volume relocator',
+				load => sub { return post("MgmtConfig", { relocatorOn => JSON::XS::false }); },
+				display => 'transaction',
+			},
+			'status' => {
+				desc => 'display volume relocator status',
+				load => sub { return load("VolumeRelocatorStatus"); },
+				display => 'relocator',
+			},
+			'disks' => {
+				desc => 'show estimated disks usage once relocation is conplete',
+				load => sub { return load("VolumeRelocatorDisksList"); },
+				display => 'disksTargets',
+			},
+			'volume' => {
+				desc => 'volume related relocator reporting',
+				next => {
+					'name' => { desc => 'Volume name', param => 'VolumeName',
+						next => {
+							'disks' => {
+								desc => 'show estimated disks usage for this volume after relocation',
+								load => sub { my ($p) = @_; return load("VolumeRelocatorVolumeDisks/".$p->{name}); },
+								display => 'disksTargets',
+							},
+						}
+					},
+				},
+			},
+			'snapshot' => {
+				desc => 'snapshot related relocator reporting',
+				next => {
+					'name' => { desc => 'Snapshot name', param => 'SnapshotName',
+						next => {
+							'disks' => {
+								desc => 'show estimated disks usage for this snapshot after relocation',
+								load => sub { my ($p) = @_; return load("VolumeRelocatorSnapshotDisks/".$p->{name}); },
+								display => 'disksTargets',
+							},
+						}
+					},
+				},
+			}
+		}
+	},
+	
+	'balancer' => {
+		desc => 'Volume balancer management',
+		next => {
+			'stop' => {
+				desc => 'stop balancer',
+				load => sub { return post("VolumeBalancerStatus", { 'cmd' => 'stop' }); },
+				display => 'transaction',
+			},
+			'commit' => {
+				desc => 'commit balancer changes',
+				load => sub { return post("VolumeBalancerStatus", { 'cmd' => 'commit' }); },
+				display => 'transaction',
+			},
+			'status' => {
+				desc => 'display volume balancer status',
+				load => sub { return load("VolumeBalancerStatus"); },
+				display => 'balancer',
+			},
+			'groups' => {
+				desc => 'display balancer allocation groups', 'end' => 1,
+				load => sub { return load("VolumeBalancerGroups"); },
+				display => 'balancerGroups',
+			},
+			'disks' => {
+				desc => 'show estimated disks usage after re-balancing volumes',
+				load => sub { return load("VolumeBalancerDisksList"); },
+				display => 'disksTargets',
+			},
+			'volume' => {
+				desc => 'volume related balancer reporting',
+				next => {
+					'status' => {
+						desc => 'display balancer per volume summary info.',
+						load => sub { return load("VolumeBalancerVolumesStatus"); },
+						display => 'balancerVolumes',
+					},
+					'name' => { desc => 'Volume name', param => 'VolumeName',
+						next => {
+							'disks' => {
+								desc => 'show estimated disks usage for this volume after re-balancing',
+								load => sub { my ($p) = @_; return load("VolumeBalancerVolumeDisks/".$p->{name}); },
+								display => 'disksTargets',
+							},
+							'diskSets' => {
+								desc => 'list this volume\'s current and new target disk sets',
+								load => sub { my ($p) = @_; return load("VolumeBalancerVolumeDiskSets/".$p->{name}); },
+								display => 'balancerDiskSets',
+							}
+						}
+					},
+				},
+			},
+			'snapshot' => {
+				desc => 'snapshot related balancer reporting',
+				next => {
+					'name' => { desc => 'Snapshot name', param => 'SnapshotName',
+						next => {
+							'disks' => {
+								desc => 'show estimated disks usage for this snapshot after re-balancing',
+								load => sub { my ($p) = @_; return load("VolumeBalancerSnapshotDisks/".$p->{name}); },
+								display => 'disksTargets',
+							},
+							'diskSets' => {
+								desc => 'list this snapshot\'s current and new target disk sets',
+								load => sub { my ($p) = @_; return load("VolumeBalancerSnapshotDiskSets/".$p->{name}); },
+								display => 'balancerDiskSets',
+							}
+						}
+					},
+				},
+			},
+			'override' => {
+				desc => 'balancer overrides',
+				next => {
+					'list' => { desc => 'list overrids',
+						load => sub { return load("VolumeBalancerTargetOverride"); },
+						display => 'json',
+					},
+					'add-from-file' => { desc => 'add overrides from json file',
+						next => {
+							'filename' => { param => 'FileName',
+								load => sub { my ($p) = @_; return post( "VolumeBalancerTargetOverride", loadJsonFile( $p->{filename} ) ); },
+								display => 'transaction',
+							}
+						}
+					},
+				}
+			}
+		}
+	},
+	
+	'disk' => { desc => 'Disks managment',
+		next => {
+			'list' => { desc => 'list disks',
+				load => sub { return load("DisksList"); },
+				display => 'disks',
+				next => {
+					'info' => { desc => 'list device name, disk model, serial and description',
+						load => sub { return load("DisksList"); },
+						display => 'disksInfo',
+					},
+					'internal' => { desc => 'list disks internal statistics',
+						load => sub { return load("DisksList"); },
+						display => 'disksInternal',
+					},
+				}
+			},
+			'diskId' => { param => 'DiskId',
+				next => {
+					'list' => { desc => 'list Disk',
+						display => 'disk',
+						load => sub { my ($p) = @_; return load("DiskDescribe/".$p->{'diskId'}); }
+					},
+					'eject' => { desc => 'eject Disk',
+						load => sub { my ($p) = @_; return post("DiskEject/".($p->{'diskId'}), { 'force' => JSON::XS::false }); },
+						display => 'transaction',
+						next => {
+							'force' => { desc => 'Force disk eject to complete even if this action will make some volumes unavailable',
+								load => sub { my ($p) = @_; return post("DiskEject/".($p->{'diskId'}), { 'force' => JSON::XS::true }); },
+								display => 'transaction',
+							},
+						}
+					},
+					'softEject' => { desc => 'soft eject disk',
+						load => sub { my ($p) = @_; return post("DiskSoftEject/".($p->{'diskId'}), {} ); },
+						display => 'transaction',
+						next => {
+							'cancel' => {
+								desc => 'cancel soft eject disk',
+								load => sub { my ($p) = @_; return post("DiskSoftEjectCancel/".($p->{'diskId'}), {} ); },
+								display => 'transaction',
+							},
+							'pause' => {
+								desc => 'pause soft eject disk',
+								load => sub { my ($p) = @_; return post("DiskSoftEjectPause/".($p->{'diskId'}), {} ); },
+								display => 'transaction',
+							}
+						}
+					},
+					'info' => { desc => 'disk info',
+						load => sub { my ($p) = @_; return load("DiskGetInfo/".$p->{'diskId'}); },
+						display => 'diskInfo',
+					},
+					'forget' => { desc => 'forget Disk',
+						load => sub { my ($p) = @_; return post("DiskForget/".($p->{'diskId'}), {} ); },
+						display => 'transaction',
+					},
+					'ignore' => { desc => 'try to boot cluster by ignoring this disk. Possible data corruption.',
+						next => {
+							'I_know_I_will_lose_data' => { 'noAutoComplete'=>1,
+								load => sub { my ($p) = @_; return post("DiskIgnore/".($p->{'diskId'}), {} ); },
+								display => 'transaction',
+							}
+						}
+					},
+					'description' => { desc => 'set disk description',
+						next => {
+							'description' => {
+								desc => 'disk description', param => 'DiskDescription',
+								load => sub { my ($p) = @_; return post("DiskSetDescription/".($p->{'diskId'}), {'description' => $p->{'description'}}); },
+								display => 'transaction',
+							},
+						},
+					},
+					'activeRequests' => { desc => 'Show currently active Storpool requests for this disk',
+						load => sub { my ($p) = @_; return load("DiskActiveRequests/".$p->{'diskId'}); },
+						display => 'activeRequests',
+					},
+					'scrubbing' => { desc => 'scrubbing operations',
+						next => {
+							'start' => { desc => 'start scrubbing operation immediately',
+								display => 'transaction',
+								load => sub { my ($p) = @_; return post("DiskScrubStart/".$p->{'diskId'}, {}); }
+							},
+							'pause' => { desc => 'pause scrubbing operation',
+								display => 'transaction',
+								load => sub { my ($p) = @_; return post("DiskScrubPause/".$p->{'diskId'}, {}); }
+							},
+							'continue' => { desc => 'continue scrubbing after pause',
+								display => 'transaction',
+								load => sub { my ($p) = @_; return post("DiskScrubContinue/".$p->{'diskId'}, {}); }
+							},
+						},
+					},
+					'retrim' => {
+						load => sub { my ($p) = @_; return post("DiskRetrim/".$p->{'diskId'}, {}); },
+						display => 'transaction',
+					},
+				}
+			},
+		}
+	},
+	'placementGroup' => { desc => 'placement groups mamanagment',
+		next => {
+			'list' => { desc => 'list placement groups',
+					load => sub { return load("PlacementGroupsList"); },
+					display => 'placementGroups',
+			},
+			'groupName' => { param => 'PlacementGroupName', 'multiBegin'=>1, desc => 'Name of the placement group',
+				next => {
+					'addDisk' => { 'multi' => 1, desc => 'add Disk to placementGroup',
+						next => {
+							'diskIdAdd' => { desc => 'disk Id to add',
+								'multiEnd' => 1, param => 'DiskId',
+								'list' => 1,
+								load => \&updatePlacementGroup,
+								display => 'transaction',
+							}
+						}
+					},
+					'rename' => { desc => 'set Name ([A-Za-z0-9_]{128})', 'multi'=>1,
+						next => {
+							'rename' => { 'multiEnd'=>1, param => 'PlacementGroupName',
+								load => \&updatePlacementGroup,
+								display => 'transaction',
+							}
+						}
+					},
+					'rmDisk' => { 'multi' => 1, desc => 'remove Disk from placementGroup',
+						next => {
+							'diskIdRm' => { desc => 'disk Id to remove',
+								'multiEnd' => 1, param => 'DiskId',
+								'list' => 1,
+								load => \&updatePlacementGroup,
+								display => 'transaction',
+							}
+						}
+					},
+					'list' => {desc => 'display content of placementGroup',
+						load => sub { my ($p) = @_; return load("PlacementGroupDescribe/".$p->{'groupName'}); },
+						display => 'placementGroup',
+					},
+					'delete' => { desc => 'delete the placement group',
+						next => {
+							'delete' => { desc => 'mandatorily specify the placement group name', param => 'PlacementGroupName',
+								load => \&updatePlacementGroup,
+								display => 'transaction',
+							}
+						}
+					},
+				}
+			}
+		}
+	},
+	
+	'faultSet' => { desc => 'fault sets mamanagment',
+		next => {
+			'list' => { desc => 'list fault sets',
+					load => sub { return load("FaultSetsList"); },
+					display => 'faultSets',
+			},
+			'name' => { param => 'FaultSetName', 'multiBegin'=>1, desc => 'Name of the fault set',
+			next => {
+					'rename' => { desc => 'set Name ([A-Za-z0-9_]{128})', 'multi'=>1,
+						next => {
+							'rename' => { 'multiEnd'=>1, param => 'FaultSetName',
+								load => \&updateFaultSet,
+								display => 'transaction',
+							}
+						}
+					},
+					'addServer' => { 'multi'=>1, desc => 'add Server to a fault set',
+						next => {
+							'addServers' => { desc => 'server Id to add',
+								'multiEnd' => 1, param => 'ServerId',
+								'list' => 1,
+								load => \&updateFaultSet,
+								display => 'transaction',
+							}
+						}
+					},
+					'rmServer' => { 'multi'=>1, desc => 'remove Server from a fault set',
+						next => {
+							'rmServers' => { desc => 'server Id to remove',
+								'multiEnd' => 1, param => 'ServerId',
+								'list' => 1,
+								load => \&updateFaultSet,
+								display => 'transaction',
+							}
+						}
+					},
+					'delete' => { desc => 'delete the fault set',
+						next => {
+							'delete' => { desc => 'mandatorily specify the fault set name', param => 'FaultSetName',
+								load => \&deleteFaultSet,
+								display => 'transaction',
+							}
+						}
+					},
+				}
+			}
+		}
+	},
+	
+	'attach' => { desc => 'make a volume visible to a client', 'multiBegin'=>1,
+		next => {
+			'client' => { desc => 'specify a client to attach the volume to', 'multi'=>1,
+				next => {
+					'clientId' => { desc => 'the client to attach the volume to',
+						param => 'ClientId', 'multiEnd'=>1,
+						load => \&attachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'here' => { desc => 'attach here', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'here' => 1 },
+						load => \&attachVolume,
+						display => 'transaction',
+			},
+			'volume' => { desc => 'specify a volume to attach', 'multi'=>1,
+				next => {
+					'volume' => { desc => 'the volume to attach',
+						param => 'VolumeName', 'multiEnd'=>1,
+						load => \&attachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'snapshot' => { desc => 'specify a snapshot to attach', 'multi'=>1,
+				next => {
+					'snapshot' => { desc => 'the snapshot to attach',
+						param => 'SnapshotName', 'multiEnd'=>1,
+						load => \&attachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'mode' => { desc => 'specify the read/write mode', 'multi'=>1,
+				next => {
+					'mode' => { param => 'VolumeRights', 'multiEnd'=>1,
+						load => \&attachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'list' => { desc => 'list the current attachments', 'multiBegin'=>1,
+				load => \&listAttachments,
+				display => 'attachments',
+				next => {
+					'client' => { desc => 'list by client', 'multi'=>1,
+						next => {
+							'client' => { desc => 'specify client',
+								param => 'ClientId', 'multiEnd'=>1,
+								load => \&listAttachments,
+								display => 'attachments',
+							},
+						},
+					},
+					'volume' => { desc => 'list by volume', 'multi'=>1,
+						next => {
+							'volume' => { desc => 'volume name',
+								param => 'VolumeName', 'multiEnd'=>1,
+								load => \&listAttachments,
+								display => 'attachments',
+							},
+						},
+					},
+					'snapshot' => { desc => 'list by snapshot', 'multi'=>1,
+						next => {
+							'snapshot' => { desc => 'snapshot name',
+								param => 'SnapshotName', 'multiEnd'=>1,
+								load => \&listAttachments,
+								display => 'attachments',
+							},
+						},
+					},
+				},
+			},
+			'noWait' => { desc => 'do not wait for the client', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'noWait' => 1 },
+						load => \&attachVolume,
+						display => 'transaction',
+			},
+			'timeout' => { desc => 'seconds to wait for the client to appear', 'multi'=>1,
+				next => {
+					'timeout' => { param => 'Positive', 'multiEnd'=>1,
+						load => \&attachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+		},
+	},
+	'detach' => { desc => 'make a volume no longer visible to a client', 'multiBegin'=>1,
+		next => {
+			'client' => { desc => 'specify a client to detach the volume from', 'multi'=>1,
+				next => {
+					'clientId' => { desc => 'the client to detach the volume from',
+						param => 'ClientId', 'multiEnd'=>1,
+						load => \&detachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'here' => { desc => 'detach from here', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'here' => 1 },
+						load => \&detachVolume,
+						display => 'transaction',
+			},
+			'all' => { desc => 'detach from all clients', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'all' => 1 },
+						load => \&detachVolume,
+						display => 'transaction',
+			},
+			'volume' => { desc => 'specify a volume to detach', 'multi'=>1,
+				next => {
+					'volume' => { desc => 'the volume to detach',
+						param => 'VolumeName', 'multiEnd'=>1,
+						load => \&detachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'snapshot' => { desc => 'specify a snapshot to detach', 'multi'=>1,
+				next => {
+					'snapshot' => { desc => 'the snapshot to detach',
+						param => 'SnapshotName', 'multiEnd'=>1,
+						load => \&detachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'force' => { desc => 'specify a force option', 'multi'=>1,
+				next => {
+					'force' => { desc => '"yes", default is "no"',
+						param => 'YesNo', 'multiEnd'=>1,
+						load => \&detachVolume,
+						display => 'transaction',
+					},
+				},
+			},
+			'noWait' => { desc => 'do not wait for the client', 'multi'=>1, 'multiEnd'=>1,
+						inject => { 'noWait' => 1 },
+						load => \&detachVolume,
+						display => 'transaction',
+			},
+		},
+	},
+	'iscsi' =>{ desc => 'iSCSI related commands',
+		next => {
+			'config' => { desc => 'display iSCSI config',
+				load => \&iscsiGetConfig,
+				display => 'iscsiConfig',
+				next => {
+					'portalGroup' => { desc => 'portalGroup mgmt',
+						next => {
+							'pgName' => { desc => 'name of the new portal group',
+								param => 'PgName',
+								
+								next => {
+									'create' => { desc => 'create portal group',
+										load => \&iscsiCreatePortalGroup,
+										display => 'transaction',
+										
+										next => {
+											'addNet' => { desc => 'add net filter',
+												next => {
+													'netAdd' => { desc => 'net to add',
+														param => 'NetPrefix',
+														load => \&iscsiCreatePortalGroup,
+														display => 'transaction',
+													}
+												}
+											},
+										}
+									},
+
+									'delete' => { desc => 'delete portal group',
+										load => \&iscsiDeletePortalGroup,
+										display => 'transaction',
+									},
+
+									'addNet' => { desc => 'add network',
+										next => {
+											'netAdd' => { desc => 'net to add',
+												param => 'NetPrefix',
+												load => \&iscsiPortalGroupAddNetwork,
+												display => 'transaction',
+											},
+										},
+									},
+								}
+							}
+						},
+					},
+					'portal' => { desc => 'portals mgmt',
+						next => {
+							'create' => { desc => 'create portal',
+								multiBegin => 1,
+								next => {
+									'portalGroup' => {
+										'desc' => 'specify the group that the portal should be created in',
+										'multi' => 1,
+										'next' => {
+											'pgName' => { desc => 'name of the portal group',
+												param => 'PgName',
+												load => \&iscsiConfigCreatePortal,
+												display => 'transaction',
+												multiEnd => 1,
+											},
+										},
+									},
+									'controller' => {
+										'desc' => 'specify the ID of the controller that listens on this portal',
+										'multi' => 1,
+										'next' => {
+											'controller' => { desc => 'ID of the controller',
+												param => 'ClientId',
+												load => \&iscsiConfigCreatePortal,
+												display => 'transaction',
+												multiEnd => 1,
+											},
+										},
+									},
+									'address' => {
+										'desc' => 'specify the IP address of the portal',
+										'multi' => 1,
+										'next' => {
+											'ip' => { desc => 'IP address',
+												param => 'IP',
+												load => \&iscsiConfigCreatePortal,
+												display => 'transaction',
+												multiEnd => 1,
+											},
+										},
+									},
+									'port' => {
+										'desc' => 'specify the TCP port of the portal (default: 3260)',
+										'multi' => 1,
+										'next' => {
+											'port' => { desc => 'TCP port',
+												param => 'Port',
+												load => \&iscsiConfigCreatePortal,
+												display => 'transaction',
+												multiEnd => 1,
+											},
+										},
+									},
+								}
+							},
+							'delete' => { dest => 'delete portal',
+								multiBegin => 1,
+								next => {
+									'address' => {
+										'desc' => 'specify the IP address of the portal',
+										'multi' => 1,
+										'next' => {
+											'ip' => { desc => 'IP address',
+												param => 'IP',
+												load => \&iscsiConfigPortalDelete,
+												display => 'transaction',
+												multiEnd => 1,
+											},
+										},
+									},
+									'port' => {
+										'desc' => 'specify the TCP port of the portal (default: 3260)',
+										'multi' => 1,
+										'next' => {
+											'port' => { desc => 'TCP port',
+												param => 'Port',
+												load => \&iscsiConfigPortalDelete,
+												display => 'transaction',
+												multiEnd => 1,
+											},
+										},
+									},
+								}
+							}
+						}
+					},
+					'target' => { desc => 'targets mgmt',
+						next => {
+							'create' => { desc => 'create target ( export volume )',
+								next => {
+									'volumeName' => { desc => 'volume to export',
+										param => 'VolumeName',
+										load => \&iscsiTargetCreate,
+										display => 'transaction',
+									}
+								}
+							},
+							'delete' => { desc => 'delete target',
+								next => {
+									'volumeName' => { desc => 'volume to export',
+										param => 'VolumeName',
+										load => \&iscsiTargetDelete,
+										display => 'transaction',
+									}
+								}
+							}
+						}
+					},
+					'initiator' => { desc => 'initiator mgmt',
+						next => {
+							'name' => { desc => 'initiator name',
+								param => 'IscsiName',
+								next => {
+									'create' => { desc => 'create initiator',
+										load => \&iscsiCreateInitiator,
+										display => 'transaction',
+										multiBegin => 1,
+										
+										next => {
+											'net' => { desc => 'add net filter',
+												multi => 1,
+												next => {
+													'netAdd' => { desc => 'net to add',
+														param => 'NetPrefix',
+														load => \&iscsiCreateInitiator,
+														display => 'transaction',
+													}
+												}
+											},
+											'chap' => { desc => 'set CHAP authentication username and secret',
+												multi => 1,
+												next => {
+													'username' => { desc => 'authentication username',
+														param => 'String',
+														next => {
+															'secret' => { desc => 'authentication password',
+																'multiEnd' => 1, param => 'String',
+																multiEnd => 1,
+																load => \&iscsiCreateInitiator,
+																display => 'transaction',
+															}
+														}
+													}
+												}
+											}
+										}
+									},
+									'delete' => { desc => 'delete initiator',
+										load => \&iscsiDeleteInitiator,
+										display => 'transaction',
+									},
+									'addNet' => { desc => 'add network',
+										next => {
+											'netAdd' => { desc => 'net to add',
+												param => 'NetPrefix',
+												load => \&iscsiInitiatorAddNet,
+												display => 'transaction',
+											}
+										}
+									}
+								}
+							},
+						}
+					},
+					'export' => { desc => 'export volume to initiator',
+						multiBegin => 1,
+
+						next => {
+							'initiator' => { desc => 'initiator name',
+								multi => 1,
+								next => {
+									'initiator' => { desc => 'initiator name',
+										param => 'IscsiName',
+										multiEnd => 1,
+										load => \&iscsiExport,
+										display => 'transaction',
+									},
+								},
+							},
+							'volume' => { desc => 'volume to export',
+								multi => 1,
+								next => {
+									'volumeName' => { desc => 'volume name',
+										param => 'VolumeName',
+										multiEnd => 1,
+										load => \&iscsiExport,
+										display => 'transaction',
+									},
+								},
+							},
+							'portalGroup' => { desc => 'portal group name',
+								multi => 1,
+								next => {
+									'portalGroup' => { desc => 'portal group name',
+										param => 'PgName',
+										multiEnd => 1,
+										load => \&iscsiExport,
+										display => 'transaction',
+									},
+								},
+							},
+						}
+					},
+					'unexport' => { desc => 'delete export',
+						multiBegin => 1,
+						
+						next => {
+							'initiator' => { desc => 'initiator name',
+								multi => 1,
+								next => {
+									'initiator' => { desc => 'initiator name',
+										param => 'IscsiName',
+										multiEnd => 1,
+										load => \&iscsiUnexport,
+										display => 'transaction',
+									},
+								},
+							},
+							'volume' => { desc => 'volume to unexport',
+								multi => 1,
+								next => {
+									'volumeName' => { desc => 'volume name',
+										param => 'VolumeName',
+										multiEnd => 1,
+										load => \&iscsiUnexport,
+										display => 'transaction',
+									},
+								},
+							},
+							'portalGroup' => { desc => 'portal group name',
+								multi => 1,
+								next => {
+									'portalGroup' => { desc => 'portal group name',
+										param => 'PgName',
+										multiEnd => 1,
+										load => \&iscsiUnexport,
+										display => 'transaction',
+									},
+								},
+							},
+						}
+					},
+					'setBaseName' => { desc => 'set the cluster iSCSI base name',
+						next => {
+							'name' => { desc => 'iSCSI name to use for targets by default',
+								param => 'IscsiName',
+								load => \&iscsiSetBaseName,
+								display => 'transaction',
+							}
+						}
+					}
+				},
+			},
+
+			# Informational queries
+
+			'basename' => { desc => 'the base name for iSCSI objects in the cluster',
+				load => \&iscsiGetConfig,
+				display => 'iscsi_basename',
+			},
+
+			'initiator' => { desc => 'the initiators allowed to access iSCSI volumes',
+				next => {
+					'initName' => { desc => 'name of the initiator',
+						param => 'IscsiName',
+						next => {
+							'export' => { desc => 'volumes exported to this initiator',
+								next => {
+									'list' => { desc => 'list the exported volumes',
+										load => \&iscsiGetConfig,
+										display => 'iscsi_initiatorExports',
+									},
+								},
+							},
+						},
+					},
+
+					'list' => { desc => 'display the initiators',
+						load => \&iscsiGetConfig,
+						display => 'iscsi_initiators',
+
+						next => {
+							'exports' => { desc => 'all exported volumes',
+								load => \&iscsiGetConfig,
+								display => 'iscsi_initiatorExports',
+							},
+
+							'networks' => { desc => 'all defined access networks',
+								load => \&iscsiGetConfig,
+								display => 'iscsi_initiatorNetworks',
+							},
+						},
+					},
+				},
+			},
+
+			'portalGroup' => { desc => 'the iSCSI portal groups',
+				next => {
+					'pgName' => { desc => 'name of the portal group',
+						param => 'PgName',
+						next => {
+							network => { desc => 'the portals defined in the group',
+								next => {
+									list => { desc => 'list the networks',
+										load => \&iscsiGetConfig,
+										display => 'iscsi_portalGroupNetworks',
+									},
+								},
+							},
+							portal => { desc => 'the portals defined in the group',
+								next => {
+									list => { desc => 'list the portals',
+										load => \&iscsiGetConfig,
+										display => 'iscsi_portalGroupPortals',
+									},
+								},
+							},
+						},
+					},
+
+					list => { desc => 'list the iSCSI portal groups',
+						load => \&iscsiGetConfig,
+						display => 'iscsi_portalGroups',
+
+						next => {
+							networks => { desc => 'display networks defined in all the groups',
+								load => \&iscsiGetConfig,
+								display => 'iscsi_portalGroupNetworks',
+							},
+							portals => { desc => 'display portals defined in all the groups',
+								load => \&iscsiGetConfig,
+								display => 'iscsi_portalGroupPortals',
+							},
+						},
+					},
+				},
+			},
+
+			'target' => { desc => 'iSCSI targets (StorPool iSCSI services)',
+				next => {
+					'list' => { desc => 'list the defined targets',
+						load => \&iscsiGetConfig,
+						display => 'iscsi_targets',
+					},
+				},
+			},
+		}
+	},
+	'kubernetes' => { desc => 'Kubernetes integration commands',
+		next => {
+			'status' => { desc => 'report Kubernetes status',
+				load => sub { return load("KubernetesStatus"); },
+				display => 'kubernetesStatusClusters',
+				next => {
+					'classes' => { desc => 'report the status of Kubernetes storage classes',
+						load => sub { return load("KubernetesStatus"); },
+						display => 'kubernetesStatusClasses',
+					},
+				},
+			},
+			'list' => { desc => 'list configured Kubernetes clusters',
+				load => sub { return load("KubernetesList"); },
+				display => 'kubernetesList',
+			},
+			'add' => { desc => 'add new kubernetes cluster',
+				'next' => {
+					'name' => {
+						'next' => {
+							'name' => { param => 'TemplateName',
+								load => sub { my($p) = @_; return post("KubernetesAdd", $p); },
+								diplay => 'transaction',
+							}
+						}
+					}
+				}
+			},
+			'delete' => { desc => 'delete existing kubernetes cluster',
+				'next' => {
+					'name' => {
+						'next' => {
+							'name' => { param => 'TemplateName',
+								load => sub { my($p) = @_; return post("KubernetesDelete/".$p->{'name'}, {}); },
+								display => 'transaction',
+							}
+						}
+					}
+				}
+			},
+			'update' => { desc => 'change existing kubernetes cluster',
+				next => {
+					'name' => {
+						'next' => {
+							'name' => { param => 'TemplateName',
+								next => {
+									'disable' => {
+										next => {
+											'disabled' => { param => 'YesNo',
+												load => sub { my ($p) = @_; return post("KubernetesUpdate/".$p->{'name'}, { 'disabled' => parseYesNo($p->{'disabled'}) }); },
+												display => 'transaction',
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			},
+		},
+	},
+	'mgmtConfig' => { desc => 'Internal MGMT configuration management', 'multiBegin'=>1,
+		next => {
+			'list' => { desc => 'Show current MGMT configuration',
+				load => sub { return load("MgmtConfig"); },
+				display => 'mgmtConfig',
+			},
+			'relocatorInterval' => { desc => 'set relocator interval', 'multi'=>1,
+				next => {
+					'relocatorInterval' => { param => 'Period', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'relocatorMinTrObjects' => { desc => 'set min number of objects per relocator transaction', 'multi'=>1,
+				next => {
+					'relocatorMinTrObjects' => { param => 'Positive', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'relocatorMaxTrObjects' => { desc => 'set max number of objects per relocator transaction', 'multi'=>1,
+				next => {
+					'relocatorMaxTrObjects' => { param => 'Positive', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'relocatorMaxRecoveryTasksPerDisk' => { desc => 'set max number of tasks per disk due to relocation', 'multi'=>1,
+				next => {
+					'relocatorMaxRecoveryTasksPerDisk' => { param => 'Positive', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'relocatorMaxRecoveryObjectsPerDisk' => { desc => 'set max number of objects in recovery per disk due to relocation', 'multi'=>1,
+				next => {
+					'relocatorMaxRecoveryObjectsPerDisk' => { param => 'Positive', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'relocatorRecoveryObjectsTrigger' => { desc => 'set max number of objects in recovery for a disk to be usable by the relocator', 'multi'=>1,
+				next => {
+					'relocatorRecoveryObjectsTrigger' => { param => 'Positive', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'relocatorGBFreeBeforeAdd' => { desc => 'set relocatior min free GB per disk beofre adding objects', 'multi'=>1,
+				next => {
+					'relocatorGBFreeBeforeAdd' => { param => 'Positive', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					}
+				}
+			},
+			'balancerAuto' => { desc => 'set balancer auto mode',
+				next => {
+					'on' => { desc => 'turn ON balancer auto mode',
+						load => sub { return post("MgmtConfig", { balancerAutoOn => JSON::XS::true }); },
+						display => 'transaction',
+					},
+					'off' => {
+						load => sub { return post("MgmtConfig", { balancerAutoOn => JSON::XS::false }); },
+						display => 'transaction',
+					},
+				}
+			},
+			'balancerAutoInterval' => { desc => 'set balancer auto mode interval', 'multi'=>1,
+				next => {
+					'balancerAutoInterval' => { param => 'Period', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'snapshotDeleteInterval' => { desc => 'set snapshot delete check interval', 'multi'=>1,
+				next => {
+					'snapshotDeleteInterval' => { param => 'Period', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'disksSoftEjectInterval' => { desc => 'set disks soft eject check interval', 'multi'=>1,
+				next => {
+					'disksSoftEjectInterval' => { param => 'Period', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+			'delayedSnapshotDelete' => { desc => 'enable or disable delayed snapshot delete',
+				next => {
+					'on' => {
+						load => sub { return post("MgmtConfig", { delayedSnapshotDelete => JSON::XS::true }); },
+						display => 'transaction',
+					},
+					'off' => {
+						load => sub { return post("MgmtConfig", { delayedSnapshotDelete => JSON::XS::false }); },
+						display => 'transaction',
+					},
+				},
+			},
+			'snapshotDematerializeInterval' => { desc => 'set snapshot dematerialize interval. 0 = off', 'multi'=>1,
+				next => {
+					'snapshotDematerializeInterval' => { param => 'Period', 'multiEnd'=>1,
+						load => sub { my($p) = @_; return post("MgmtConfig", $p); },
+						display => 'transaction',
+					},
+				}
+			},
+		}
+	},
+	'location' => { desc => 'locations managment',
+		next => {
+			'list' => { desc => 'show created locations',
+				load => sub { return load("LocationsList"); },
+				display => 'locationsList'
+			},
+			'add' => { desc => 'add remote location',
+				next => {
+					'locationId' => { param => 'LocationId',
+						next => { 
+							'name' => { param => 'VolumeName',
+								load => \&locationAdd,
+								display => 'transaction',
+							}
+						}
+					}
+				}
+			},
+			'rename' => { desc => 'rename existing location',
+				next => {
+					'location' => { param => 'VolumeName',
+						next => {
+							'name' => {
+								next => {
+									'name' => { param => 'VolumeName',
+										load => sub { my($p) = @_; return post("LocationRename", { location => $p->{"location"}, name => $p->{"name"} }) },
+										display => 'transaction',
+									}
+								}
+							}
+						}
+					}
+				}
+			},
+			'remove' => { desc => 'delete existing location',
+				next => {
+					'location' => { param => 'VolumeName',
+						load => sub { my($p) = @_; return post("LocationRemove", { location => $p->{"location"} } ) },
+						display => 'transaction',
+					}
+				}
+			}
+		}
+	},
+	'cluster' => { desc => 'clusters managent',
+		next => {
+			'list' => { desc => "show created clusters",
+				load => sub { return load("ClustersList"); },
+				display => 'clustersList'
+			},
+			'add' => { desc => 'add cluster',
+				next => {
+					'locationName' => { param => 'VolumeName',
+						next => {
+							'id' => { param => 'ClusterId',
+								load => \&clusterAdd,
+								display => 'transaction',
+							}
+						}
+					}
+				}
+			},
+			'remove' => { desc => "delete existing cluster",
+				next => {
+					'location' => { param => 'VolumeName',
+						next => {
+							'id' => { param => 'ClusterId',
+								load => sub { my($p) = @_; return post("ClusterRemove", { location => $p->{"location"}, id => $p->{"id"} }) },
+								display => 'transaction',
+							}
+						}
+					}
+				}
+			}
+		}
+	},
+	'remoteBridge' => { desc => "remote bridge management",
+		next => {
+			'list' => { desc => "show registered bridges",
+				load => sub { return load("RemoteBridgesList"); },
+				display => 'remoteBridgesList'
+			},
+			'register' => { desc => 'add remote bridge record',
+				next => {
+					'locationName' => { param => 'VolumeName',
+						next => {
+							'ip' => { param => 'IP',
+								next => {
+									'publicKey' => { param => 'PublicKey',
+										load => \&remoteBridgeAdd,
+										display => 'transaction',
+										next => {
+											'minimumDeleteDelay' => { param => 'TimeDelay',
+												load => \&remoteBridgeAdd,
+												display => 'transaction',
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			},
+			'deregister' => { desc => 'remove remote bridge record',
+				next => {
+					'ip' => { param => 'IP',
+						load => \&remoteBridgeRemove,
+						display => 'transaction',
+					}
+				}
+			}
+		}
+	}
+};
+
+$cmd->{'volume'}->{'next'}->{'groupBackup'}->{'next'}->{'remoteLocation'}->{'next'}->{'volume'}->{'next'} = $cmd->{'volume'}->{'next'}->{'groupBackup'}->{'next'}->{'remoteLocation'}->{'next'};
+
+############################################
+sub getMulti($$$)
+{
+	my ($c, $arr, $skip) = @_;
+	my $ret = undef;
+	my $multi = 0;
+	
+	my @look = @$arr;
+	my $lsize = $#look;
+	for( my $i=$lsize; $i>=0; $i-- )
+	{
+		$multi++ if exists $look[$i]->{'multi'} || exists $c->{'multi'} || exists $look[$i]->{'multiEnd'} || exists $c->{'multiEnd'};
+		if( $multi && exists $look[$i]->{'multiBegin'} )
+		{
+			$ret = $look[$i];
+			dbg("look[$i] multiBEGIN");
+			if( 0 == $skip--)
+			{
+				last;
+			}
+		}
+	}
+	dbg "end:".scalar keys %$ret;
+	return $ret;
+}
+
+sub cliWalk($;$)
+{
+	my ($line, $flags) = @_;
+	my $ret = {};
+	my @walked = ();
+	my $c = $cmd;
+	my $params = {};
+	
+	dbg"BEGIN line:'$line' flags:$flags";
+	
+	$line =~s/(\s+)/ /g; #strip multiple spaces
+	
+	unless( $line =~ m/^\s*$/ )
+	{
+		my $word = 'root';
+		my @words = split " ", $line;
+		
+		dbg"words in line:".($#words+1);
+		for( my $i=0; $#words>=0  && $i <= $#words; $i++ )
+		{
+			$word = $words[$i];
+			dbg"analysing word[$i]:'$word'";
+			
+			if( $i==$#words && ($flags&F_SKIP_LAST_WORD) > 0 )
+			{
+				dbg"'$word' Skipped LAST WORD";
+				last;
+			}
+			
+			### COMMAND
+			if( exists($c->{$word}) && !exists($c->{$word}->{'param'}) )
+			{
+				dbg"command '$word' EXIST";
+				unless( exists $c->{$word}->{'name'} ) # fill missing element in conf structure...
+				{
+					$c->{$word}->{'name'} = $word;
+				}
+				
+				push @walked, $c->{$word};
+				
+				if( exists $c->{$word}->{inject} )
+				{
+					$params->{$_} = $c->{$word}->{inject}->{$_} for keys %{$c->{$word}->{inject}};
+				}
+				
+				if( exists $c->{$word}->{'next'} )
+				{
+					dbg"command '$word' have NEXT";
+					$c = $c->{$word}->{'next'};
+					next;
+				}
+				else
+				{
+					dbg"'$word' is END COMMAND";
+					my $multi = getMulti($c->{$word}, \@walked, 0);
+					if( exists $multi->{'next'} )
+					{
+						$c = $multi->{'next'};
+#						dbg"ret->{'m'} assigned to '$multi->{'name'}'";
+#						$ret->{'m'} = $multi;
+						if( $i < $#words )
+						{
+							dbg"more words left:".($#words-$i);
+							next;
+						}
+						else
+						{
+							dbg"ret->{'m'} assigned to '$multi->{'name'}'";
+							$ret->{'m'} = $multi;
+						}
+					}
+					else
+					{
+						dbg"NO multi";
+					}
+					last;
+				}
+			}
+			
+			### PARAMETER
+			else
+			{
+				my $next = 0;
+				foreach my $name (keys %{$c})
+				{
+					my $param = $c->{$name}->{param};
+					next unless defined $param;
+					
+					my $def = $PARAM_DEFS{$param};
+					die "No such parameter $param\n" unless defined $def;
+					die "No validator for $name\n" unless defined $def->{validate};
+					
+					if( $def->{validate}->($word, $params) )
+					{
+						
+						$word = $def->{parse}->($word) if (defined $def->{parse});
+						
+						my $dbgstr = "<$name>=$word VALIDATED";
+						
+						if( exists $c->{$name}->{'list'} )
+						{
+							if( exists $params->{$name} )
+							{
+								my $l = $params->{$name};
+								push (@$l, $word);
+							}
+							else
+							{
+								$params->{$name} = [$word];
+							}
+						}
+						else
+						{
+							$params->{$name} = $word;
+						}
+						
+						
+						$c->{$name}->{'name'} = $name;
+						push @walked, $c->{$name};
+						if( exists $c->{$name}->{'next'} )
+						{
+							$dbgstr .=" NEXT";
+							$c->{$name}->{'name'} = $name;
+							$c = $c->{$name}->{'next'};
+							dbg($dbgstr);
+							$next = 1;
+							last;
+						}
+						else
+						{
+							$dbgstr .= " is END PARAMETER";
+							dbg $dbgstr;
+							my $multi = getMulti($c->{$name}, \@walked, 0);
+							if( exists $multi->{'next'} )
+							{
+								$c = $multi->{'next'};
+								dbg"ret->{'m'} assigned to '$multi->{'name'}'";
+								$ret->{'m'} = $multi;
+								if( $i<$#words )
+								{
+									dbg"more words left:".($#words-$i);
+									$next = 1;
+									last;
+								}
+#								else
+#								{
+#									dbg"ret->{'m'} assigned to '$multi->{'name'}'";
+#									$ret->{'m'} = $multi;
+#								}
+							}
+							last;
+						}
+					}
+					else
+					{
+						last;
+					}
+				}
+				### Unknown word
+				if( $next )
+				{
+					next;
+				}
+				dbg("Don't recognize '$word' as keyword or parameter!");
+				last;
+			}
+		}
+	}
+	else
+	{
+		dbg"empty line, return cmd root";
+	}
+	
+	$ret->{'ptr'} = $c;
+	$ret->{'walked'} = \@walked;
+	$ret->{'wsize'} = $#walked;
+	$ret->{'params'} = $params;
+	
+	dumpHashref("walked", $ret) if $debug>0;
+	return $ret;
+}
+
+
+{ # global scope
+	
+	my ($ptr, $txt, %offered, $gwalk);
+	
+	sub cliAutocomplete
+	{
+		my($arg, $iter) = @_;
+		my $name;
+		my $multiOption = 0;
+		my $ptr = $gwalk->{'ptr'};
+		
+		dbg "BEGIN arg:'%s', iter:%d\n", $arg, $iter;
+		return undef if $iter>15;
+		if( $iter == 0 )
+		{
+			%offered = ();
+		}
+		# fill already filled multioptions
+		if( exists $gwalk->{'m'} )
+		{
+			dbg"multiROOT:'$gwalk->{'m'}->{'name'}'";
+			my $ptrM = $gwalk->{'m'}->{'next'};
+			$multiOption = 1;
+			foreach my $e (@{$gwalk->{'walked'}})
+			{
+				$name = $e->{'name'};
+				if( exists $e->{'param'} )
+				{
+					$name = "<$name>";
+				}
+				dbg"walked:'$name'(".$e->{'name'}.")";
+				if( exists $ptrM->{$e->{'name'}} )
+				{
+					dbg"+offered:'$name'";
+					$offered{$name} = $e;
+				}
+			}
+			foreach my $e ( sort keys %$ptrM )
+			{
+				dbg"grrr:$e";
+				$name = $e;
+				if( exists $ptrM->{$e}->{'parm'} )
+				{
+					$name = "<$name>";
+				}
+				if( ! exists $offered{$name} && exists $ptrM->{$e}->{'multi'} )
+				{
+					dbg "rebase $name";
+					$ptr = $ptrM;
+				}
+			}
+		}
+		else
+		{
+			dbg"NO multiROOT!";
+		}
+		dbg "ptr:".dump $ptr;
+		if( $gwalk->{'wsize'} >= 0 )
+		{
+			my $e = $gwalk->{'walked'}[$gwalk->{'wsize'}];
+			if( exists($e->{'load'}) && !$multiOption && !exists($e->{'next'}) && !exists($e->{'multiEnd'}) )
+			{
+				dbg"End of comand! RETURN undef";
+				return undef;
+			}
+		}
+		foreach my $k (keys %{$ptr})
+		{
+			if( exists($ptr->{$k}->{'param'}) )
+			{
+				$name = "<$k>";
+			}
+			else
+			{
+				$name = $k;
+			}
+			
+			dbg("key:'$k' name:'$name' LOOP");
+			
+			### check entry is offered
+			if( exists( $offered{$name} ) )
+			{
+				dbg"'$name' already OFFERED";
+				next;
+			}
+			
+			if( exists($ptr->{$k}->{'param'}) )
+			{
+				if( $arg ne "" )
+				{
+					### arg not empty
+					dbg("arg:$arg PARAMETER");
+					if( exists $ptr->{$k}->{'complete'} )
+					{
+						if( $ptr->{$k}->{'complete'}->($arg, $gwalk->{'params'}) > 0 )
+						{
+							dbg("RETURN '$name' as '$arg' <<< validated parameter autocomplete");
+							$gwalk->{'params'}->{ $k } = $arg;
+							$offered{$name} = $ptr->{$k};
+							return $arg;
+						}
+						else
+						{
+							dbg("Can't validate '$arg' as '$name'");
+						}
+					}
+					else
+					{
+						dbg("implement 'complete()' function for '$name'");
+						$offered{$name} = $ptr->{$k};
+					}
+					next;
+				}
+				else
+				{
+					### arg is empty
+					if( scalar keys(%{$ptr}) > 1 ) # there is more than one option at this level
+					{
+						dbg( "RETURN '<$k>' PARAM <<< full autocomplete" );
+						$offered{$name} = $ptr->{$k};
+						return $name;
+					}
+					else
+					{
+						last;
+					}
+				}
+			}
+			elsif( exists($ptr->{$k}->{'noAutoComplete'}) )
+			{
+				return undef;
+			}
+			elsif( $k =~ m|^\Q$arg\E| ) # partial match
+			{
+				if( $multiOption && (!exists $ptr->{$k}->{'multi'} ) )
+				{
+					dbg"not multioption '$name' SKIPPED";
+					next;
+				}
+				$offered{$name} = $ptr->{$k};
+				dbg( "RETURN '$name' <<< partial autocomplete" );
+				return $name;
+			}
+		}#foreach keys $ptr
+		dbg"RETURN undef <<< end of autocomplete";
+		return undef;
+	}
+	
+	sub cliAttemptedCompletion
+	{
+		my ($arg, $line, $start, $end) = @_;
+		my @ret;
+		
+		dbg "\n arg:'%s', line:'%s', start:%d, end:%d", $arg, $line, $start, $end;
+		
+		my $flags = 0;
+		unless( $arg =~ m/^\s*$/ )
+		{
+			dbg"F_SKIP_LAST_WORD";
+			$flags |= F_SKIP_LAST_WORD;
+		}
+		
+		$gwalk= cliWalk($line, $flags);
+		
+		my $ptr = $gwalk->{'ptr'};
+		
+		my (@matches) = $term->completion_matches( $arg, \&cliAutocomplete);
+		
+		dbg"cliAutocomplete offered:".($#matches+1)." matches:".join("|", @matches).";";
+		
+		my $auto;
+		### failed to offer autocomplete
+		if( $#matches == -1 )
+		{
+			$auto = 0;
+			# if only 1 entry...
+			if ( scalar keys %{$ptr} == 1 )
+			{
+				my $name;
+				($name, $ptr) = each(%{$ptr});
+				# and is parameter...
+				if( exists $ptr->{'param'} )
+				{
+					if( exists $offered{"<$name>"} )
+					{
+						dbg"<$name> already offered";
+					}
+					else
+					{
+						### construct parameter hint
+						dbg"PARAMETER <$name> building autocomplete...";
+						push @matches, "";
+						push @matches, "<$name>";
+						if( exists $ptr->{'hint'} )
+						{
+							push @matches, "(".$ptr->{'hint'}.")";
+						}
+						else
+						{
+							push @matches, "";
+						}
+					}
+				}
+				elsif( exists $ptr->{'noAutoComplete'} )
+				{
+					push @matches, "";
+					push @matches, "$name";
+					push @matches, "";
+				}
+			}
+		}
+		else
+		{
+			$auto = $#matches+1;
+		}
+		
+		dbg"auto:$auto line:'$line'";
+		
+		if( $gwalk->{'wsize'} >= 0 )
+		{
+			### end marker, add '[enter]' to hints
+			if( exists $gwalk->{'walked'}[$gwalk->{'wsize'}]->{'load'} )
+			{
+				dbg"endmark flags:$flags";
+				if( ! $flags )
+				{
+					dbg"insert [enter] ($#matches)";
+					if($auto==1)
+					{
+						@matches = ("", "[Enter]", @matches);
+						
+					}
+					elsif( $auto>1 )
+					{
+						push @matches, "[enter]";
+					}
+					else
+					{
+						@matches = ("", "[Enter]", "");
+					}
+				}
+			}
+			
+		}
+		
+		if($debug)
+		{
+			foreach my $m (@matches)
+			{
+				dbg "matches:'$m'";
+			}
+		}
+		
+		return @matches;
+	}
+	
+	############################################
+	# called if cliAttemptedCompletion fail
+	#
+	# add possible [enter]
+	#
+	sub cliCompletionEntry($$)
+	{
+		my ($arg, $iter) = @_;
+		dbg("BEGIN %d, arg:'%s'\n", $iter, $arg);
+		my @walked;
+		if( $iter==0 )
+		{
+			$ptr = cliWalk($attribs->{line_buffer}, 0);
+			if( $ptr->{'wsize'} < 0 )
+			{
+				print STDERR "\nError: unknown command\n";
+				$term->forced_update_display();
+				return undef;
+			}
+			else
+			{
+				dbg"return ''";
+				return "";
+			}
+			
+		}
+		elsif( $iter==1 )
+		{
+			if($ptr->{'wsize'} >= 0)
+			{
+				return "[enter]";
+			}
+		}
+		return undef;
+	}
+}
+
+
+sub cliCmdExit
+{
+	print STDERR "Exiting...\n";
+	$term->WriteHistory($historyFile) if $term;
+	close($pager{'fh'}) if exists $pager{'fh'};
+	exit 0;
+}
+
+############################################
+sub dumpHelp($$);
+sub dumpHelp($$) ### pagerify
+{
+	my($ref, $level) = @_;
+	my $separator = " -";
+	
+	foreach my $key (sort keys %$ref)
+	{
+		print "  " x ($level + 1);
+		print exists $ref->{$key}->{'param'} ? "<$key>" : $key;
+		
+		my $separate = 0;
+		if( exists $ref->{$key}->{'desc'} )
+		{
+			print $separator if !$separate++;
+			print " $ref->{$key}->{'desc'}";
+		}
+		if( exists $ref->{$key}->{'param'} )
+		{
+			print $separator if !$separate++;
+			print " ($PARAM_DEFS{$ref->{$key}->{param}}->{'hint'})";
+		}
+		if( exists $ref->{$key}->{'multi'} )
+		{
+			print $separator if !$separate++;
+			print " {M}";
+		}
+		
+		print "\n";
+		
+		# recursion disabled
+		#if( exists $ref->{$key}->{'next'} )
+		#{
+		#	dumpHelp($ref->{$key}->{'next'}, $level+1)
+		#}
+	}
+}
+
+############################################
+sub cliCmdHelp
+{
+	dbg "input:".join("|",@_);
+	my $w = cliWalk($attribs->{'line_buffer'} || '', 0);
+	my $ptr = $w->{'ptr'};
+	print "\n";
+	dumpHelp($ptr, 0);
+	$term->forced_update_display if $term;
+	return 0;
+}
+
+############################################
+sub errorOffset
+{
+	my ($w) = @_;
+	my $off = length( $cli_prompt );
+	my $marker = "^";
+	if( $w )
+	{
+		my $ptr;
+		for(my $i=0; $i< scalar @{$w->{'walked'}}; $i++)
+		{
+			$ptr = $w->{'walked'}[$i];
+			if( exists $ptr->{'param'} )
+			{
+				$off+=length $w->{'params'}->{$ptr->{'name'}};
+			}
+			else
+			{
+				$off+=length $ptr->{'name'};
+			}
+			$off++;
+		}
+	}
+	
+	my $ret = sprintf "%".$off."s", '';
+	return $ret;
+}
+
+sub isTransientError($)
+{
+	my ($r) = @_;
+	
+	return defined(ref($r)) && ref($r) eq 'ARRAY' &&
+		defined(ref($r->[0])) && ref($r->[0]) eq 'HASH' &&
+		defined(ref($r->[0]->{'error'})) && ref($r->[0]->{'error'}) eq 'HASH' &&
+		$r->[0]->{'error'}->{'transient'};
+}
+
+sub handleAsTransientError($)
+{
+	return $opt_B && isTransientError($_[0]);
+}
+
+sub cliHandleCommand($$)
+{
+	my ($s, $line) = @_;
+	my @walked = ();
+	my $ptr;
+	my $last;
+	my $w = {};
+	
+	$line =~ s/\s+/ /g; # strip multispaces
+	$line =~ s/(\s+)$//; # strip trailing spaces
+	my @l = split" ", $line;
+	
+	dbg "mode:$mode, line:'$line'";
+	
+	my $response;
+	
+	if ( $mode eq 'raw' )
+	{
+		$line =~ s/\s+/\//g;
+		$response = load($line);
+		dbg dump($response);
+		if ($response->[1]) {
+			return 1;
+		}
+		return 0;
+	}
+	else # $mode eq 'normal' or $mode eq 'test'
+	{
+		$w = cliWalk($line, 0);
+		
+		if( exists $w->{'wsize'} && $w->{'wsize'} >= 0 ) # found something
+		{
+			@walked = @{$w->{'walked'}};
+			
+			$last = $walked[$#walked];
+			dbg"last:'".$last->{'name'}."'";
+			
+			my $eoffset = errorOffset($w);
+			my $efun = $eoffset;
+			$efun =~s/\s/\./g;
+			
+			if( exists($last->{'load'}) )
+			{
+				### CLI garbage at end
+				if( $#l != $#walked )
+				{
+					print $efun."^\n" if $readline;
+					print STDERR "Error: unexpected garbage after '$last->{'name'}'\n";
+					return 3;
+				}
+				
+				$response = $last->{'load'}( $w->{'params'} ) ;
+			}
+			else
+			{
+				### CLI incomplete command
+				print $efun."^\n" if $readline;
+				print STDERR "Error: incomplete command! Expected:\n";
+				$ptr = $last->{'next'};
+				foreach my $k (keys %$ptr)
+				{
+					if( $k eq "param" )
+					{
+						print STDERR "\t<".$ptr->{$k}->{'name'}.">";
+					}
+					else
+					{
+						print STDERR "\t$k";
+					}
+					if( exists $ptr->{$k}->{'desc'} )
+					{
+						print STDERR " - ".$ptr->{$k}->{'desc'};
+					}
+					if( exists $ptr->{$k}->{'hint'} )
+					{
+						print STDERR " (".$ptr->{$k}->{'hint'}.")";
+					}
+					
+					print STDERR "\n";
+				}
+				return 4;
+			}
+		
+		}
+		else
+		{
+			print STDERR "Unrecognized command: $line\n";
+			return 5;
+		}
+	}
+	
+	if( handleAsTransientError($response) ) {
+		return $response;
+	}
+	
+	if( $format eq 'raw' )
+	{
+		if( !defined($response) || ref($response) ne 'ARRAY' || $response->[1] ) {
+			return 1;
+		}
+		return 0;
+	}
+	elsif( $format eq 'pass' )
+	{
+		my $ret = 0;
+		
+		sub same_ref($ $)
+		{
+			my ($v1, $v2) = @_;
+			# OK, so here's the thing.
+			# The API will either return a reference to a hash or
+			# a reference to an array.  If someday it returns something else,
+			# then this function will need to be changed.
+			#
+			# For both hashes and arrays, Perl makes it easy for us: a string
+			# comparison of ref($v) will contain enough information to uniquely
+			# identify the objects.  Thus, ref($v1) ne rev($v2) is just enough.
+			#
+			return defined( ref($v1) ) && defined( ref($v2) ) && ref($v1) eq ref($v2);
+		}
+		
+		if( !defined( $response ) || ref($response) ne 'ARRAY' || !defined( $response->[0] ) )
+		{
+			$response = jsError("Internal CLI error, no result returned");
+		}
+		my $output;
+		if( defined( $response->[1] ) && $response->[1] ne '' ||
+		       !defined( $resLastLoad ) || !same_ref($response->[0], $resLastLoad) )
+		{
+			# The CLI handler either returned an error or generated some
+			# weird kind of output.
+			$output = $jsonObj->encode( $response->[0] );
+			$ret = 1;
+		}
+		else
+		{
+			$output = $jsonLastLoad;
+		}
+		pagerAdd $output;
+		pagerAdd "\n" unless substr($output, -1) eq "\n";
+		pagerDisplay();
+		undef $resLastLoad;
+		undef $jsonLastLoad;
+		return $ret;
+	}
+	elsif( exists $last->{'display'} )
+	{
+		return doDisplay({ 'mode' => $last->{'display'}, 'params' => $w->{'params'} }, $response);
+	}
+	else
+	{
+		# Do nothing.
+		return 0;
+	}
+}
+
+
+############################################
+# TODO: incomplete, unused
+sub cliHistoryMoveLast
+{
+	my ($line) = @_;
+	
+	my $res = $term->where_history();
+	dbg"where_history:$res";
+	my $hg = $term->history_get($res);
+	dbg"hisotry_get:'$hg'";
+	my $prev='';
+	my @hist = $term->GetHistory;
+	for(my $i=$#hist; 0 <= $i; $i--)
+	{
+		dbg"hist[$i]:'$hist[$i]'";
+		if( $hist[$i]=~/^\s+$/ )
+		{
+			dbg"[$i] removing empty '$hist[$i]'";
+			$term->remove_history($i);
+		}
+		elsif($i>0 && $hist[$i-1] eq $hist[$i])
+		{
+			dbg"[$i] removing duplicated '$hist[$i]'";
+			$term->remove_history($i);
+		}
+	}
+	dbg dump $term->GetHistory;
+#	dbg "line:'$line'";
+#	$term->AddHistory($line) if $line =! m/^\s*$/;
+	unless( $line =~ m/^\s*$/ )
+	{
+		dbg"adding to history:'$line'";
+		$term->AddHistory($line);
+		$term->WriteHistory($historyFile)
+			or warn "$0: cannot write history file: $!\n";
+	}
+}
+
+sub cliHistory
+{
+	my ($line) = @_;
+	
+	unless( $line =~ m/^\s*$/ )
+	{
+		my @hist = $term->GetHistory;
+		if( @hist && $hist[$#hist] eq $line )
+		{
+			return;
+		}
+		$term->AddHistory($line);
+		$term->WriteHistory($historyFile) or warn "$0: cannot write history file: $!\n";
+	}
+}
+
+sub cliHistoryInit
+{
+	$term->using_history();
+	my $ret = $term->MinLine(0);
+	$ret = $term->stifle_history($historyLength);
+	
+	if( -f $historyFile )
+	{
+		$term->ReadHistory($historyFile) or warn "$0: cannot read history file: $!\n";
+	}
+}
+
+
+sub cliReadline($)
+{
+	my ($s) = @_;
+	my $ret = 1;
+	
+	$term = new Term::ReadLine 'StorPoolCLI';
+	$term->ornaments('md,me,,');    # bold face prompt
+	$term->rl_add_defun('cliCmdHelp', \&cliCmdHelp, ord '?');
+	
+	$term->rl_add_defun("cliExit", \&cliCmdExit);
+	$attribs = $term->Attribs;
+	$OUT = $attribs->{'outstream'};
+	$attribs->{completion_entry_function} = \&cliCompletionEntry;
+	$attribs->{attempted_completion_function} = \&cliAttemptedCompletion;
+	
+	print "Term::Readline::Gnu v$attribs->{library_version} $attribs->{readline_version} $attribs->{gnu_readline_p} $attribs->{terminal_name}\n" if $debug;
+	
+	if( $debug && 0 )
+	{
+		my $features = $term->Features;
+		dumpHashref("Features",$features) if $debug;
+		dbg dump $term->rl_get_all_function_names();
+	}
+	
+	if( exists $ENV{'HOME'} )
+	{
+		$historyFile = $ENV{'HOME'}."/$historyFile";
+	}
+	
+	cliHistoryInit();
+	
+	while( defined( $_ = $term->readline($cli_prompt) ) )
+	{
+		s/(\s+)/ /g; # remove multiple spaces
+		my $hline = $_;
+		s/\s+$//; #remove ending spaces
+		dbg "line:'$_'";
+		next unless $_;
+		
+		cliHistory($hline);
+		next if /^\s*#/;
+		$ret = cliHandleCommand($s, $_);
+	}
+	cliCmdExit();
+	return $ret;
+}
+
+my $transientRetry = 0;
+my $transientSleep;
+
+sub retryTransientError($)
+{
+	my ($r) = @_;
+	
+	print STDERR "Transient error: $r->[0]->{error}->{descr}\n";
+	$transientRetry++;
+	if( $transientRetry >= 5 ) {
+		print STDERR "Too many transient errors, giving up!\n";
+		return 0;
+	}
+	
+	if( $transientRetry == 1 ) {
+		$transientSleep = 1;
+	} else {
+		$transientSleep = int($transientSleep * 1.5 + 0.5);
+	}
+	print STDERR "Retry after $transientSleep second".($transientSleep == 1? "": "s")."\n";
+	sleep($transientSleep);
+	return 1;
+}
+
+
+#######################################################################
+#######################################################################
+#######################################################################
+my $s;
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+sub VERSION_MESSAGE
+{
+	my ($fh) = @_;
+	print $fh "StorPool CLI v1.0\n";
+}
+
+sub HELP_MESSAGE
+{
+	my ($fh) = @_;
+	usage();
+}
+
+my $stashedCommand;
+my $gotopts = 0;
+
+mainLoop:
+
+confget();
+
+if( !defined($ENV{SP_AUTH_TOKEN}) )
+{
+	die "Missing authentication token(SP_AUTH_TOKEN), exiting.\n";
+}
+
+$host = $ENV{'SP_API_HTTP_HOST'} if defined($ENV{'SP_API_HTTP_HOST'});
+$port = $ENV{'SP_API_HTTP_PORT'} if defined($ENV{'SP_API_HTTP_PORT'});
+
+{
+	if( !$gotopts )
+	{
+		getopts('BdF:f:hjPRrS:t') or usage();
+		$gotopts = 1;
+	}
+	
+	if( defined($opt_h) )
+	{
+		VERSION_MESSAGE(\*STDOUT);
+		HELP_MESSAGE(\*STDOUT);
+		exit(0);
+	}
+	
+	$debug = 1 if defined $opt_d;
+
+	if( $opt_f )
+	{
+		usage() if $opt_j || $opt_R;
+		usage() unless $opt_f =~ /^( csv | json | pass | raw | text )$/x;
+		$format = $opt_f;
+	}
+	elsif( $opt_j )
+	{
+		usage() if $opt_R;
+		$format = 'pass';
+	}
+	elsif( $opt_R )
+	{
+		$format = 'raw';
+	}
+	if( defined $opt_F )
+	{
+		usage() unless $format eq 'csv' && length $opt_F == 1;
+		$csv_separator = $opt_F;
+	}
+	
+	usage() if $opt_t and $opt_r;
+	
+	$mode = 'test' if defined $opt_t;
+	
+	if( defined $opt_r )
+	{
+		$mode = 'raw';
+		$format = 'pass';
+	}
+	
+	if( defined $opt_S )
+	{
+		my @a = split( ':', $opt_S );
+		
+		$host = $a[0];
+		$port = $a[1] if defined $a[1];
+	}
+	
+	if( defined $opt_P )
+	{
+		$no_pager = 1;
+	}
+	elsif( exists $ENV{'PAGER'} )
+	{
+		$pager{'bin'} = $ENV{'PAGER'};
+	}
+	else
+	{
+		$pager{'bin'} = CLI_PAGER;
+	}
+}
+
+$url = "http://$host:$port/ctrl/$version/";
+
+if( $mode eq 'test' )
+{
+	print STDERR "\t!!!TESTING MODE !!!\n";
+}
+
+my $ret = 0;
+if( @ARGV ) # command from argv
+{
+	$no_pager = 1;
+	
+	my $cmd = join(" ", @ARGV);
+	dbg "ARGV:'$cmd'";
+	$ret = cliHandleCommand($s, $cmd);
+	if( handleAsTransientError($ret) )
+	{
+		if( retryTransientError($ret) )
+		{
+			goto mainLoop;
+		}
+		else
+		{
+			exit(1);
+		}
+	}
+}
+elsif( -t STDIN && !$opt_B ) # interactive readline
+{
+	$readline = 1;
+	$ret = cliReadline($s);
+}
+else # commands from pipe
+{
+	$no_pager = 1;
+	
+	sub readCommand()
+	{
+		if( defined($stashedCommand) )
+		{
+			my $cmd = $stashedCommand;
+			
+			undef $stashedCommand;
+			return $cmd;
+		}
+		return <STDIN>;
+	}
+	
+	my $cmd;
+	while( defined($cmd = readCommand()) )
+	{
+		chomp $cmd;
+		$cmd =~ s/^\s+//;
+		$cmd =~ s/\s+$//;
+		if( $cmd =~ m/^(|#.*)$/ )
+		{
+			next;
+		}
+		dbg "STDIN: '$cmd'";
+		$ret = cliHandleCommand($s, $cmd);
+		if( handleAsTransientError($ret) )
+		{
+			$stashedCommand = $cmd;
+			if( retryTransientError($ret) )
+			{
+				goto mainLoop;
+			}
+			else
+			{
+				exit(1);
+			}
+		}
+		$transientRetry = 0;
+		last if $ret;
+	}
+}
+
+$s->shutdown(2) if defined $s;
+exit $ret;
+

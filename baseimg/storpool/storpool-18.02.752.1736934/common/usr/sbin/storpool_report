@@ -1,0 +1,22 @@
+#!/bin/bash
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+
+
+SP_REPORTDIR="/var/spool/storpool"
+BINDUMP="/usr/sbin/storpool_dump";
+DAEMON="server"
+
+[ -f /etc/storpool.conf ] && [ -f /usr/lib/storpool/storpool_confget.sh ] && . /usr/lib/storpool/storpool_confget.sh
+
+DEST=${SP_REPORTDIR}/shm.local
+
+[ -n "${SP_DUMPBIN}" ] && BINDUMP="${SP_DUMPBIN}"
+[ -n "$1" ] && DEST="$1"
+[ -n "$2" ] && DAEMON="$2"
+
+logger -i -t ${0##*/} "${BINDUMP} -w ${DEST} ${DAEMON}"
+${BINDUMP} -w ${DEST} ${DAEMON}

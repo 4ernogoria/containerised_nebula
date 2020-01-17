@@ -1,0 +1,104 @@
+#!/bin/bash
+
+me="$(basename -- "$0")"
+if [[ -z "$*" ]]; then
+	echo "Usage: $me host1 [host2 host3 ... hostN]"
+fi
+
+pdir="/home/cust/_tools"
+debug="${debug:-}"
+
+for remote in "$@" ; do
+	if ! grep -Fqw "$remote" ./hosts.txt; then
+		echo "'$remote' not found in ./hosts.txt exiting..." 1>&2
+		exit 1
+	fi
+	echo -e "\n#--- Copying latest lvmsp on $remote"
+	latestlvmsp=( $(ls -t "$pdir"/lvmsp-*.tgz) )
+	if [[ -z ${latestlvmsp[*]} ]]; then
+		echo "Couldn't find any lvmsp package at $pdir" 1>&2
+		exit 1
+	fi
+	if ! scp "${latestlvmsp[0]}" "$remote":storpool/ ; then
+		echo "Copying ${latestlvmsp[0]} on $remote failed, please check" 1>&2
+		exit 1
+	fi
+	echo -e "\n#--- Copying done, transferred ${latestlvmsp[0]} to $remote"
+	echo -e "\n#--- Updating lvmsp to ${latestlvmsp[0]} on $remote"
+	if ! ssh -tt "$remote" '
+		debug='"$debug"'
+		ident='"${me}[$$]"'
+		if [[ -n $debug ]]; then
+			set -x
+		fi
+		if [[ $EUID != 0 ]]; then
+			sudo=sudo
+		fi
+		mainconf="/etc/lvmsp.conf"
+		latestlvmsp='"${latestlvmsp[0]}"'
+		latestlvmspv="$(basename -- "$latestlvmsp")"
+		latestlvmspvonly="${latestlvmspv/.tgz}"
+		l(){
+			# print in log and on stdout
+			logger -t "$ident" -- "$@"
+			echo "$@"
+		}
+		le(){
+			# print message also on stderr
+			logger -st "$ident" -- "$@"
+		}
+		lf(){
+			while read -r line; do
+				l "$line"
+			done <<<"$(cat $@)"
+		}
+		if [[ ! -e $mainconf ]]; then
+			le "lvmsp most probably not installed, $mainconf does not exist"
+			exit 1
+		fi
+		lvmspversion="$(grep -F -- lvmsp- /usr/local/lvmsp/log.sh | sed -re "s/(\#)? +//g")"
+		l "lvmsp version: $lvmspversion"
+		if [[ $lvmspversion == $latestlvmspvonly ]]; then
+			l "Latest lvmsp version already installed"
+			exit 0
+		fi
+		package=~/storpool/"$latestlvmspv"
+		if [[ ! -r $package ]]; then
+			le "Package $package does not exist, please check"
+			exit 1
+		fi
+		l "Uncompressing $package"
+		cd ~/storpool/
+		$sudo tar -xf "$package"
+		if [[ $? -ne 0 ]]; then
+			le "Failed to uncompress $package in ~/storpool, please check"
+			exit 1
+		fi
+		pdir="${package/.tgz}"
+		cd "$pdir"
+		if [[ $? -ne 0 ]]; then
+			le "Failed to change dir to the uncompressed $pdir, please check"
+			exit 1
+		fi
+		inlog="$(mktemp)"
+		l "Installing $latestlvmspvonly"
+		if ! $sudo ./install.sh > "$inlog" 2>&1 ; then
+			le "$latestlvmspvonly installation failed, output from installation:"
+			lf "$inlog"
+			rm -f "$inlog"
+			exit 1
+		fi
+		l "running $latestlvmspvonly tests (from the ${latestlvmspvonly} package)"
+		if ! $sudo ~/storpool/${latestlvmspvonly}/quickcheck > "$inlog" 2>&1 ; then
+			le "$latestlvmspvonly tests failed, output from tests:"
+			lf "$inlog"
+			rm -f "$inlog"
+			exit 1
+		fi
+		l "Success $latestlvmspvonly tests"
+		rm -f "$inlog"
+		'; then
+		echo "Installation on $remote FAILED" 1>&2
+	fi
+	echo -e "#--- finished $remote\n"
+done

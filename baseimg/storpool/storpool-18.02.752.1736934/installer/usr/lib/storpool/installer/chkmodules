@@ -1,0 +1,19 @@
+#!/bin/bash
+
+
+if [[ -z "$*" ]]; then
+	echo "Usage: $(basename -- "$0") kernelversion [kernelversion1 2 ... n ]"
+	exit 1
+fi
+
+chk(){
+	local kernels=($1)
+	sshpi "
+	for k in ${kernels[*]}; do
+		echo \$k
+		ls /lib/modules/\${k}/extra/storpool*.ko 2>/dev/null || (echo FAILED ; exit 1)
+	done
+	"
+}
+
+chk "$@"

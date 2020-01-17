@@ -1,0 +1,113 @@
+#!/bin/bash
+#
+# Clean Root CGroup from User Processes
+#
+# Copyright (c) 2013, 2015  StorPool.
+# All rights reserved.
+#
+# storpool_cgclean	StorPool Root CGroup Cleaner
+# chkconfig:		- 30 86
+# description:		The storpool_cgclean script cleans root cgroup \
+#			from user processes
+#
+# lockfile: /var/lock/subsys/storpool_cgclean
+#
+### BEGIN INIT INFO
+# Provides:		storpool_cgclean
+# Required-Start:	$local_fs $syslog $cgconfig
+# Required-Stop:	$local_fs $syslog
+# Should-Start:		
+# Should-Stop:		
+# Short-Description:	start and stop the storpool_cgclean script
+# Description:		The storpool_cgclean script cleans root cgroup \
+#			from user processes
+### END INIT INFO
+
+program="storpool_cgmove"
+lockfile="/var/lock/subsys/$program"
+
+# Source function library & LSB routines
+. /etc/rc.d/init.d/functions
+
+[ -f "/etc/sysconfig/$program" ] && . "/etc/sysconfig/$program"
+
+log_success_msg () {
+    echo -n $*; success "$*"; echo
+}
+
+log_failure_msg () {
+    echo -n $*; failure "$*"; echo
+}
+
+start()
+{
+	if [ -f "$lockfile" ]; then
+		log_failure_msg "$program lock file already exists"
+		return 0
+	fi
+
+	if ! grep "^cgroup" /proc/mounts &>/dev/null; then
+		log_failure_msg $"Cannot find cgroups, is cgconfig service running?"
+		return 1
+	fi
+
+	echo "Running $program ..."
+	/usr/lib/storpool/storpool_cgmove
+	retval=$?
+
+	echo
+	if [ $retval -ne 0 ]; then
+		return 7
+	fi
+
+	touch "$lockfile"
+
+	if [ $? -ne 0 ]; then
+		log_failure_msg "$program is executed but unable to lock it"
+		return 1
+	fi
+
+	log_success_msg "Running $program"
+
+	return 0
+}
+
+status()
+{
+	if [ -f "$lockfile" ]; then
+		log_success_msg "$program is executed on boot"
+		return 0
+	else
+		log_failure_msg "$program is not executed on boot"
+	fi
+}
+
+RETVAL=0
+
+# See how we are called
+case "$1" in
+	start)
+		start
+		RETVAL=$?
+		;;
+	status)
+		status -p $pidfile $program
+		RETVAL=$?
+		;;
+	stop)
+		if [ -f "$lockfile" ]; then
+			rm -f $lockfile
+			log_success_msg "$program stopped"
+		fi
+		;;
+	restart)
+		$0 stop
+		$0 start
+		;;
+	*)
+		echo $"Usage: $0 {start|status}"
+		RETVAL=2
+		;;
+esac
+
+exit $RETVAL

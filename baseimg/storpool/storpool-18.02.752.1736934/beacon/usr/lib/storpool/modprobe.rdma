@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+
+. /usr/lib/storpool/storpool_confget.sh
+
+/sbin/modprobe --ignore-install storpool_rdma 
+#iface=${SP_IFACE} rdma_iface=${SP_RDMA_IFACE} rdma_multicast=${SP_RDMA_MULTICAST} rdma_disable_multicast=${SP_RDMA_DISABLE_MULTICAST-0} rdma_service_id=${SP_RDMA_SERVICE_ID-0}
+
+/usr/lib/storpool/ib/load_guids
+/usr/lib/storpool/ip/load_ips
+
+echo $SP_IFACE1_CFG >  /sys/devices/virtual/storpool_rdma/storpool_rdma/state/net0/config
+echo $SP_IFACE2_CFG >  /sys/devices/virtual/storpool_rdma/storpool_rdma/state/net1/config
+
+if [ -f /sys/class/storpool_rdma/storpool_rdma/info/net0/name ] && [ ! -z "$SP_IFACE" ]; then
+	for NET_IDX in 0 1; do
+		IF_POS=$(($NET_IDX+1))
+		IF_NAME=`echo $SP_IFACE | cut -d ',' -f $IF_POS`
+		IF_MTU=`echo $IF_NAME | cut -s -d '@' -f 2`
+		if [ ! -z "$IF_MTU" ]; then
+			IF_NAME=`echo $IF_NAME | cut -d '@' -f 1`
+			echo $IF_MTU > /sys/class/storpool_rdma/storpool_rdma/info/net$NET_IDX/mtu
+		fi
+		echo $IF_NAME > /sys/class/storpool_rdma/storpool_rdma/info/net$NET_IDX/name
+	done
+fi

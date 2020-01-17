@@ -1,0 +1,149 @@
+#!/bin/sh
+# Copyright 2018 Storpool
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+function log()
+{
+	echo $$ "$*" >> /var/log/sp-flexvol.log
+}
+
+function output()
+{
+	log output "$@"
+	echo "$@"
+}
+
+
+function usage()
+{
+	echo "Inavlid usage" 1>&2
+}
+
+function getvolumename()
+{
+	VOLNAME=$(echo $1 | jq -r '.["kubernetes.io/pvOrVolumeName"]')
+	output '{"status": "Success", "volumeName" : "'$VOLNAME'" }'
+	exit 0
+}
+
+function domount()
+{
+	MNTPATH=$1
+	VOLNAME=$(echo $2 | jq -r '.["kubernetes.io/pvOrVolumeName"]')
+	FSTYPE=$(echo $3|jq -r '.["kubernetes.io/fsType"]')
+	
+	
+	if [ $(ismounted) -eq 0 ] ; then
+		if [ "$FSTYPE" == "" ]; then
+			FSTYPE=ext4
+		fi
+		
+		RES=`storpool detach volume $VOLNAME all force yes`
+		
+		if [ $? -ne 0 ]; then
+			log storpool-error $RES
+			output "{ \"status\": \"Failure\", \"message\": \"Storpool dettach all failed\" }"
+			exit 1
+		fi
+		
+		storpool attach volume $VOLNAME here > /dev/null
+		if [ $? -ne 0 ]; then
+			log storpool-error $RES
+			output "{ \"status\": \"Failure\", \"message\": \"Storpool attach failed\" }"
+			exit 1
+		fi
+		
+		DEV_PATH=/dev/storpool/$VOLNAME
+		VOLFSTYPE=`blkid -o udev ${DEV_PATH} 2>/dev/null|grep "ID_FS_TYPE"|cut -d"=" -f2`
+		if [ "${VOLFSTYPE}" == "" ]; then
+			mkfs -t ${FSTYPE} ${DEV_PATH} >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				output "{ \"status\": \"Failure\", \"message\": \"Failed to create fs ${FSTYPE} on device ${DEV_PATH}\"}"
+				exit 1
+			fi
+		fi
+		
+		mkdir -p ${MNTPATH} &> /dev/null
+		mount ${DEV_PATH} ${MNTPATH} &> /dev/null
+		if [ $? -ne 0 ]; then
+			output "{ \"status\": \"Failure\", \"message\": \"Failed to mount device ${DEV_PATH} at ${MNTPATH}\"}"
+			exit 1
+		fi
+	fi
+	
+	output '{"status": "Success" }'
+	exit 0
+}
+
+ismounted() {
+	MOUNT=`findmnt -n ${MNTPATH} 2>/dev/null | cut -d' ' -f1`
+	if [ "${MOUNT}" == "${MNTPATH}" ]; then
+		echo "1"
+	else
+		echo "0"
+	fi
+}
+
+function dounmount()
+{
+	MNTPATH=$1
+	
+	if [ $(ismounted) -eq 1 ] ; then
+		umount ${MNTPATH} &> /dev/null
+		if [ $? -ne 0 ]; then
+			output "{ \"status\": \"Failed\", \"message\": \"Failed to unmount volume at ${MNTPATH}\"}"
+			exit 1
+		fi
+	fi
+	
+	VOLNAME=`basename $MNTPATH`
+	storpool detach volume "$VOLNAME" here > /dev/null
+	
+	output '{"status": "Success" }'
+	exit 0
+}
+
+op=$1
+
+log "invocation" "$@"
+
+if [ "$op" = "init" ]; then
+	output '{"status": "Success", "capabilities" : { "attach" : false }  }'
+	exit 0
+fi
+
+if [ $# -lt 2 ]; then
+	usage
+fi
+
+shift
+
+case "$op" in
+	mount)
+		domount $*
+		;;
+	unmount)
+		dounmount $*
+		;;
+	
+	getvolumename)
+		getvolumename $*
+		;;
+	
+	*)
+		output "{ \"status\": \"Not supported\" }"
+		exit 0
+esac
+
+	

@@ -1,0 +1,34 @@
+{#- name device #}
+DEVICE={{item.interface}}
+{#- should start on boot #}
+ONBOOT={{item.onboot|default('yes')}}
+{#- device type #}
+TYPE={{item.iftype|default('Ethernet')}}
+{%- if (item.bonding_master is defined) %}
+MASTER={{item.bonding_master}}
+SLAVE='yes'
+{%- endif %}
+{%- if (item.iftype == 'Bond') %}
+BONDING_MASTER=yes
+{%- if (item.bond_mode == 'active-backup') or (item.bond_mode == '1') %}
+BONDING_OPTS="mode={{item.bond_mode}} arp_interval={{item.arp_interval|default('500')}} arp_all_targets=any arp_ip_target={% for ip in item.arp_ip_target %}{{ip}}{% if not loop.last %},{% endif %}{% endfor %}"
+{%- elif (item.bond_mode == '4') or (item.bond_mode == '802.3ad') %}
+BONDING_OPTS="mode={{item.bond_mode}} miimon={{item.miimon|default('100')}} lacp_rate={{item.lacp_rate|default('1')}}"
+{%- endif %}
+{%- endif %}
+BOOTPROTO={{item.bootproto|default('none')}}
+MTU={{item.mtu|default('9000')}}
+{%- if (item.iftype == 'Vlan') %}
+VLAN=yes
+{%- if (item.physdev is defined) %}
+PHYSDEV={{item.physdev}}
+{%- endif %}
+{%- if (item.vlan_id is defined) %}
+VLAN_ID={{ item.vlan_id }}
+{%- endif %}
+{%- endif %}
+{%- if (item.ipaddr is defined) %}
+IPADDR={{ item.ipaddr }}
+PREFIX={{ item.prefix|default(24)}}
+{%- endif %}
+NM_CONTROLLED={{item.nm_controlled|default('no')}}

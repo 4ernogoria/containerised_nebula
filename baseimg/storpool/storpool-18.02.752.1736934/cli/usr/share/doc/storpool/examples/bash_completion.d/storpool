@@ -1,0 +1,52 @@
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+# Storpool
+#
+
+_storpool()
+{
+        local cur prev
+
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+#        if [[ ${cur} == * ]] ; then
+#            COMPREPLY=( $(compgen -W "net server disk volume task" -- ${cur}) )
+#            return 0
+#        fi
+
+        case "${prev}" in
+            list)
+            	return 0
+            	;;
+            net)
+                COMPREPLY=( $(compgen -W "list" -- ${cur}) )
+                return 0
+                ;;
+            server)
+                COMPREPLY=( $(compgen -W "list" -- ${cur}) )
+                return 0
+                ;;
+            disk)
+                COMPREPLY=( $(compgen -W "list" -- ${cur}) )
+                return 0
+                ;;
+            volume)
+                COMPREPLY=( $(compgen -W "list" -- ${cur}) )
+                return 0
+                ;;
+            task)
+                COMPREPLY=( $(compgen -W "list" -- ${cur}) )
+                return 0
+                ;;
+            *)
+                COMPREPLY=( $(compgen -W "net server disk volume task" -- ${cur}) )
+                return 0
+            ;;
+        esac
+}
+complete -F _storpool storpool

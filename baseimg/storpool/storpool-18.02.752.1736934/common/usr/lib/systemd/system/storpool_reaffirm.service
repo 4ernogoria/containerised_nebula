@@ -1,0 +1,27 @@
+#
+#-
+# Copyright (c) 2016  StorPool.
+# All rights reserved.
+#
+
+[Unit]
+Description=Restore the StorPool configuration settings if modified.
+After=apport.service
+Wants=apport.service
+Before=storpool_beacon.service
+Before=storpool_block.service
+Before=storpool_mgmt.service
+Before=storpool_server.service
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=storpool_beacon.service
+WantedBy=storpool_block.service
+WantedBy=storpool_mgmt.service
+WantedBy=storpool_server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/sbin/storpool_reaffirm -p
+ExecStop=/bin/true

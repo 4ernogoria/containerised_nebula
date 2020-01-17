@@ -1,0 +1,24 @@
+#!/bin/sh
+
+set -e
+
+. /usr/lib/storpool/storpool_confget.sh
+
+if [ -z "$SP_RDMA_GUIDS_MAP" ]; then
+	exit 0
+fi
+
+if [ -z "$SP_RDMA_RESOLVE_LIDS" ]; then
+	for pair in $SP_RDMA_GUIDS_MAP; do
+		node="${pair%%:*}"
+		addr="${pair#*:}"
+		fname="/sys/devices/virtual/storpool_rdma/storpool_rdma/info/guids/node${node}p0"
+		if [ ! -f "$fname" ]; then
+			echo "Nonexistent $fname" 1>&2
+			continue
+		fi
+		echo "$addr" > "$fname"
+	done
+else
+	/usr/lib/storpool/ib/load_lids ${SP_RDMA_GUIDS_MAP}
+fi;

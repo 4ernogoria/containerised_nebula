@@ -1,0 +1,836 @@
+StorPool installation started at Tue, 07 May 2019 13:06:36 +0300
+Please see the /root/storpool-18.02.752.1736934/install.log file for detailed information
+Modules to install: beacon bindings-py block bridge cli common config mgmt repsync server update
+Kernel versions installed: 3.10.0-862.14.4.el7.x86_64.debug 3.10.0-862.14.4.el7.x86_64 kabi-rhel70 kabi-rhel71 kabi-rhel72 kabi-rhel73 kabi-rhel74 kabi-rhel75 3.10.0-957.1.3.el7.x86_64 
+Kernel version requested: 3.10.0-862.14.4.el7.x86_64
+Kernel major version '3' regexp '^3\.' latest '3.10.0-957.5.1.el7.x86_64'
+Adding '3.10.0-957.5.1.el7.x86_64' to the list of all kernel versions, now '3.10.0-862.14.4.el7.x86_64.debug 3.10.0-862.14.4.el7.x86_64 kabi-rhel70 kabi-rhel71 kabi-rhel72 kabi-rhel73 kabi-rhel74 kabi-rhel75 3.10.0-957.1.3.el7.x86_64  3.10.0-957.5.1.el7.x86_64'
+Kernel versions to install for:  3.10.0-862.14.4.el7.x86_64 3.10.0-957.1.3.el7.x86_64 3.10.0-957.5.1.el7.x86_64
+Installing the required OS packages...
+Loaded plugins: fastestmirror
+Cleaning repos: base docker-ce-stable epel extras storpool-contrib updates
+20 metadata files removed
+12 sqlite files removed
+0 metadata files removed
+package storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-block-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-common-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-config-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-install-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-server-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+package storpool-update-dep-18.02.752.1736934-1-1.el7.noarch is not installed
+Loaded plugins: fastestmirror
+Examining ././storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-block-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-block-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-block-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-common-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-common-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-common-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-config-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-config-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-config-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-install-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-install-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-install-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-server-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-server-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-server-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Examining ././storpool-update-dep-18.02.752.1736934-1-1.el7.noarch.rpm: storpool-update-dep-18.02.752.1736934-1-1.el7.noarch
+Marking ././storpool-update-dep-18.02.752.1736934-1-1.el7.noarch.rpm to be installed
+Resolving Dependencies
+--> Running transaction check
+---> Package storpool-beacon-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-bindings-py-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-block-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-bridge-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-cli-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-common-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+--> Processing Dependency: python-jinja2 for package: storpool-common-dep-18.02.752.1736934-1-1.el7.noarch
+Loading mirror speeds from cached hostfile
+ * base: centos-mirror.rbc.ru
+ * epel: fedora-epel.koyanet.lv
+ * extras: mirror.reconn.ru
+ * updates: mirror.reconn.ru
+--> Processing Dependency: PyYAML for package: storpool-common-dep-18.02.752.1736934-1-1.el7.noarch
+---> Package storpool-config-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-install-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-mgmt-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-precheck-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-repsync-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-server-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+---> Package storpool-update-dep-18.02.752.1736934.noarch 0:1-1.el7 will be installed
+--> Running transaction check
+---> Package PyYAML.x86_64 0:3.10-11.el7 will be installed
+---> Package python-jinja2.noarch 0:2.7.2-2.el7 will be installed
+--> Processing Dependency: python-babel >= 0.8 for package: python-jinja2-2.7.2-2.el7.noarch
+--> Processing Dependency: python-markupsafe for package: python-jinja2-2.7.2-2.el7.noarch
+--> Running transaction check
+---> Package python-babel.noarch 0:0.9.6-8.el7 will be installed
+---> Package python-markupsafe.x86_64 0:0.11-10.el7 will be installed
+--> Finished Dependency Resolution
+
+Dependencies Resolved
+
+================================================================================
+ Package                                    Arch   Version     Repository  Size
+================================================================================
+Installing:
+ storpool-beacon-dep-18.02.752.1736934      noarch 1-1.el7     /storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-bindings-py-dep-18.02.752.1736934 noarch 1-1.el7     /storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-block-dep-18.02.752.1736934       noarch 1-1.el7     /storpool-block-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-bridge-dep-18.02.752.1736934      noarch 1-1.el7     /storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-cli-dep-18.02.752.1736934         noarch 1-1.el7     /storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-common-dep-18.02.752.1736934      noarch 1-1.el7     /storpool-common-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-config-dep-18.02.752.1736934      noarch 1-1.el7     /storpool-config-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-install-dep-18.02.752.1736934     noarch 1-1.el7     /storpool-install-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-mgmt-dep-18.02.752.1736934        noarch 1-1.el7     /storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-precheck-dep-18.02.752.1736934    noarch 1-1.el7     /storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-repsync-dep-18.02.752.1736934     noarch 1-1.el7     /storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-server-dep-18.02.752.1736934      noarch 1-1.el7     /storpool-server-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+ storpool-update-dep-18.02.752.1736934      noarch 1-1.el7     /storpool-update-dep-18.02.752.1736934-1-1.el7.noarch
+                                                                          0.0  
+Installing for dependencies:
+ PyYAML                                     x86_64 3.10-11.el7 base       153 k
+ python-babel                               noarch 0.9.6-8.el7 base       1.4 M
+ python-jinja2                              noarch 2.7.2-2.el7 base       515 k
+ python-markupsafe                          x86_64 0.11-10.el7 base        25 k
+
+Transaction Summary
+================================================================================
+Install  13 Packages (+4 Dependent packages)
+
+Total download size: 2.0 M
+Installed size: 8.8 M
+Downloading packages:
+--------------------------------------------------------------------------------
+Total                                              1.1 MB/s | 2.0 MB  00:01     
+Running transaction check
+Running transaction test
+Transaction test succeeded
+Running transaction
+  Installing : storpool-config-dep-18.02.752.1736934-1-1.el7.noarch        1/17 
+  Installing : storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch      2/17 
+  Installing : PyYAML-3.10-11.el7.x86_64                                   3/17 
+  Installing : python-babel-0.9.6-8.el7.noarch                             4/17 
+  Installing : python-markupsafe-0.11-10.el7.x86_64                        5/17 
+  Installing : python-jinja2-2.7.2-2.el7.noarch                            6/17 
+  Installing : storpool-common-dep-18.02.752.1736934-1-1.el7.noarch        7/17 
+  Installing : storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch        8/17 
+  Installing : storpool-block-dep-18.02.752.1736934-1-1.el7.noarch         9/17 
+  Installing : storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch       10/17 
+  Installing : storpool-update-dep-18.02.752.1736934-1-1.el7.noarch       11/17 
+  Installing : storpool-server-dep-18.02.752.1736934-1-1.el7.noarch       12/17 
+  Installing : storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch         13/17 
+  Installing : storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch      14/17 
+  Installing : storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarc   15/17 
+  Installing : storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch          16/17 
+  Installing : storpool-install-dep-18.02.752.1736934-1-1.el7.noarch      17/17 
+  Verifying  : python-markupsafe-0.11-10.el7.x86_64                        1/17 
+  Verifying  : python-jinja2-2.7.2-2.el7.noarch                            2/17 
+  Verifying  : storpool-common-dep-18.02.752.1736934-1-1.el7.noarch        3/17 
+  Verifying  : storpool-block-dep-18.02.752.1736934-1-1.el7.noarch         4/17 
+  Verifying  : storpool-repsync-dep-18.02.752.1736934-1-1.el7.noarch       5/17 
+  Verifying  : python-babel-0.9.6-8.el7.noarch                             6/17 
+  Verifying  : storpool-beacon-dep-18.02.752.1736934-1-1.el7.noarch        7/17 
+  Verifying  : PyYAML-3.10-11.el7.x86_64                                   8/17 
+  Verifying  : storpool-bridge-dep-18.02.752.1736934-1-1.el7.noarch        9/17 
+  Verifying  : storpool-bindings-py-dep-18.02.752.1736934-1-1.el7.noarc   10/17 
+  Verifying  : storpool-update-dep-18.02.752.1736934-1-1.el7.noarch       11/17 
+  Verifying  : storpool-server-dep-18.02.752.1736934-1-1.el7.noarch       12/17 
+  Verifying  : storpool-config-dep-18.02.752.1736934-1-1.el7.noarch       13/17 
+  Verifying  : storpool-mgmt-dep-18.02.752.1736934-1-1.el7.noarch         14/17 
+  Verifying  : storpool-precheck-dep-18.02.752.1736934-1-1.el7.noarch     15/17 
+  Verifying  : storpool-install-dep-18.02.752.1736934-1-1.el7.noarch      16/17 
+  Verifying  : storpool-cli-dep-18.02.752.1736934-1-1.el7.noarch          17/17 
+
+Installed:
+  storpool-beacon-dep-18.02.752.1736934.noarch 0:1-1.el7                        
+  storpool-bindings-py-dep-18.02.752.1736934.noarch 0:1-1.el7                   
+  storpool-block-dep-18.02.752.1736934.noarch 0:1-1.el7                         
+  storpool-bridge-dep-18.02.752.1736934.noarch 0:1-1.el7                        
+  storpool-cli-dep-18.02.752.1736934.noarch 0:1-1.el7                           
+  storpool-common-dep-18.02.752.1736934.noarch 0:1-1.el7                        
+  storpool-config-dep-18.02.752.1736934.noarch 0:1-1.el7                        
+  storpool-install-dep-18.02.752.1736934.noarch 0:1-1.el7                       
+  storpool-mgmt-dep-18.02.752.1736934.noarch 0:1-1.el7                          
+  storpool-precheck-dep-18.02.752.1736934.noarch 0:1-1.el7                      
+  storpool-repsync-dep-18.02.752.1736934.noarch 0:1-1.el7                       
+  storpool-server-dep-18.02.752.1736934.noarch 0:1-1.el7                        
+  storpool-update-dep-18.02.752.1736934.noarch 0:1-1.el7                        
+
+Dependency Installed:
+  PyYAML.x86_64 0:3.10-11.el7          python-babel.noarch 0:0.9.6-8.el7       
+  python-jinja2.noarch 0:2.7.2-2.el7   python-markupsafe.x86_64 0:0.11-10.el7  
+
+Complete!
+Checking for any crashsync commands in the crontab of the storpool account
+No crashsync commands found in the crontab of the storpool account
+Checking for SP_CRASH_USER in /etc/storpool.conf and /etc/storpool.conf.d/repsync-username.conf
+- found storpool
+Using 'storpool' as the report sync user account name
+Setting SP_CRASH_USER in /etc/storpool.conf.d/repsync-username.conf
+Copying a directory: beacon/usr/ /usr/
+Copying beacon/usr/ to /usr/
+Exclude specification: (none)
+./
+./sbin/
+./sbin/storpool_stat.bin
+./sbin/storpool_hugepages
+./sbin/storpool_beacon.bin
+./lib/
+./lib/storpool/
+./lib/storpool/tcpdump.sh
+./lib/storpool/storpool_ping
+./lib/storpool/modprobe.rdma
+./lib/storpool/ib/
+./lib/storpool/ib/load_lids
+./lib/storpool/ib/load_guids
+./lib/storpool/bpf_preload.so
+./lib/systemd/
+./lib/systemd/system/
+./lib/systemd/system/storpool_stat.service
+./lib/systemd/system/storpool_hugepages.service
+./lib/systemd/system/storpool_beacon.service
+Copying a directory: -I -x init.d beacon/etc/ /etc/
+Copying beacon/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+Copying a directory: -I beacon/etc/init.d/ /etc/init.d/
+Copying beacon/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_stat
+./storpool_hugepages
+./storpool_beacon
+Copying a directory: beacon/lib/modules/3.10.0-862.14.4.el7.x86_64/extra/ /lib/modules/3.10.0-862.14.4.el7.x86_64/extra/
+Copying beacon/lib/modules/3.10.0-862.14.4.el7.x86_64/extra/ to /lib/modules/3.10.0-862.14.4.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_rdma.ko
+./storpool_pci.ko
+Copying a directory: beacon/lib/modules/3.10.0-957.1.3.el7.x86_64/extra/ /lib/modules/3.10.0-957.1.3.el7.x86_64/extra/
+Copying beacon/lib/modules/3.10.0-957.1.3.el7.x86_64/extra/ to /lib/modules/3.10.0-957.1.3.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_rdma.ko
+./storpool_pci.ko
+Copying a directory: beacon/lib/modules/3.10.0-957.5.1.el7.x86_64/extra/ /lib/modules/3.10.0-957.5.1.el7.x86_64/extra/
+Copying beacon/lib/modules/3.10.0-957.5.1.el7.x86_64/extra/ to /lib/modules/3.10.0-957.5.1.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_rdma.ko
+./storpool_pci.ko
+Copying a directory: beacon/lib/udev/ /lib/udev/
+Copying beacon/lib/udev/ to /lib/udev/
+Exclude specification: (none)
+./
+./vf-udevhelper
+Copying a directory: bindings-py/usr/ /usr/
+Copying bindings-py/usr/ to /usr/
+Exclude specification: (none)
+./
+./lib/
+./lib/python2.7/
+./lib/python2.7/site-packages/
+./lib/python2.7/site-packages/storpool/
+./lib/python2.7/site-packages/storpool/example.py
+./lib/python2.7/site-packages/storpool/spapi.py
+./lib/python2.7/site-packages/storpool/spconfig.py
+./lib/python2.7/site-packages/storpool/spdoc.py
+./lib/python2.7/site-packages/storpool/spjson.py
+./lib/python2.7/site-packages/storpool/sptest.py
+./lib/python2.7/site-packages/storpool/sptypes.py
+./lib/python2.7/site-packages/storpool/sputils.py
+./lib/python2.7/site-packages/storpool/example.pyc
+./lib/python2.7/site-packages/storpool/spapi.pyc
+./lib/python2.7/site-packages/storpool/spconfig.pyc
+./lib/python2.7/site-packages/storpool/spdoc.pyc
+./lib/python2.7/site-packages/storpool/spjson.pyc
+./lib/python2.7/site-packages/storpool/sptest.pyc
+./lib/python2.7/site-packages/storpool/sptypes.pyc
+./lib/python2.7/site-packages/storpool/sputils.pyc
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/SOURCES.txt
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/dependency_links.txt
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/top_level.txt
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/namespace_packages.txt
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/zip-safe
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/PKG-INFO
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7.egg-info/requires.txt
+./lib/python2.7/site-packages/storpool-4.0.0-py2.7-nspkg.pth
+./share/
+./share/doc/
+./share/doc/python-storpool/
+./share/doc/python-storpool/apidoc.html
+Copying a directory: block/usr/ /usr/
+Copying block/usr/ to /usr/
+Exclude specification: (none)
+./
+./sbin/
+./sbin/storpool_block.bin
+./lib/
+./lib/storpool/
+./lib/storpool/udev_helper.py
+./lib/storpool/modprobe.bd
+./lib/storpool/cleanup-pre-14.09.sh
+./lib/systemd/
+./lib/systemd/system/
+./lib/systemd/system/storpool_block.service
+Copying a directory: -I -x init.d block/etc/ /etc/
+Copying block/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+./udev/
+./udev/rules.d/
+./udev/rules.d/99-storpool_bd.rules
+./udev/rules.d/99-vf-udevhelper.rules
+Copying a directory: -I block/etc/init.d/ /etc/init.d/
+Copying block/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_block
+Copying a directory: block/lib/modules/3.10.0-862.14.4.el7.x86_64/extra/ /lib/modules/3.10.0-862.14.4.el7.x86_64/extra/
+Copying block/lib/modules/3.10.0-862.14.4.el7.x86_64/extra/ to /lib/modules/3.10.0-862.14.4.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_bd.ko
+Copying a directory: block/lib/modules/3.10.0-957.1.3.el7.x86_64/extra/ /lib/modules/3.10.0-957.1.3.el7.x86_64/extra/
+Copying block/lib/modules/3.10.0-957.1.3.el7.x86_64/extra/ to /lib/modules/3.10.0-957.1.3.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_bd.ko
+Copying a directory: block/lib/modules/3.10.0-957.5.1.el7.x86_64/extra/ /lib/modules/3.10.0-957.5.1.el7.x86_64/extra/
+Copying block/lib/modules/3.10.0-957.5.1.el7.x86_64/extra/ to /lib/modules/3.10.0-957.5.1.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_bd.ko
+Copying a directory: bridge/usr/ /usr/
+Copying bridge/usr/ to /usr/
+Exclude specification: (none)
+./
+./sbin/
+./sbin/storpool_bridge.bin
+./lib/
+./lib/storpool/
+./lib/storpool/bridge-ip
+./lib/systemd/
+./lib/systemd/system/
+./lib/systemd/system/storpool_bridge.service
+Copying a directory: -I -x init.d bridge/etc/ /etc/
+Copying bridge/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+Copying a directory: -I bridge/etc/init.d/ /etc/init.d/
+Copying bridge/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_bridge
+Copying a directory: cli/usr/ /usr/
+Copying cli/usr/ to /usr/
+Exclude specification: (none)
+./
+./share/
+./share/doc/
+./share/doc/storpool/
+./share/doc/storpool/examples/
+./share/doc/storpool/examples/bash_completion.d/
+./share/doc/storpool/examples/bash_completion.d/storpool
+./sbin/
+./sbin/storpool
+Copying a directory: common/usr/ /usr/
+Copying common/usr/ to /usr/
+Exclude specification: (none)
+./
+./share/
+./share/doc/
+./share/doc/storpool/
+./share/doc/storpool/apidoc.html
+./share/doc/storpool/copyright.txt
+./share/doc/storpool/open_source_licenses.txt
+./share/doc/storpool/examples/
+./share/doc/storpool/examples/fio/
+./share/doc/storpool/examples/fio/fio-detect
+./share/doc/storpool/examples/fio/fplot.py
+./share/doc/storpool/examples/fio/get_res
+./share/doc/storpool/examples/fio/pretty_print
+./share/doc/storpool/examples/fio/rm_res
+./share/doc/storpool/examples/fio/run_one
+./share/doc/storpool/examples/fio/run_quick
+./share/doc/storpool/examples/fio/run_validate
+./share/doc/storpool/examples/fio/README.md
+./share/doc/storpool/examples/fio/tests
+./share/doc/storpool/examples/fio/template/
+./share/doc/storpool/examples/fio/template/gen.pl
+./share/doc/storpool/examples/fio/template/rm_templates
+./share/doc/storpool/examples/fio/template/fill
+./share/doc/storpool/examples/fio/template/fill-verify
+./share/doc/storpool/examples/fio/template/sustain
+./share/doc/storpool/examples/fio/template/trim
+./share/doc/storpool/examples/fio/template/verify-r
+./share/doc/storpool/examples/fio/template/verify-s
+./share/doc/storpool/examples/etc/
+./share/doc/storpool/examples/etc/cron.d/
+./share/doc/storpool/examples/cgconfig/
+./share/doc/storpool/examples/cgconfig/centos6/
+./share/doc/storpool/examples/cgconfig/centos6/etc/
+./share/doc/storpool/examples/cgconfig/centos6/etc/cgconfig.d/
+./share/doc/storpool/examples/cgconfig/centos6/etc/cgconfig.d/machine.slice.conf
+./share/doc/storpool/examples/cgconfig/centos6/etc/cgconfig.d/storpool.slice.conf
+./share/doc/storpool/examples/cgconfig/centos6/etc/cgconfig.d/system.slice.conf
+./share/doc/storpool/examples/cgconfig/centos6/etc/init.d/
+./share/doc/storpool/examples/cgconfig/centos6/etc/init.d/storpool_cgmove
+./share/doc/storpool/examples/cgconfig/centos6/etc/cgrules.conf
+./share/doc/storpool/examples/cgconfig/centos7/
+./share/doc/storpool/examples/cgconfig/centos7/etc/
+./share/doc/storpool/examples/cgconfig/centos7/etc/cgconfig.d/
+./share/doc/storpool/examples/cgconfig/centos7/etc/cgconfig.d/machine.slice.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/cgconfig.d/storpool.slice.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/cgconfig.d/system.slice.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/cgconfig.d/user.slice.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/machine.slice.d/
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/machine.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/storpool.slice.d/
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/storpool.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/system.slice.d/
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/system.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/user.slice.d/
+./share/doc/storpool/examples/cgconfig/centos7/etc/systemd/system/user.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/centos7/usr/
+./share/doc/storpool/examples/cgconfig/centos7/usr/lib/
+./share/doc/storpool/examples/cgconfig/centos7/usr/lib/systemd/
+./share/doc/storpool/examples/cgconfig/centos7/usr/lib/systemd/system/
+./share/doc/storpool/examples/cgconfig/centos7/usr/lib/systemd/system/storpool_cgmove.service
+./share/doc/storpool/examples/cgconfig/debian9/
+./share/doc/storpool/examples/cgconfig/debian9/etc/
+./share/doc/storpool/examples/cgconfig/debian9/etc/cgconfig.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/cgconfig.d/machine.slice.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/cgconfig.d/storpool.slice.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/cgconfig.d/system.slice.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/cgconfig.d/user.slice.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/init.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/init.d/cgconfig
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/cgmanager.service.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/cgmanager.service.d/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/machine.slice.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/machine.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/storpool.slice.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/storpool.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/system.slice.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/system.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/user.slice.d/
+./share/doc/storpool/examples/cgconfig/debian9/etc/systemd/system/user.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/debian9/etc/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/debian9/lib/
+./share/doc/storpool/examples/cgconfig/debian9/lib/systemd/
+./share/doc/storpool/examples/cgconfig/debian9/lib/systemd/system/
+./share/doc/storpool/examples/cgconfig/debian9/lib/systemd/system/storpool_cgmove.service
+./share/doc/storpool/examples/cgconfig/ubuntu1404/
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.d/machine.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.d/machine.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.d/storpool.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.d/system.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.d/user.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/default/
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/default/cgconfig
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/init/
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/init/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1404/etc/cgrules.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/cgconfig.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/cgconfig.d/machine.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/cgconfig.d/storpool.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/cgconfig.d/system.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/cgconfig.d/user.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/init.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/init.d/cgconfig
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/cgmanager.service.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/cgmanager.service.d/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/machine.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/machine.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/storpool.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/storpool.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/system.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/system.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/user.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/systemd/system/user.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/etc/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1604/lib/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/lib/systemd/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/lib/systemd/system/
+./share/doc/storpool/examples/cgconfig/ubuntu1604/lib/systemd/system/storpool_cgmove.service
+./share/doc/storpool/examples/cgconfig/ubuntu1804/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/cgconfig.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/cgconfig.d/machine.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/cgconfig.d/storpool.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/cgconfig.d/system.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/cgconfig.d/user.slice.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/init.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/init.d/cgconfig
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/cgmanager.service.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/cgmanager.service.d/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/machine.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/machine.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/storpool.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/storpool.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/system.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/system.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/user.slice.d/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/systemd/system/user.slice.d/90-MemoryLimit.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/etc/cgconfig.conf
+./share/doc/storpool/examples/cgconfig/ubuntu1804/lib/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/lib/systemd/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/lib/systemd/system/
+./share/doc/storpool/examples/cgconfig/ubuntu1804/lib/systemd/system/storpool_cgmove.service
+./share/doc/storpool/examples/cgconfig/README
+./share/doc/storpool/examples/cgconfig/cgtool.sh
+./share/doc/storpool/examples/99-ethtool-hook
+./share/doc/storpool/examples/irqbalance
+./share/doc/storpool/examples/nginx/
+./share/doc/storpool/examples/nginx/conf.d/
+./share/doc/storpool/examples/nginx/conf.d/nginx_status.conf
+./share/doc/storpool/examples/nginx/conf.d/storpool.conf
+./share/doc/storpool/examples/nginx/certs/
+./share/doc/storpool/examples/nginx/certs/genkey.sh
+./share/doc/storpool/examples/nginx/certs/openssl.conf
+./share/doc/storpool/examples/bash_completion.d/
+./sbin/
+./sbin/storpool_reaffirm
+./sbin/iface-genconf
+./sbin/storpool_tree
+./sbin/storpool_shorten
+./sbin/storpool_revision
+./sbin/storpool_parents
+./sbin/storpool_daemon
+./sbin/storpool_report
+./sbin/check_modules
+./sbin/storpool_dump
+./lib/
+./lib/storpool/
+./lib/storpool/stats_dump
+./lib/storpool/perl/
+./lib/storpool/perl/Net/
+./lib/storpool/perl/Net/StorPool/
+./lib/storpool/perl/Net/StorPool/Version.pm
+./lib/storpool/perl/Net/StorPool/Util.pm
+./lib/storpool/update_functions.sh
+./lib/storpool/unload
+./lib/storpool/setirqaff
+./lib/storpool/debiface.j2
+./lib/storpool/rheliface.j2
+./lib/storpool/need_resize
+./lib/storpool/sdump
+./lib/storpool/pre-upgrade-checks
+./lib/storpool/netlatency
+./lib/storpool/iscsi_targets
+./lib/storpool/fix_dir_owner
+./lib/storpool/check_rootcgp
+./lib/storpool/check_prelinked
+./lib/storpool/adapt/
+./lib/storpool/adapt/logrotate.d/
+./lib/storpool/adapt/logrotate.d/storpool
+./lib/storpool/ib/
+./lib/storpool/ib/ping_guids
+./lib/storpool/ip/
+./lib/storpool/ip/load_ips
+./lib/storpool/adapt-config
+./lib/storpool/cpuconf
+./lib/storpool/gen-newproto-conf
+./lib/storpool/ifvxlan
+./lib/storpool/irqbalance_banscript
+./lib/storpool/multi-server-helper.py
+./lib/storpool/storpool_cgmove
+./lib/storpool/vf-genconf
+./lib/storpool/get_tech_support
+./lib/systemd/
+./lib/systemd/system/
+./lib/systemd/system/storpool_cgmove.service
+./lib/systemd/system/storpool_reaffirm.service
+./lib/systemd/system/storpool_flushwbc.service
+./lib/systemd/system/storpool.slice
+Copying a directory: -I -x init.d common/etc/ /etc/
+Copying common/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+./storpool_revision
+./storpool_version.ini
+./systemd/
+./systemd/system/
+./systemd/system/user.slice.d/
+./systemd/system/user.slice.d/90-MemoryLimit.conf
+./systemd/system/system.slice.d/
+./systemd/system/system.slice.d/90-MemoryLimit.conf
+./systemd/system/storpool.slice.d/
+./systemd/system/storpool.slice.d/90-MemoryLimit.conf
+./systemd/system/machine.slice.d/
+./systemd/system/machine.slice.d/90-MemoryLimit.conf
+./cgconfig.d/
+./cron.d/
+./cron.d/storpool_setirqaff
+./cron.d/storpool_reaffirm
+./logrotate.d/
+./logrotate.d/storpool_setirqaff
+./logrotate.d/storpool_bridge
+./logrotate.d/storpool_mgmt
+./sysctl.d/
+./sysctl.d/99-StorPool.conf
+./rsyslog.d/
+./rsyslog.d/99-StorPool.conf
+./prelink.conf.d/
+./prelink.conf.d/storpool.conf
+./modprobe.d/
+./modprobe.d/storpool.conf
+Copying a directory: -I common/etc/init.d/ /etc/init.d/
+Copying common/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_reaffirm
+Creating /etc/logrotate.d/storpool
+Copying a directory: config/usr/ /usr/
+Copying config/usr/ to /usr/
+Exclude specification: (none)
+./
+./share/
+./share/doc/
+./share/doc/storpool/
+./share/doc/storpool/examples/
+./share/doc/storpool/examples/storpool.conf.example
+./sbin/
+./sbin/storpool_showconf
+./sbin/storpool_confshow
+./sbin/storpool_confget
+./lib/
+./lib/storpool/
+./lib/storpool/zbase32
+./lib/storpool/storpool_confget.sh
+./lib/storpool/storpool-defaults.conf
+./lib/storpool/python/
+./lib/storpool/python/sp/
+./lib/storpool/python/sp/cgroups/
+./lib/storpool/python/sp/cgroups/__init__.py
+./lib/storpool/python/sp/cgroups/filters.py
+./lib/storpool/python/sp/cgroups/hierarchy.py
+./lib/storpool/python/sp/disk/
+./lib/storpool/python/sp/disk/__init__.py
+./lib/storpool/python/sp/disk/disklist.py
+./lib/storpool/python/sp/disk/hier.py
+./lib/storpool/python/sp/netiface/
+./lib/storpool/python/sp/netiface/__init__.py
+./lib/storpool/python/sp/netiface/ifaceutil.py
+./lib/storpool/python/sp/netiface/spiface.py
+./lib/storpool/python/sp/process/
+./lib/storpool/python/sp/process/__init__.py
+./lib/storpool/python/sp/process/pidutil.py
+./lib/storpool/python/sp/process/sppidutil.py
+./lib/storpool/python/sp/tools/
+./lib/storpool/python/sp/tools/__init__.py
+./lib/storpool/python/sp/tools/hugepages.py
+./lib/storpool/python/sp/util/
+./lib/storpool/python/sp/util/file/
+./lib/storpool/python/sp/util/file/__init__.py
+./lib/storpool/python/sp/util/file/parsers.py
+./lib/storpool/python/sp/util/file/readers.py
+./lib/storpool/python/sp/util/file/writers.py
+./lib/storpool/python/sp/util/__init__.py
+./lib/storpool/python/sp/util/backports.py
+./lib/storpool/python/sp/util/decorators.py
+./lib/storpool/python/sp/util/limits.py
+./lib/storpool/python/sp/util/misc.py
+./lib/storpool/python/sp/util/re_extensions.py
+./lib/storpool/python/sp/validations/
+./lib/storpool/python/sp/validations/__init__.py
+./lib/storpool/python/sp/validations/cgroups.py
+./lib/storpool/python/sp/validations/check.py
+./lib/storpool/python/sp/__init__.py
+./lib/storpool/python/sp/apicheck-tests.py
+./lib/storpool/python/sp/cpuinfo.py
+./lib/storpool/python/sp/installed.py
+./lib/storpool/python/sp/messages.py
+./lib/storpool/python/sp/service.py
+./lib/storpool/python/sp/spmemory.py
+./lib/storpool/install_helper
+Copying a directory: mgmt/usr/ /usr/
+Copying mgmt/usr/ to /usr/
+Exclude specification: (none)
+./
+./share/
+./share/doc/
+./share/doc/storpool/
+./share/doc/storpool/examples/
+./share/doc/storpool/examples/etc/
+./share/doc/storpool/examples/etc/cron.d/
+./share/doc/storpool/examples/etc/cron.d/storpool_scrub_disks
+./sbin/
+./sbin/storpool_mgmt.bin
+./lib/
+./lib/storpool/
+./lib/storpool/transfer_progress
+./lib/storpool/storpool_balancer.bin
+./lib/storpool/scrub_disks
+./lib/storpool/monitor
+./lib/storpool/latthreshold.py
+./lib/storpool/balancer.sh
+./lib/storpool/api-ip
+./lib/systemd/
+./lib/systemd/system/
+./lib/systemd/system/storpool_mgmt.service
+Copying a directory: -I -x init.d mgmt/etc/ /etc/
+Copying mgmt/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+./cron.d/
+./cron.d/storpool_monitor
+Copying a directory: -I mgmt/etc/init.d/ /etc/init.d/
+Copying mgmt/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_mgmt
+Copying a directory: repsync/usr/ /usr/
+Copying repsync/usr/ to /usr/
+Exclude specification: (none)
+./
+./share/
+./share/doc/
+./share/doc/storpool/
+./share/doc/storpool/examples/
+./share/doc/storpool/examples/storpool_genreport.conf
+./sbin/
+./sbin/storpool_repsync_crontab
+./sbin/storpool_repsync
+./lib/
+./lib/storpool/
+./lib/storpool/storpool_repsync.cron
+./lib/storpool/storpool_kdump
+./lib/storpool/storpool_genreport
+Copying a directory: -I -x init.d repsync/etc/ /etc/
+Copying repsync/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+./cron.d/
+./cron.d/storpool_genreport
+Copying a directory: -I repsync/etc/init.d/ /etc/init.d/
+Copying repsync/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_kdump
+Copying a directory: server/usr/ /usr/
+Copying server/usr/ to /usr/
+Exclude specification: (none)
+./
+./sbin/
+./sbin/storpool_server_3
+./sbin/storpool_server_2
+./sbin/storpool_server_1
+./sbin/storpool_server.bin
+./sbin/storpool_nvmed.bin
+./sbin/storpool_initdisk
+./sbin/storpool_controller.bin
+./sbin/disk_tester
+./lib/
+./lib/storpool/
+./lib/storpool/storcli-helper.pl
+./lib/storpool/server_stat
+./lib/storpool/server_inspect
+./lib/storpool/hpssacli-helper.pl
+./lib/storpool/flushwbc
+./lib/storpool/expose_nvme_drives
+./lib/storpool/diskid-helper
+./lib/systemd/
+./lib/systemd/system/
+./lib/systemd/system/storpool_server_3.service
+./lib/systemd/system/storpool_server_2.service
+./lib/systemd/system/storpool_server_1.service
+./lib/systemd/system/storpool_server.service
+./lib/systemd/system/storpool_nvmed.service
+./lib/systemd/system/storpool_controller.service
+Copying a directory: -I -x init.d server/etc/ /etc/
+Copying server/etc/ to /etc/
+Exclude specification:  --exclude=init.d
+./
+Copying a directory: -I server/etc/init.d/ /etc/init.d/
+Copying server/etc/init.d/ to /etc/init.d/
+Exclude specification: (none)
+./
+./storpool_server_3
+./storpool_server_2
+./storpool_server_1
+./storpool_server
+./storpool_nvmed
+./storpool_controller
+Copying a directory: server/lib/modules/3.10.0-862.14.4.el7.x86_64/extra/ /lib/modules/3.10.0-862.14.4.el7.x86_64/extra/
+Copying server/lib/modules/3.10.0-862.14.4.el7.x86_64/extra/ to /lib/modules/3.10.0-862.14.4.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_disk.ko
+Copying a directory: server/lib/modules/3.10.0-957.1.3.el7.x86_64/extra/ /lib/modules/3.10.0-957.1.3.el7.x86_64/extra/
+Copying server/lib/modules/3.10.0-957.1.3.el7.x86_64/extra/ to /lib/modules/3.10.0-957.1.3.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_disk.ko
+Copying a directory: server/lib/modules/3.10.0-957.5.1.el7.x86_64/extra/ /lib/modules/3.10.0-957.5.1.el7.x86_64/extra/
+Copying server/lib/modules/3.10.0-957.5.1.el7.x86_64/extra/ to /lib/modules/3.10.0-957.5.1.el7.x86_64/extra/
+Exclude specification: (none)
+./
+./storpool_disk.ko
+Copying a directory: update/usr/ /usr/
+Copying update/usr/ to /usr/
+Exclude specification: (none)
+./
+./lib/
+./lib/storpool/
+./lib/storpool/update_services
+./lib/storpool/update_safe
+./lib/storpool/update_rdma
+./lib/storpool/update_disk
+./lib/storpool/update_all
+./lib/storpool/time_bubble
+./lib/storpool/replacebd
+./lib/storpool/fixup_dev_sp_group
+Cleaning out any stale modules in weak-updates/ directories
+Examining the kernel command line: crashkernel=auto rd.md.uuid=141b877b:5ace1571:77045cf9:b1197f6b rd.lvm.lv=centos/root rd.md.uuid=2d8ebaf8:87e2c34c:d09c59c1:54148385 vga=normal crashkernel=auto nofb i915.modeset=0 swapaccount=1 libata.fua=1 nomodeset video=vesafb:off norhgb noquiet 
+Checking for libata.fua=1 swapaccount=1 vga=normal nofb nomodeset video=vesafb:off i915.modeset=0
+It seems to contain all the required parameters
+Running storpool_hugepages
+Reloading the systemd service database
+Removing files from old versions of StorPool
+Modules: beacon bindings-py block bridge cli common config mgmt repsync server update
+Successfully installed beacon bindings-py block bridge cli common config mgmt repsync server update

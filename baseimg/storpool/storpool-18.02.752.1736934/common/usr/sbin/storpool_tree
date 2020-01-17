@@ -1,0 +1,180 @@
+#!/usr/bin/perl
+
+use 5.010;
+use strict;
+use warnings;
+no warnings 'recursion';
+
+use JSON::XS;
+use Data::Dumper;
+use Term::ANSIColor;
+
+my $TEXT;
+
+my %colors = (
+	reset => 'reset',
+	title => 'bold green',
+	tree => 'white',
+	volume => 'white',
+	snap_children => 'cyan',
+	snap_bare => 'red',
+	comment => 'bold cyan',
+);
+$colors{$_} = color $colors{$_} for keys %colors;
+
+sub children($$);
+sub depth($$$);
+
+sub readfile($) {
+	my ($file) = @_;
+	open my $f, '<', $file or die "Could not open $file: $!\n";
+	my $s;
+	{
+		local $/;
+		$s = <$f>;
+	}
+	close $f or die "Could not close $file: $!\n";
+	return $s;
+}
+
+sub c($ $) {
+	my ($type, $s) = @_;
+	my $c = $colors{$type};
+	die "Internal error: unknown color type $type\n" unless defined $c;
+	return "$c$s$colors{reset}";
+}
+
+sub children($$) {
+	my ($t, $ind) = @_;
+
+	my @vols = sort { $a->{name} cmp $b->{name} } values %$t;
+	my $last = $vols[-1]->{name};
+	foreach my $vol (@vols) {
+		my $has_children = %{$vol->{children}};
+
+		my $col = $vol->{type} eq 'volume'? 'volume':
+			$has_children? 'snap_children': 'snap_bare';
+		my ($newind, $char) =
+			$vol->{name} eq $last? ("   ", "└─"): ("│  ", "├─");
+		say c('tree', "$ind$char").c($col, $vol->{name});
+
+		if ($has_children) {
+			children $vol->{children}, "$ind$newind";
+		}
+	}
+}
+
+sub depth($$$) {
+	my ($t, $depth, $limit) = @_;
+	$depth += 1;
+	
+	my @vols = sort { $a->{name} cmp $b->{name} } values %$t;
+	foreach my $vol (@vols) {
+		my $has_children = %{$vol->{children}};
+
+		if ($has_children) {
+			depth $vol->{children}, $depth, $limit;
+		} else {
+			if ($depth >= $limit) {
+				$TEXT .= "$depth\t(" . $vol->{type} . ")\t" . $vol->{name} ."\n";
+			}
+		}
+	}
+}
+
+sub add_nodes($$$) {
+	my ($nodes, $type, $data) = @_;
+
+	for my $obj (@{$data->{data}})
+	{
+		$nodes->{$obj->{name}} = {
+			type => $type,
+			name => $obj->{name},
+			parentName => $obj->{parentName},
+			children => {},
+		};
+	}
+}
+
+sub build_tree($) {
+	my ($nodes) = @_;
+	
+	my $tree = {};
+	for my $n (values %$nodes) {
+		my ($name, $parent) = ($n->{name}, $n->{parentName});
+
+		if ($parent eq '') {
+			$tree->{$name} = $n;
+		} else {
+			$nodes->{$parent}->{children}->{$name} = $n;
+		}
+	}
+	return $tree;
+}
+
+MAIN:
+{
+
+	
+	my %nodes;
+	my $volumes;
+	my $snapshots;
+	my $printStats=0;
+	my $limit = 0;
+	
+	my $numArgs = @ARGV;
+	
+	if ($ARGV[0] && $ARGV[0] eq "-s") {
+		$numArgs -= 2;
+		$printStats = 1;
+		$limit = $ARGV[1];
+	}
+	
+	if ($numArgs != 2 && $numArgs != 0) {
+		print <<EOUSAGE ;
+Usage: storpool_tree
+or
+Usage: storpool_tree volumesJson snapshotsJson
+
+In the first form the script fetches the required information by using the
+StorPool cli on the machine it is executed.
+
+Example with data fetched from a remote host (second form):
+	storpool_tree <(ssh host storpool -j volume list) <(ssh host storpool -j snapshot list)
+EOUSAGE
+		exit;
+	}
+	
+	if ($numArgs == 0) {
+		$volumes = `storpool -j volume list`;
+		$snapshots = `storpool -j snapshot list`;
+	} else {
+		my $volumesFile = $ARGV[$printStats*2];
+		my $snapshotsFile = $ARGV[1+$printStats*2];
+		$volumes = readfile $volumesFile;
+		$snapshots = readfile $snapshotsFile;
+	}
+	
+	add_nodes \%nodes, 'volume', decode_json $volumes;
+	add_nodes \%nodes, 'snapshot', decode_json $snapshots;
+	my $tree = build_tree \%nodes;
+	
+	if ($printStats) {
+		if (%{$tree}) {
+			depth $tree, 0, $limit;
+			
+			if ($TEXT) {
+				say "DEPTH\t(TYPE)  \tNAME_LAST_IN_CHAIN";
+				print "$TEXT";
+			}
+		}
+	} else {
+		say c('title', 'StorPool');
+		
+		if (%{$tree}) {
+			children $tree, '  ';
+		} else {
+			say c('comment', '  └─N/A');
+		}
+	}
+}

@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# shellcheck source=tools/update/update_functions.sh
+source /usr/lib/storpool/update_functions.sh
+usage(){
+	cat <<EOUSAGE
+
+${bold}Usage: $0 [module1] [module2] ... --yes${norm}
+
+	Stops all running StorPool server services and attempts to reload the storpool_disk
+	kernel module only.
+
+	${bold}[-h|--help]${norm}	- prints this message
+	${bold}[moduleN]${norm} - attempts to also reload module after storpool_disk
+
+	${bold}--yes${norm} - required to actually perform the reload
+	${bold}--no-cgroup-check${norm} - skip the check that the cgroups exist (${bold}UNSAFE${norm}, please make sure you know what you are doing)
+
+EOUSAGE
+}
+
+unset modules nocgroups proceedf
+if [[ -n "$*" ]]; then
+	while test -n "$1"; do
+		case "$1" in
+			-h|--help|usage|help)
+				usage
+				exit 0
+				shift
+				;;
+			--no-cgroups-check)
+				nocgroups=1
+				shift
+				;;
+			--yes)
+				proceedf=1
+				shift
+				;;
+			*)
+				if chkloaded "$1"; then
+					modules+=("$1")
+				else
+				  echo "${bold}${1}${norm} missing or not loaded"
+				fi
+				shift
+				;;
+		esac
+	done
+fi
+
+allservices=($(getservices "disk"))
+chkprelinked "${allservices[*]}"
+
+if [[ -z $proceedf ]]; then
+	echo "Please use '--yes' to reload" 1>&2
+	exit 1
+fi
+
+unset running
+running=($(getrunning "${allservices[*]}"))
+
+echo -e "Running services:\n${running[*]}"
+
+chkhugepages "${running[*]}"
+
+chkcgroups "${running[*]}"
+
+stopservices "${running[@]}"
+
+unloadmodules "storpool_disk" "${modules[@]}"
+
+loadmodules "${modules[@]}"
+
+startservices "${running[@]}"
+
+for mod in "storpool_disk" "${modules[@]}"; do
+	printmodversion "$mod"
+done

@@ -1,0 +1,89 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2017  StorPool.
+# All rights reserved.
+
+use v5.10;
+use strict;
+use warnings;
+
+sub slurp($)
+{
+	my ($fname) = @_;
+
+	my $f;
+	open($f, '<', $fname)
+		? do {
+			my @contents = map { chomp; $_ } <$f>;
+
+			close($f)
+				? \@contents
+				: die "Could not close $fname after reading: $!\n"
+		}
+		: die "Could not open $fname for reading: $!\n"
+}
+
+sub find_devices($ $ $)
+{
+	my ($path, $names, $callback) = @_;
+
+	$callback->({
+		map {
+			my $dev = $_;
+			my $devpath = "$path/$dev";
+			-l $devpath
+				? do {
+					my $target = readlink $devpath;
+					$target =~ m{
+						/host \d+
+						/session (?<sess> \d+ )
+						/target \d+
+					}x
+						? do {
+							my $tname = "/sys/class/iscsi_session/session$+{sess}/targetname";
+							-f $tname
+								? ($dev => slurp($tname)->[0])
+								: ()
+						}
+						: ()
+				}
+				: ()
+		} @{$names}
+	})
+}
+
+sub get_device_info($ $)
+{
+	my ($path, $callback) = @_;
+	my $d;
+
+	opendir($d, $path)
+		? do {
+			my @names = readdir $d;
+
+			closedir($d)
+				? find_devices $path, \@names, sub {
+					$callback->($_[0])
+				}
+				: die "Could not closedir($path): $!\n"
+		}
+		: die "Could not opendir($path): $!\n"
+}
+
+sub display_devices($)
+{
+	my ($devices) = @_;
+
+	map {
+		say "/dev/$_\t$devices->{$_}"
+	} sort keys %{$devices}
+}
+
+MAIN:
+{
+	get_device_info '/sys/block', sub {
+		# devices
+		display_devices $_[0]
+	}
+}

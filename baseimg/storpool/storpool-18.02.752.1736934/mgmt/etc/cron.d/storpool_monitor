@@ -1,0 +1,5 @@
+# /etc/cron.d/storpool_storpool_monitor: crontab entries for the storpool monitoring pusher
+
+PATH=/bin:/usr/sbin:/usr/bin
+
+* *    * * *   root [ -f /etc/storpool.conf ] && /usr/lib/storpool/monitor

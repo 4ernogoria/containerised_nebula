@@ -1,0 +1,6 @@
+# /etc/cron.d/storpool_genreport: crontab entries for the StorPool issues checker
+# This file might be replaced by StorPool installer. 
+
+PATH=/bin:/usr/sbin:/usr/bin
+
+* *    * * *   root [ -f /etc/storpool.conf ] && /usr/lib/storpool/storpool_genreport

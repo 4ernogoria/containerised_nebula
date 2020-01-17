@@ -1,0 +1,107 @@
+#!/bin/bash
+
+set -e
+usage(){
+	cat <<EOUSAGE
+	Usage: $(basename -- $0) -h|--help
+	Usage: $(basename -- $0) <parameters>
+
+	Checks if there are modules for the running kernel.
+
+	parameters:
+	[-r|--report] - creates report in \$SP_REPORTDIR instead of printing on stdout
+	-k|--kver=<Kernel Version>	- check for <Kernel Version> as reported by \$(uname -r)
+EOUSAGE
+
+}
+
+confget="/usr/lib/storpool/storpool_confget.sh"
+if [[ ! -r $confget ]]; then
+	# StorPool probably not installed?
+	echo "$confget missing, is StorPool installed?" 1>&2
+	exit 0
+fi
+
+. "$confget"
+
+if [ -n "$1" ]; then
+	while test -n "$1"; do
+		case "$1" in
+			-h|--help)
+				usage
+				exit
+				;;
+			-r|--report)
+				reportf=1
+				shift
+				;;
+			-k=*|--kver=*)
+				kver="${1##*=}"
+				shift
+				;;
+			*)
+				usage
+				exit 1
+				;;
+		esac
+	done
+else
+	usage
+	exit 1
+fi
+
+if [[ -z $SP_REPORTDIR ]]; then
+	# missing configuration, exit normally
+	echo "$SP_REPORTDIR missing, is StorPool installed?" 1>&2
+	exit 0
+fi
+
+if [[ -z $kver ]]; then
+	echo "-k|--kver parameter missing" 1>&2
+	exit 1
+fi
+
+tstamp=$(date -u +%Y%m%d-%H%M%S)
+rname="report-kernel-postinstall-${tstamp}.txt"
+tmpreport="${SP_REPORTDIR}/building-${rname}"
+report="${SP_REPORTDIR}/${rname}"
+
+modulesdir="/lib/modules/$kver"
+
+if [[ ! -d $modulesdir ]]; then
+	# kernel should be installed, but "$modulesdir" dir is missing, grumple, grumple, complain
+	emessage="$modulesdir missing, please check if $kver was correctly installed"
+	if [[ -n $reportf ]]; then
+		# drop this message into the report as well
+		echo "$emessage" | tee -a "$report" 1>&2
+	else
+		echo "$emessage" 1>&2
+	fi
+	exit 1
+fi
+
+# check if we already have modules for this kernel
+spmodules=( $(find /lib/modules/$kver -type f -name "storpool_*.ko") )
+
+if [[ -z ${spmodules[*]} ]]; then
+	echo "Missing modules for $kver" >> "$tmpreport"
+	revision="/usr/lib/storpool/storpool_revision"
+	if [[ -x $revision  ]]; then
+		$revision >> "$tmpreport"
+	else
+		cat /etc/storpool_revision >> "$tmpreport"
+		for b in /usr/sbin/storpool_*.bin ; do
+			printf "%s\t%s\n" "$b" "$(strings $b | fgrep storpool_revision | cut -d= -f2)" >> "$tmpreport"
+		done
+	fi
+fi
+
+if [[ -s $tmpreport ]]; then
+	# $tmpreport not empty
+	if [[ -n $reportf ]]; then
+		chown "$SP_CRASHUSER" -- "$tmpreport"
+		mv -- "$tmpreport" "$report"
+	else
+		cat "$tmpreport" && rm -f "$tmpreport" 1>&2
+	fi
+fi

@@ -1,0 +1,39 @@
+#!/bin/sh
+
+usage()
+{
+	echo "Usage: $0 [up|down]"
+	exit 1
+}
+
+if [ "$#" -ne 1 ]; then
+	usage
+	exit 1
+fi
+
+ip=$SP_API_HTTP_HOST
+dev=$SP_API_IFACE
+res=42
+
+case $1 in
+	"up")
+		ip addr add $ip/32 dev $dev
+		res=$?
+		if [ "$res" -eq 0 ]; then
+			for i in 1 2 3; do
+				arping -U $ip -I $dev -c1
+				arping -A $ip -I $dev -c1
+				sleep 0.050
+			done
+		fi
+		;;
+	"down")
+		ip addr del $ip/32 dev $dev
+		res=$?
+		;;
+	*)
+		usage
+esac
+
+logger -t ${0##*/} "ip $1 $ip dev $dev ($res)"
+exit "$res"

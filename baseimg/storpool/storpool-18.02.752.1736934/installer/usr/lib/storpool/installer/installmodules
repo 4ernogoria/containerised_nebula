@@ -1,0 +1,116 @@
+#!/bin/bash
+
+if [[ -n $TERM ]]; then
+    bold=$(tput bold)
+    norm=$(tput sgr0)
+fi
+
+me="$(basename -- "$0")"
+if [[ -z "$*" ]]; then
+	echo "Usage: $me host1 [host2 host3 ... hostN]"
+	echo "export gid=\$gerritID if you would like to have a different glob for finding a remote package"
+fi
+
+gid="${gid:-}"
+
+for remote in "$@" ; do
+	if ! grep -Fqw "$remote" ./hosts.txt; then
+		echo "'$remote' not found in ./hosts.txt exiting..." 1>&2
+		exit 1
+	fi
+	echo -e "\n#--- Installing on $remote"
+	if ! ssh -tt "$remote" '
+        ident='"${me}[$$]"'
+        gid='"$gid"'
+		if [[ $EUID != 0 ]]; then
+			sudo=sudo
+		fi
+		l(){
+			# print in log and on stdout
+			logger -t "$ident" -- "$@"
+			echo "$@"
+		}
+		le(){
+			# print message also on stderr
+			logger -st "$ident" -- "$@"
+		}
+		lmod(){
+			while read -r line; do
+				l "$line"
+			done <<<"$($sudo storpool_revision)"
+		}
+		lf(){
+			while read -r line; do
+				l "$line"
+			done <<<"$(cat $@)"
+		}
+		l "Previous modules:"
+		lmod
+		modules="@block @cli" # at least block/beacon
+		revision="$($sudo storpool_revision)"
+		if echo "$revision" | fgrep -q server; then # if there is at least one server
+			modules="@block_server @cli"
+		fi
+		if echo "$revision" | fgrep -q mgmt; then
+			modules="$modules bindings-py cli mgmt"
+		fi
+		if echo "$revision"| fgrep -q bridge; then
+			modules="$modules bridge"
+		fi
+		if echo "$revision" | fgrep -q iscsi; then
+			modules="$modules iscsi"
+		fi
+		l pending modules:
+		l $modules
+		suser="$($sudo storpool_showconf -n sp_crash_user)"
+		shome="$(getent passwd "$suser" | cut -d: -f6)"
+		if [[ -z $shome ]]; then
+			le "Failed to get homedir for \"$suser\", bailing out..."
+			exit 1
+		fi
+		if [[ -n $gid ]]; then
+			echo "Using $gid as glob"
+			last="$(ls -d ~/storpool/storpool-${gid}*/ | sort -V | tail -n 1 )"
+		else
+			last="$(ls -d ~/storpool/storpool-1[68].0*/ | sort -V | tail -n 1)"
+		fi
+		kernels="$( find "$shome" -name unsupportedkernels | xargs cat )"
+		if [[ -z $last ]]; then
+			le "No ~/storpool/storpool-* directory found bailing out"
+			exit 1
+		fi
+		kernelsfrompackage=( $(find ${last}/*/lib/modules/ -mindepth 1 -maxdepth 1 -type d | while read k ; do echo ${k##*/} ; done | sort -Vu) )
+		. /etc/os-release
+		major="$(uname  -r | cut -d. -f1)"
+		minor="$(uname  -r | cut -d. -f2)"
+		if [[ ${ID} == "centos" && ${VERSION_ID} == "7" ]]; then
+			# exclude kernels for Virtuozzo
+			lastkernelfrompackage="$( printf "%s\n"  ${kernelsfrompackage[*]} | fgrep "el7" | egrep "^${major}.${minor}" | python -c "import sys, re ; from distutils.version import LooseVersion ; print sorted(sys.stdin.read().split(\"\n\")[:-1], key=(lambda x: LooseVersion(re.sub(\"\.el[67].*$\", \"\", x))))[-1]")"
+		else
+			lastkernelfrompackage="$( printf "%s\n"  ${kernelsfrompackage[*]} | egrep "^${major}.${minor}" | python -c "import sys, re ; from distutils.version import LooseVersion ; print sorted(sys.stdin.read().split(\"\n\")[:-1], key=(lambda x: LooseVersion(re.sub(\"\.el[67].*$\", \"\", x))))[-1]")"
+		fi
+		set -e
+		l "latest package in directory $last"
+		cd "$last"
+		inlog="$(mktemp)"
+		l "installing for $(uname -r)"
+		$sudo ./install.sh $modules > "$inlog" && ' \
+		'lf "$inlog"
+		if [[ $last =~ "storpool-18.0[12]*" ]]; then
+			echo "$last already installing all modules, including last kernel modules in package, proceeding without a separate installation"
+		else
+			for k in $kernels ${lastkernelfrompackage}; do
+				l "installing for $k"
+				$sudo ./install.sh -k $k $modules > "$inlog"
+				lf "$inlog"
+			done
+		fi
+		l "modules installed"
+		lmod
+		rm -f "$inlog"
+		set +e
+		' ; then
+		echo "${bold}Installation on $remote FAILED${norm}" 1>&2
+	fi
+	echo -e "#--- finished $remote\n"
+done

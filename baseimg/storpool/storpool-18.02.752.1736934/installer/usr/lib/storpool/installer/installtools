@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# To change the installed content, update and run /home/cust/_tools/geninstalltools
+
+if [[ -z "$*" && ! -r ./hosts.txt ]]; then
+  echo "no ./hosts.txt file found in the present directory" 1>&2
+fi
+
+if [[ -n "$*" ]]; then
+	lhosts=($@)
+	trap 'rm -f $hosts' EXIT QUIT TERM INT HUP
+	hosts="$(mktemp)"
+	printf -- "%s\n" "${lhosts[@]}" >> "$hosts"
+else
+	hosts=./hosts.txt
+fi
+
+echo "hosts: $(cat $hosts)"
+
+echo "Creating storpool directory in ~"
+pssh -h "$hosts" 'mkdir -p storpool'
+
+echo "Copying tools"
+count=0
+for h in $(<"$hosts" ); do
+  rsync -r /home/cust/_tools/installtools.tar.xz "${h}":storpool/ &
+  count=$((count+1))
+  if [[ $((count%5)) -eq 0 ]]; then
+    wait
+  fi
+done
+wait
+
+# shellcheck disable=SC2016
+pssh -h "$hosts" -i '
+  cd storpool
+  if ! [ "$USER" = "root" ]; then
+    s=sudo
+  fi
+  $s tar -xf installtools.tar.xz
+  for i in installtools/* ; do
+    bname="$(basename -- $i)"
+    if [[ -e $bname ]]; then
+      rm -rf "$bname"
+    fi
+    $s mv "$i" "$bname"
+  done
+  rmdir installtools
+  last_raid_hba_tools="$(ls -t raid_hba_tools*xz | head -n 1)"
+  $s tar -xf "$last_raid_hba_tools" -C /
+  '

@@ -1,0 +1,29 @@
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+
+[Unit]
+Description=StorPool block device client service
+After=syslog.target
+After=network.target
+After=storpool_beacon.service
+Before=remote-fs-pre.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/storpool_block.pid
+ExecStart=/usr/sbin/storpool_block -d
+ExecStopPost=/bin/rm -f /var/run/storpool_block.pid
+StandardInput=null
+StandardOutput=inherit
+StandardError=inherit
+KillMode=process
+Slice=storpool.slice
+BlockIOAccounting=false
+CPUAccounting=false
+MemoryAccounting=false

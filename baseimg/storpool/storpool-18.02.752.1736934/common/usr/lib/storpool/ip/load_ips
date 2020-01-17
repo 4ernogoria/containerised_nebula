@@ -1,0 +1,30 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2017  StorPool.
+# All rights reserved.
+#
+
+use v5.010;
+use strict;
+use warnings;
+use Config::IniFiles;
+
+my $cfg = Config::IniFiles->new( -file => "/etc/storpool.conf", -fallback => "ALL" );
+
+foreach my $sec ($cfg->Sections) {
+	next if( $sec eq "ALL" );
+	
+	my $ourId = $cfg->val($sec, "SP_OURID");
+	
+	
+	for( my $i = 0; $i < 2; $i++ ) {
+		my @cfg = split ":",$cfg->val($sec, "SP_IFACE".($i+1)."_CFG") // "";
+		my $ip = $cfg[4] //  "0.0.0.0";
+		
+		my $fname = "/sys/devices/virtual/storpool_rdma/storpool_rdma/state/ips/node".$ourId."n".$i;
+		open(my $fh, '>', $fname);
+		print $fh $ip;
+		close $fh;
+	}
+}

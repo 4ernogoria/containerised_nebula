@@ -1,0 +1,95 @@
+#!/bin/bash
+
+set -e
+
+# check if we need to resize this to allow space for journal space at the end
+# ONLY FOR STORCLI-SUPPORTED CONTROLLERS
+# ONLY FOR HDDs
+# does the following:
+#	gets the serial via diskid-helper
+#	goes through all controllers and virtual devices
+#	if it finds the serial, compares the virtual and physical size
+#	if the sizes are different, no resize is needed, else it's needed
+#	if it wasn't found, not resize is needed
+
+
+setbin(){
+    local dev="$1"
+    # determine storcli64 or perccli64 through vendor
+    local vendor=`tr 'A-Z' 'a-z' < /sys/block/${dev}/device/vendor | tr -d ' '`
+    case "${vendor}" in
+        lsi|avago)
+            echo storcli64
+            ;;
+        dell)
+            echo perccli64
+	    ;;
+        *)
+            echo "$vendor not supported" 1>&2
+            exit 1
+            ;;
+    esac
+}
+
+function die() {
+	echo "Dying: $1"
+	exit 99
+}
+
+if [ -z "$1" ]; then
+	echo usage: $0 device
+	exit 3
+fi
+
+
+dev=$1
+cleandev=`echo "$1" | cut -d / -f 3 |tr -d '0-9'`
+cli=`setbin $cleandev`
+
+eval `/usr/lib/storpool/diskid-helper $dev`
+
+if ! [ "$METHOD" = "STORCLI_CMD" ]; then
+	echo NO
+	exit 6
+fi
+
+for c in `seq 0 10`; do
+	if ! $cli "/c$c" show 2>&1 |grep -q 'Status = Success'; then
+		continue
+	fi
+	for v in `seq 0 16`; do
+		if ! $cli "/c$c/v$v" show 2>&1 |grep -q 'Status = Success'  ; then 
+			continue
+		fi
+
+		
+
+		vsz=`$cli "/c$c/v$v" show all j | grep 'Number of Blocks'|tr -d 'A-Za-z:,"\t '`
+		if [[ -z "$vsz" ]]; then die "no vsz"; fi 
+
+		if [[ "$vsz" -lt 2048000 ]]; then
+			continue;
+		fi
+
+		physport=/c$c/e`$cli "/c$c/v$v" show all j | grep EID:Slt|cut -d \" -f 4|sed 's%:%/s%'`
+		if [[ -z "$physport" ]]; then die "no physport"; fi 
+
+		physsz=`$cli $physport show all j  | grep '"Coerced size"'|cut -d \[ -f 2|cut -d ' ' -f 1|tr 'a-z' 'A-Z' | sed 's/0X/ibase=16\n/' |bc`
+		if [[ -z "$physsz" ]]; then die "no physsz"; fi 
+
+		ser=`$cli $physport  show all j   |grep SN|cut -d \" -f 4|sed 's/ //g'`
+		if [[ -z "$ser" ]]; then die "no physsz"; fi 
+
+		if [[ "$ser" = "$SERIAL" ]]; then
+			#echo Found $dev $ser at /c$c/v$v $physport $vsz $physsz
+			if ! [[ "$vsz" -eq "$physsz" ]]; then
+				echo NO
+				exit 6
+			fi
+			echo YES
+			exit 5
+		fi
+	done
+done
+echo NO
+exit 6

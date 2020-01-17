@@ -1,0 +1,101 @@
+#!/usr/bin/python
+#
+#-
+# Copyright (c) 2016  StorPool.
+# All rights reserved.
+#
+import argparse
+import logging
+import logging.handlers
+import os
+import sys
+
+logger = logging.getLogger(sys.argv[0])
+logger.setLevel(logging.INFO)
+handler = logging.handlers.SysLogHandler(address = '/dev/log')
+logger.addHandler(handler)
+if sys.stdout.isatty():
+	# initialises output to stdout as well
+	clogger = logging.StreamHandler(sys.stdout)
+	clogger.setLevel(logging.INFO)
+	logger.addHandler(clogger)
+try:
+	from storpool import spapi, spconfig, sptypes
+except ImportError as e:
+	logger.critical(e)
+	exit(1)
+
+
+cfg = spconfig.SPConfig()
+ID = cfg['SP_OURID']
+
+api = spapi.Api.fromConfig(cfg = cfg)
+
+def start(disks):
+	'''disks: dict with diskID keys and data elements
+	start/unpause scrubbing for all available drives'''
+	for k in disks.keys():
+		if disks[k].scrubbingPaused:
+			logger.info('Unpausing disk {d}'.format(d = k))
+			try:
+				api.diskScrubContinue(k)
+			except spapi.ApiError as e:
+				logger.warning('Failed to continue scrubbing for disk {d} - {e}'.format(d = k, e = e.message))
+		else:
+			logger.info('Starting scrubbing for disk {d}'.format(d = k))
+			try:
+				api.diskScrubStart(k)
+			except spapi.ApiError as e:
+				logger.warning('Failed to start scrubbing for disk {d} - {e}'.format(d = k, e = e.message))
+
+def stop(disks):
+	'''disks: dict with diskID keys and data elements
+	pause scrubbing for all available drives presently in scrubbing'''
+	for k in disks.keys():
+		if disks[k].scrubbingStartedBefore > 0:
+			logger.info('Pausing disks {d}'.format(d = k))
+			try:
+				api.diskScrubPause(k)
+			except spapi.ApiError as e:
+				logger.warning('Failed to pause disk {d} - {e}'.format(d = k, e = e.message))
+
+def getdisks():
+	'''returns modified api.disksList() with only available drives that are not being softEject-ed
+	exits on error'''
+	try:
+		ddict = api.disksList()
+		return dict((k, v) for k, v in ddict.iteritems() if isinstance(v, sptypes.UpDiskSummary) and ddict[k].softEject == 'off' )
+	except BaseException as e:
+		logger.critical(e)
+		exit(1)
+
+def getactive():
+	'''returns True if present node is the active API, else None'''
+	try:
+		return api.servicesList().mgmt[int(ID)].active
+	except KeyError:
+		return False
+	except BaseException as e:
+		logger.critical(e)
+		exit(1)
+
+parser = argparse.ArgumentParser(description='Starts/Unpauses/Pauses scrubbing for all disks in a StorPool cluster.')
+parser.add_argument("--start", help="Start/Unpause scrubbing for all disks", action = 'store_true')
+parser.add_argument("--stop", help="Pause scrubbing for all disks in progress", action = 'store_true')
+parser.add_argument("-a", "--active", help="Run only on the node with the active StorPool API - useful when executed through cron on multiple nodes", action = 'store_true')
+args = parser.parse_args()
+if args.active:
+	logger.info('Starting in active mode, checking if this is the active StorPool API node')
+	if not getactive():
+		logger.info('Node ID {i} is not the presently active StorPool API, exiting.'.format(i = ID))
+		exit(0)
+if args.start and args.stop:
+	logger.critical('Please select either "--start" or "--stop", exiting.')
+	exit(1)
+elif not args.start and not args.stop:
+	parser.print_usage()
+	exit(1)
+elif args.start:
+	start(getdisks())
+else:
+	stop(getdisks())

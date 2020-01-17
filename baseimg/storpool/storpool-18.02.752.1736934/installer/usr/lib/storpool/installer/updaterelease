@@ -1,0 +1,108 @@
+#!/bin/bash
+
+if [[ -n $TERM ]]; then
+    bold=$(tput bold)
+    norm=$(tput sgr0)
+fi
+me="$(basename -- "$0")"
+allhosts=()
+
+usage(){
+  cat >&1 <<EOUSAGE
+
+    ${bold}Usage: $(basename -- "$0") host [host2 .. hostN] [release=<year.version>|r=<year.version>]${norm}
+
+  Gets the latest available kernel on host, then copies the latest available "release" package
+  and executes "installmodules".
+
+  If release is not provided reads the output from "storpool_revision" on the host itself, then
+  gets the module with the latest <year>.<version> and considers this as the latest release
+  installed on this node.
+
+  ${bold}[release='<year.version>']${norm} - Use this release, do not check on the remote host
+  ${bold}release${norm}, ex.:
+
+  - release="16.02"
+  - release="18.01"
+  - release="18.02"
+
+EOUSAGE
+}
+
+sprevision(){
+    local args=()
+    if [[ -z "$*" ]]; then
+        local hosts=./hosts.txt
+        if [[ ! -r $hosts ]]; then
+            echo "No $hosts file found in the present directory"
+            return
+        fi
+        args+=(-h "$hosts")
+    else
+        h=("$@")
+        for host in "${h[@]}" ; do
+            args+=(-H "$host")
+        done
+    fi
+    # shellcheck disable=SC2016
+    pssh -O StrictHostKeyChecking=no -O ConnectTimeout=15s "${args[@]}" -i '
+        if [[ $EUID -ne 0 ]]; then
+            s=sudo
+        fi
+        $s timeout 2 storpool_revision
+    '
+}
+
+if [[ -n "$*" ]]; then
+  while test -n "$1"; do
+    case "$1" in
+      -h|--help|usage|help)
+        usage
+        exit 0
+        shift
+        ;;
+      release=*|r=*)
+        release=${1##*=}
+        shift
+        ;;
+      debug)
+        export debugf=1
+        echo "Printing debug messages"
+        set -x
+        shift
+        ;;
+      *)
+        host="$1"
+		if ! grep -qw "$host" ./hosts.txt; then
+			echo "Host \"$host\" not found in hosts.txt, bailing out" 1>&2
+			exit 1
+		fi
+		allhosts+=("$host")
+		shift
+        ;;
+    esac
+  done
+elif [[ -z "$*" ]]; then
+	echo "No host selected, please provide host" 1>&2
+	exit 1
+fi
+
+tfile="$(mktemp "./${me}-XXXX")"
+trap 'rm -f $tfile' EXIT QUIT TERM INT HUP
+BCONF="$tfile" generate-build-conf "${allhosts[@]}"
+res=0
+for host in "${allhosts[@]}"; do
+	if [[ -z $release ]]; then
+		read -r year version <<<"$(sprevision "$host" | awk -F'[ .]+' '/^\/usr\/sbin\/storpool_/ { print $3, $4 }' | sort -n | tail -n 1)"
+		if [[ -z $year || -z $version ]]; then
+			echo "Could not determine release for $host, please use r=\$release, skipping" 1>&2
+			res=1
+			continue
+		fi
+		release="${year}.${version}"
+	fi
+	echo "Using $release for $host"
+	copytoservers r="$release" host="$host"
+	gid="$release" installmodules "$host"
+done
+exit "$res"

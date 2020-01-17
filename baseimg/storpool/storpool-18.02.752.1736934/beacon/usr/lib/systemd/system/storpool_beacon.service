@@ -1,0 +1,33 @@
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+
+[Unit]
+Description=StorPool beacon service
+After=ntpd.service
+After=chronyd.service
+After=syslog.target
+After=network.target
+After=storpool_hugepages.service
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=storpool_server.service
+WantedBy=storpool_block.service
+WantedBy=storpool_mgmt.service
+
+[Service]
+Type=forking
+PIDFile=/var/run/storpool_beacon.pid
+ExecStart=/usr/sbin/storpool_beacon -d
+ExecStopPost=/bin/rm -f /var/run/storpool_beacon.pid
+StandardInput=null
+StandardOutput=inherit
+StandardError=inherit
+KillMode=process
+Slice=storpool.slice
+BlockIOAccounting=false
+CPUAccounting=false
+MemoryAccounting=false

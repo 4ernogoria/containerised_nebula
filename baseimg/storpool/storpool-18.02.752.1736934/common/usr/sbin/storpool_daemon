@@ -1,0 +1,2138 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2013 - 2018  StorPool.
+# All rights reserved.
+#
+# yum -y install perl-BSD-Resource.x86_64
+
+use 5.010;
+use strict;
+use warnings;
+
+use BSD::Resource qw(setrlimit RLIMIT_CORE RLIMIT_STACK);
+use Fcntl;
+use File::Basename qw(basename dirname);
+use File::Copy qw(copy);
+use File::Path qw(mkpath);
+use Getopt::Std;
+use IO::Handle;
+use List::Util qw(first);
+use POSIX;
+use Socket;
+use Sys::Syslog qw(:standard :macros);
+use Time::HiRes qw(gettimeofday tv_interval);
+
+use lib '/usr/lib/storpool/perl';
+use Net::StorPool::Util qw(detect_libc run_command);
+
+use Cwd qw(abs_path);
+
+sub storpoolSplitPath($);
+sub human2bytes($);
+sub loadModules;
+sub setSprdmaConfig;
+sub sp_chown(@);
+
+my %spconf;
+
+# Parse a configuration variable holding a string.
+#
+# No validation performed.
+#
+sub env_str($; $)
+{
+	my ($var, $def) = @_;
+	my $val = $spconf{$var};
+
+	if( !defined $val)
+	{
+		return $def;
+	}
+	return $val;
+}
+
+# Parse a configuration variable holding an unsigned integer.
+#
+# Check that the value is either exactly '0' or that it starts with
+# a non-zero digit and then has only digits.
+#
+sub env_int($; $)
+{
+	my ($var, $def) = @_;
+	my $val = $spconf{$var};
+
+	if( !defined $val)
+	{
+		return $def;
+	}
+	elsif ($val =~ /^\s*(0|[1-9][0-9]*)\s*$/)
+	{
+		return int $1;
+	}
+	die "Invalid value '$val' for $var: should be a decimal non-negative integer\n";
+}
+
+# Parse a configuration variable holding a base 2, 8, 10 or 16 unsigned integer.
+#
+# Check that the value is either a 0OCT, a 0xHEX, a 0bBIN, or
+# a decimal unsigned integer.
+#
+sub env_oct($; $)
+{
+	my ($var, $def) = @_;
+	my $val = $spconf{$var};
+
+	if( !defined $val)
+	{
+		return $def;
+	}
+	elsif ($val =~ /^\s*0(x[0-9a-f]+|b[01]+|[0-7]+)\s*$/i)
+	{
+		return oct $1;
+	}
+	elsif ($val =~ /^\s*(0|[1-9][0-9]*)\s*$/)
+	{
+		return int $1;
+	}
+	die "Invalid value '$val' for $var: should be a octal, hexadecimal, binary, or decimal integer\n";
+}
+
+# Parse a configuration variable holding a boolean value.
+#
+# Check for one of the common ways to specify a boolean.
+#
+sub env_bool($; $)
+{
+	my ($var, $def) = @_;
+	my $val = $spconf{$var};
+
+	if( !defined $val)
+	{
+		return $def;
+	}
+	elsif ($val =~ /^\s*(0|n|no|f|false)\s*$/i)
+	{
+		return undef;
+	}
+	elsif ($val =~ /^\s*(1|y|yes|t|true)\s*$/i)
+	{
+		return 1;
+	}
+	die "Invalid value '$val' for $var: should be one of 0, 1, y, n, yes, no, t, f, true, or false\n";
+}
+
+my %env_handlers = (
+	str => \&env_str,
+	int => \&env_int,
+	oct => \&env_oct,
+	bool => \&env_bool,
+);
+
+my @storpoolSafePaths = qw(
+	/usr/sbin
+	/usr/lib/storpool
+);
+
+if( -l '/sbin' && (readlink('/sbin') // '') =~ m{^/?usr/sbin/?$} )
+{
+	push @storpoolSafePaths, '/sbin';
+}
+
+my $cfg = {
+	'beacon' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma', 'storpool_pci') || setSprdmaConfig() || runVFGenConf(); },
+		},
+		'params' =>{
+			'SP_OURID'=>'-n SP_OURID',
+			'SP_EXPECTED_NODES'=>'-e SP_EXPECTED_NODES',
+			'SP_WORKDIR'=>'-P SP_WORKDIR',
+			'SP_NODE_NON_VOTING'=>'-N',
+			'SP_DEREGISTER_TIMEOUT_SECONDS'=>'-t SP_DEREGISTER_TIMEOUT_SECONDS',
+			'SP_CLUSTER_ID'=>'-a SP_CLUSTER_ID',
+			'SP_POINT_TO_POINT'=>'--point-to-point',
+			'SP_IGNORE_RX_PORT'=>'--ignore-rx-port',
+		},
+	},
+	'block' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma', 'storpool_bd'); },
+		},
+		'params' =>{
+			'SP_OURID'=>'SP_OURID',
+			'SP_DISK_GROUP' => '-g SP_DISK_GROUP',
+			'SP_DISK_MODE' => '-m SP_DISK_MODE',
+			'SP_WORKDIR'=>'-P SP_WORKDIR',
+			'SP_CLUSTER_ID'=>'-a SP_CLUSTER_ID',
+			'SP_SLEEP_TYPE'=>'-s SP_SLEEP_TYPE',
+		},
+	},
+	'controller' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma'); },
+		},
+		'params' =>{
+			'SP_OURID'=>'-i SP_OURID',
+			'SP_API_HTTP_HOST' => '-A SP_API_HTTP_HOST',
+		},
+	},
+	'bridge' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma'); },
+		},
+		'params' =>{
+			'SP_API_HTTP_HOST_PORT'=>'-M SP_API_HTTP_HOST_PORT',
+			'SP_OURID'=>'-i SP_OURID',
+			'SP_WORKDIR'=>'-P SP_WORKDIR',
+			'SP_CLUSTER_ID'=>'-a SP_CLUSTER_ID',
+			'SP_BRIDGE_HOST_PORT'=>'-L SP_BRIDGE_HOST_PORT',
+			'SP_BRIDGE_TEMPLATE'=>'-T SP_BRIDGE_TEMPLATE',
+		},
+		'env' => {
+			'SP_AUTH_TOKEN' => { type => 'str' },
+			'SP_BRIDGE_HOST' => { type => 'str' },
+			'SP_BRIDGE_IFACE' => { type => 'str' },
+		},
+	},
+	'iscsi' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma'); },
+		},
+		'params' =>{
+			'SP_OURID'=>'SP_OURID',
+			'SP_WORKDIR'=>'-P SP_WORKDIR',
+			'SP_CLUSTER_ID'=>'-a SP_CLUSTER_ID',
+		},
+	},
+	'mgmt' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma'); },
+		},
+		'params' =>{
+			'SP_API_HTTP_HOST_PORT'=>'-L SP_API_HTTP_HOST_PORT',
+			'SP_OURID'=>'-i SP_OURID',
+			'SP_WORKDIR'=>'-P SP_WORKDIR',
+			'SP_MGMT_UPGRADE'=>'-U',
+			'SP_CLUSTER_ID'=>'-a SP_CLUSTER_ID',
+		},
+		'env' => {
+			'SP_API_HTTP_HOST' => { type => 'str' },
+			'SP_API_IFACE' => { type => 'str' },
+			'SP_AUTH_TOKEN' => { type => 'str' },
+		},
+	},
+	'server' =>{
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_rdma', 'storpool_disk') },
+		},
+		'params' =>{
+			'SP_OURID' => '-i SP_OURID',
+			'SP_CACHE_SIZE' => sub {
+				my $global = env_int 'SP_CACHE_SIZE';
+				my $inst = env_int 'SP_INSTANCE_ID', 0;
+				my $val = env_int "SP_CACHE_SIZE_$inst", $global;
+
+				defined $val
+					? ('-C', $val)
+					: ()
+			},
+			'SP_EXCLUDE_DISKS' => sub {
+				my $global = env_str 'SP_EXCLUDE_DISKS';
+				my $inst = env_int 'SP_INSTANCE_ID', 0;
+				my $val = env_str "SP_EXCLUDE_DISKS_$inst", $global;
+
+				defined $val
+					? ('-E', $val)
+					: ()
+			},
+			'SP_WORKDIR'=>'-P SP_WORKDIR',
+			'SP_WRITE_BACK_CACHE_ENABLED'=>'-c',
+			'SP_INSTANCE_ID' => '-I SP_INSTANCE_ID',
+			'SP_CLUSTER_ID'=>'-a SP_CLUSTER_ID',
+			'SP_SLEEP_TYPE'=>'-s SP_SLEEP_TYPE',
+			'SP_NVME_PCI_ID' => sub { defined (env_str 'SP_NVME_PCI_ID') ? '-n' : () },
+			'SP_REMOTE_RECOVERY_PARALLEL_REQUESTS_PER_DISK' => '-B SP_REMOTE_RECOVERY_PARALLEL_REQUESTS_PER_DISK',
+			'SP_NORMAL_RECOVERY_PARALLEL_REQUESTS_PER_DISK' => '-r SP_NORMAL_RECOVERY_PARALLEL_REQUESTS_PER_DISK',
+		},
+	},
+	'nvmed' => {
+		'load' =>{
+			'modules' => sub { return loadModules('storpool_pci') },
+		},
+	},
+	'stat' => {
+	},
+};
+
+sub env_set_values($) {
+	my ($type) = @_;
+
+	my $env = $cfg->{$type}->{env} // {};
+	foreach my $k (keys %{$env}) {
+		my ($type, $def) = @{$env->{$k}}{'type', 'default'};
+
+		$ENV{$k} = $env_handlers{$type}($k, $def);
+	}
+}
+
+my %re_match = ();
+
+
+my $daemon = 0;
+my $mywork = 1;
+my ($myPath, $myName, $myType, $instanceId) = storpoolSplitPath($0);
+my $binName = "storpool_".$myType.".bin";
+my @args = ("$myPath/$binName");
+my $pidFileDir = "/var/run";
+my $myReportDir;
+my $running = 0;
+my $gcore = 0;
+my @launchTimes;
+my @childErrors;
+
+
+
+sub confget()
+{
+	undef %spconf;
+	my @a = `storpool_confget`;
+	foreach my $env (@a)
+	{
+		$env =~ s/[\r\n]*$//;
+		my ($k,$v) = split("=", $env, 2);
+		$spconf{$k} = $v;
+	}
+	
+	foreach my $eKey (keys %spconf)
+	{
+		if( $eKey =~ /^SP_CPUS_(.+)_IRQ$/ )
+		{
+			if( defined $spconf{'SP_CPUS_'.$1.'_REGEX'} )
+			{
+				$re_match{lc($1)} = qr/^\s*(\d+)\:.+\s(?:$spconf{'SP_CPUS_'.$1.'_REGEX'})/;
+			}
+		}
+	}
+	foreach my $eKey (keys %re_match)
+	{
+		unless( defined $spconf{'SP_CPUS_'.uc($eKey).'_REGEX'} )
+		{
+			delete $re_match{$eKey};
+		}
+	}
+	
+	$spconf{'SP_API_HTTP_HOST_PORT'} = $spconf{'SP_API_HTTP_HOST'}.':'.$spconf{'SP_API_HTTP_PORT'};
+	$spconf{'SP_INSTANCE_ID'} = $instanceId unless $instanceId eq '';
+	if( defined $spconf{'SP_BRIDGE_HOST'} )
+	{
+		$spconf{'SP_BRIDGE_HOST_PORT'} = $spconf{'SP_BRIDGE_HOST'};
+		$spconf{'SP_BRIDGE_HOST_PORT'} .= ':'.$spconf{'SP_BRIDGE_PORT'} if ($spconf{'SP_BRIDGE_PORT'});
+	}
+}
+
+
+sub logAndOutput($ $)
+{
+	my ($msg, $fatal) = @_;
+
+	$msg =~ s/[\r\n]*$//;
+	my $safe = $msg;
+	$safe =~ s/[\r\n]+/_/g;
+
+	if( $fatal )
+	{
+		syslog(LOG_CRIT, 'Fatal: %s', $safe);
+		print STDERR "Fatal: $msg\n";
+		exit(2);
+	}
+	else
+	{
+		syslog(LOG_WARNING, 'Warning: %s', $safe);
+		print STDERR "$msg\n";
+	}
+}
+
+sub openSyslog()
+{
+	openlog($myName."-loader", 'ndelay,pid', 'daemon') or
+		die("openlog failed: $!\n");
+	$SIG{'__WARN__'} = sub { logAndOutput($_[0], 0); };
+	$SIG{'__DIE__'} = sub { logAndOutput($_[0], 1); };
+}
+
+sub closeSyslog()
+{
+	closelog() or
+		die("closelog() failed: $!\n");
+	$SIG{__WARN__} = $SIG{__DIE__} = 'DEFAULT';
+}
+
+sub storeChildMessage($ $)
+{
+	my ($data, $msg) = @_;
+
+	my @t = gettimeofday;
+	push @{$data}, { ts => \@t, message => $msg };
+	while( @{$data} > 50 && tv_interval($data->[0]{ts}, \@t) > 10 ) {
+		shift @{$data};
+	}
+}
+
+openSyslog();
+
+my $pid;		# NB: we WANT this to be undefined, not zero!
+my $pidLastSig;	# Same here.
+
+my ($workDir, $reportDir, $binDump, $spReportsFreeSpaceLimit,
+	$spDeveloperMode, $spShmDumpBlock, $spRestartOnCrash,
+	$spCrashUser, $spDaemonUmask, $spUseCGroups, $spCGroupsRDMA,
+	$spCPUDMALatency,
+	$binPidFile, $myPidFile, $spaceLimit);
+my $dumpShm;	# For testing porpoises only, no dolphins need apply!
+
+sub reconfigure()
+{
+	while( 1 )
+	{
+		eval {
+			local $SIG{__DIE__}; # Argh.
+			confget();
+			die "SP_OURID not defined in the StorPool configuration; is our hostname set up properly?\n"
+				unless defined env_int 'SP_OURID';
+		};
+		my $msg = $@;
+		last unless defined $msg && $msg ne '';
+
+		$msg =~ s/[\r\n]+$//;
+		$msg =~ s/[\r\n]+/_/g;
+		warn "Waiting for 5 seconds because the StorPool configuration could not be parsed: $msg\n";
+		sleep 5;
+	}
+
+	$workDir = env_str 'SP_WORKDIR', '/var/run/storpool';
+	$reportDir = env_str 'SP_REPORTDIR', '/var/spool/storpool';
+	$binDump = env_str 'SP_DUMPBIN', '/usr/sbin/storpool_dump';
+	$spReportsFreeSpaceLimit = env_str 'SP_REPORTS_FREE_SPACE_LIMIT';
+	$spDeveloperMode = env_bool 'SP_DEVELOPER_MODE';
+	$spShmDumpBlock = env_bool 'SP_SHM_DUMP_BLOCK';
+	$spRestartOnCrash = env_int 'SP_RESTART_ON_CRASH', 60;
+	$spCrashUser = env_str 'SP_CRASH_USER', '';
+	$spDaemonUmask = env_oct 'SP_DAEMON_UMASK', 0007;
+	$spUseCGroups = env_bool 'SP_USE_CGROUPS';
+	$spCGroupsRDMA = env_str 'SP_RDMA_CGROUPS', '';
+	$spCPUDMALatency = env_int 'SP_CPU_DMA_LATENCY';
+	$dumpShm = env_bool 'SP_DO_DUMP_SHM';
+
+	$binPidFile = $pidFileDir."/".$myName.".bin.pid";
+	$myPidFile = $pidFileDir."/".$myName.".pid";
+	$spaceLimit = human2bytes($spReportsFreeSpaceLimit);
+}
+
+reconfigure();
+
+sub storpoolSplitPath($)
+{
+	my ($path) = @_;
+
+	my ($basedir, $fname) = (dirname($path), basename($path));
+
+	die("Invalid or unsafe storpool_daemon invocation path $path\n")
+		unless defined first {
+			$basedir eq $_ || $basedir =~ m{^ \Q$_\E / }x
+		} @storpoolSafePaths;
+
+	die "Invalid StorPool service name '$fname', does not start with 'storpool_'\n"
+		unless $fname =~ /^
+			storpool_
+			(?<type>
+				[a-z][^_]+
+			)
+			(?:
+				_
+				(?<instance>
+					[0-9]+
+				)
+			)?
+			$/x;
+	my ($type, $instanceId) = ($+{type}, $+{instance} // '');
+	die "Invalid StorPool service name '$fname', ends with '.bin'\n"
+		if $type =~ / \.bin $/x;
+
+	return ($basedir, $fname, $type, $instanceId);
+}
+
+sub loadModules
+{
+	my $ret = 0;
+	foreach my $mod (@_)
+	{
+		my $found = 0;
+		if( open(my $fd, '/proc/modules') )
+		{
+			my @live = <$fd>;
+			close($fd);
+			foreach my $m (@live)
+			{
+				chomp $m;
+				if ($m =~ m/^ \Q $mod \E \s /x )
+				{
+					$found = 1;
+					syslog(LOG_DEBUG,"already loaded %s", $m);
+					last;
+				}
+			}
+		}
+		
+		if( ! $found )
+		{
+			my @sys = ("modprobe", '-q', $mod);
+			system( @sys );
+			my $sret = $?;
+			if( $sret != 0)
+			{
+				die("Can't modprobe $mod! ($sret)\n");
+			}
+			syslog(LOG_INFO,"modprobe %s", $mod);
+		}
+	}
+	return $ret;
+}
+
+sub setSprdmaConfig
+{
+	if( open( my $f, '>', "/sys/class/storpool_rdma/storpool_rdma/state/net0/config" ) )
+	{
+		print $f $spconf{'SP_IFACE1_CFG'};
+		close $f;
+	}
+	else
+	{
+		return 1;
+	}
+	
+	if( open( my $f, '>', "/sys/class/storpool_rdma/storpool_rdma/state/net1/config" ) )
+	{
+		print $f $spconf{'SP_IFACE2_CFG'};
+		close $f;
+	}
+	else
+	{
+		return 1;
+	}
+	
+	return 0;
+}
+
+sub runVFGenConf
+{
+	my @cmd = ('/usr/lib/storpool/vf-genconf', '--apply=all');
+	if( open( my $f, '-|', @cmd) )
+	{
+		my $contents;
+		{
+			local $/;
+			$contents = <$f>;
+		}
+		my $status = close $f;
+		if( $status != 0 )
+		{
+			warn "'@cmd' exited with status $status\n".
+				 "$contents\n";
+		}
+	}
+	else
+	{
+		warn "Could not run '@cmd': $!\n";
+	}
+	return 0;
+}
+
+sub preload($)
+{
+	my ($service) = @_;
+	if( exists $cfg->{$service} )
+	{
+		foreach my $func (keys %{$cfg->{$service}->{'load'}})
+		{
+			syslog(LOG_DEBUG,"preload($service): calling $func");
+			my $ret = $cfg->{$service}->{'load'}->{$func}->();
+			die("Error calling $func ($ret)\n") if $ret;
+		}
+	}
+	else
+	{	
+		die("unknown service '$service'\n");
+	}
+}
+
+sub rebindNvme($)
+{
+	my ($service) = @_;
+	
+	if( $service eq "nvmed" )
+	{
+		my $pciIds = env_str 'SP_NVME_PCI_ID', '';
+		
+		foreach my $pciId (split(/\s+/, $pciIds))
+		{
+			next unless $pciId ne '';
+			
+			my $devicePath = "/sys/bus/pci/devices/$pciId";
+			my $driverPath = "$devicePath/driver";
+			my $driverCorrect;
+			my $targetDriver = "storpool_pci";
+			
+			if( ! -e $devicePath )
+			{
+				syslog( LOG_ERR, "Device $pciId not found; please check the value of SP_NVME_PCI_ID! Continuing without this device" );
+				next;
+			}
+			
+			if( -e $driverPath )
+			{
+				my $driverName = basename( abs_path($driverPath) );
+				if( $driverName eq $targetDriver )
+				{
+					$driverCorrect = 1;
+				}
+				else
+				{
+					if( grep { $_ eq $driverName } ("nvme", "uio_pci_generic", "pci-stub") )
+					{
+						if( open my $unb, ">$driverPath/unbind" )
+						{
+							print $unb "$pciId\n";
+							close $unb;
+						}
+					}
+					else
+					{
+						syslog( LOG_ERR, "Device $pciId is bound by driver '$driverName', and that does not look like nvme. please check the value of SP_NVME_PCI_ID! Continuing without this device" );
+						next;
+					}
+				}
+			}
+			
+			if( ! $driverCorrect )
+			{
+				if( open my $bind, ">/sys/bus/pci/drivers/$targetDriver/bind")
+				{
+					print $bind "$pciId\n";
+					close $bind;
+				}
+			}
+		}
+	}
+}
+
+sub params($)
+{
+	my ($service) = @_;
+	my @ret = ();
+	if( exists($cfg->{$service}) )
+	{
+		while ( my ($param,$value) =  each %{$cfg->{$service}->{'params'}} )
+		{
+#			syslog(LOG_DEBUG,"params($service):$param");
+			
+			if( ref($value) eq 'CODE')
+			{
+				push @ret, $value->();
+				next;
+			}
+
+			my @words = split ' ', $value;
+			if( $param =~ /^SP/ )
+			{
+				if( index( $value, $param ) != -1 )
+				{
+					my $v = env_str $param;
+					next unless defined $v;
+					for my $word (@words)
+					{
+						if( $word eq $param ) {
+							push @ret, $v;
+						} else {
+							push @ret, $word;
+						}
+					}
+				}
+				elsif( env_bool $param )
+				{
+					push @ret, @words;
+				}
+			}
+			else
+			{
+				push @ret, @words;
+			}
+		}
+	}
+	else
+	{
+		die("unknown service '$service'\n");
+	}
+	return @ret;
+}
+
+sub human2bytes($)
+{
+	my ($human) = @_;
+	my %h = (
+		''  => 1,
+		'k' => 1024,
+		'm' => 1024*1024,
+		'g' => 1024*1024*1024,
+		't' => 1024*1024*1024*1024,
+		'p' => 1024*1024*1024*1024*1024,
+		);
+	if( $human =~ m/^([\d.]+)(.*)$/ )
+	{
+		my ($ret,$m) = ($1,lc($2));
+		if( exists $h{$m})
+		{
+			return $ret * $h{$m};
+		}
+	}
+	
+	die("Can't convert $human to bytes\n");
+}
+
+sub mega2bytes($)
+{
+	return human2bytes($_[0].'m');
+}
+
+sub getFreeSpace($)
+{
+	my ($rDir) = @_;
+	
+	if( open(my $f, '-|', 'df', '-m', $rDir) )
+	{
+		my $df;
+		while (<$f>) { $df = $_; } # get last row
+		close $f;
+		
+		my @df = split /\s+/,$df;
+		return mega2bytes($df[3]) if exists $df[3];
+	}
+	
+	die("Can't exec 'df $rDir'\n");
+}
+
+
+sub getCore($$)
+{
+	my ($pid, $workDir) = @_;
+	my $core = undef;
+	my $dh;
+	
+	syslog(LOG_INFO, "searching for core in $workDir");
+	
+	if( opendir($dh, "$workDir") )
+	{
+		my $file;
+		while( $file = readdir($dh) )
+		{
+			if( $file =~ /[\.\-\_]?$pid([\.\-\_]|$)/ )
+			{
+				syslog(LOG_INFO, "found $workDir/$file");
+				$core = $workDir."/".$file;
+				last;
+			}
+		}
+		closedir($dh);
+	}
+	
+	if ( !defined $core ) { syslog(LOG_INFO,"core not found"); }
+	
+	return $core;
+}
+
+sub gCore($$)
+{
+	my ($pid, $workDir) = @_;
+	my $coreFile = $workDir."/core";
+	
+	my @cmd = ('gcore', '-o', $coreFile, $pid);
+	system(@cmd);
+	my $sret = $?;
+	$coreFile .= ".$pid";
+	my $msg = "Core($coreFile) ($sret)";
+	syslog(LOG_DEBUG,"%s", $msg);
+	print "$msg\n";
+	return $coreFile;
+}
+
+my @sp_chown_user;
+my $sp_chown_user_warned = 0;
+
+sub sp_chown(@)
+{
+	my (@files) = @_;
+	
+	chmod 0660, @files;
+	
+	return unless defined($spCrashUser) && $spCrashUser ne '';
+	
+	if ( !@sp_chown_user )
+	{
+		@sp_chown_user = getpwnam($spCrashUser);
+		if ( !@sp_chown_user )
+		{
+			if ( !$sp_chown_user_warned )
+			{
+				$sp_chown_user_warned = 1;
+				syslog(LOG_NOTICE, "unknown username '$spCrashUser' to chown reports to!");
+			}
+			return;
+		}
+	}
+
+	for my $file ( @files )
+	{
+		if ( ! chown($sp_chown_user[2], -1, $file) )
+		{
+			syslog(LOG_NOTICE, "failed to chown '$file' to '$spCrashUser': $!");
+		}
+	}
+}
+
+sub getShm($$$)
+{
+	my ($pid,$type,$instanceId) = @_;
+	if( !$type )
+	{
+		syslog(LOG_CRIT,"missing dump type! using default.");
+		$type = 'server';
+	}
+	$type = $type."_".$instanceId if ($instanceId);
+	
+	my $shmFile = "$reportDir/shm-".$type.".".$pid;
+	
+	if( -f $binDump and -x $binDump )
+	{
+		syslog(LOG_INFO, "dumping $type to shmFile:$shmFile");
+		my @cmd = ($binDump, "-w", $shmFile, $type);
+		system( @cmd );
+		my $sret = $?;
+		syslog(LOG_INFO, "system(@cmd) ret:%d", $sret>>8);
+		if( $sret == -1 )
+		{
+			syslog(LOG_CRIT, "failed to generate '$shmFile'($sret)");
+		}
+		if( -f $shmFile )
+		{
+			sp_chown( $shmFile );
+			syslog(LOG_INFO, "adding local $shmFile");
+			return $shmFile;
+		}
+	}
+	else
+	{
+		syslog(LOG_ERR, "$binDump not found!");
+	}
+	return undef;
+}
+
+sub getBin($ $)
+{
+	my ($path, $binName) = @_;
+	my $fname = "$path/$binName";
+	
+	if ( -f $fname && -x $fname )
+	{
+		syslog(LOG_INFO, "found $fname");
+		return $fname;
+	}
+	syslog(LOG_INFO, "$fname not found!");
+	
+	return undef;
+}
+
+sub getPid($)
+{
+	my ($pidFile) = @_;
+	
+	if( open(my $fh, $pidFile) )
+	{
+		my (@p) = <$fh>;
+		close $fh;
+		if( $p[0] =~ m/^(\d+)/ )
+		{
+			my $pid = $1;
+			print "getPid($pidFile): $pid\n";
+			return $pid;
+		}
+	}
+	return undef;
+}
+
+sub getUname()
+{
+	my @arr = POSIX::uname();
+	my $file = (defined($myReportDir)? $myReportDir: $reportDir).'/uname-a';
+	if( open(my $fd, ">$file") )
+	{
+		print $fd join(" ", @arr);
+		close($fd);
+	}
+	else
+	{
+		syslog(LOG_ERR,"getUname(): Can't open $file for writing!");
+		$file = undef;
+	}
+	return $file;
+}
+
+sub removeMyReportDir()
+{
+	system( 'rm', '-rf', '--', $myReportDir ) if
+		defined($myReportDir) && -d $myReportDir;
+}
+
+my $keepReportDir = 0;
+
+sub report($$$;$)
+{
+	$keepReportDir = 1;
+
+	use Sys::Hostname;
+	my ($binPath, $binName, $workDir, $coreInfo) = @_;
+	my $msg;
+	my @shmFiles = ();
+	
+	# Determine the names of the interim and the final report tarballs
+	if( $binName !~ /storpool_(\w+)\.?/ )
+	{
+		die "Internal error: we should not be in report() with binName '$binName'\n";
+	}
+	my $fname = "report-$1-";
+	if( hostname =~ /^([a-z0-9\-]+)/i )
+	{
+		$fname .= "$1-";
+	}
+	$fname .= strftime('%Y%m%d-%H%M%S',gmtime())."-$pid.tgz";
+	my $tempFile = "$reportDir/building-$fname";
+	my $tarFile = "$reportDir/$fname";
+	
+	syslog(LOG_INFO, "report($binPath, $binName, $workDir, ".
+		(defined($coreInfo)? "(pidfile: $coreInfo->{pidfile})": "(no offline coreInfo)"));
+	
+	if( $gcore )
+	{
+		if( !defined($coreInfo) ) {
+			die("Internal error: report(): gcore but no coreInfo\n");
+		}
+		$pid = checkPidFile($coreInfo->{pidfile});
+		if( ! $pid )
+		{
+			die("Can't find pid from $coreInfo->{pidfile}\n");
+		}
+
+		if( !defined($myReportDir) )
+		{
+			$myReportDir = "$reportDir/$myName.$pid";
+		}
+		else
+		{
+			die("Internal error: report(): gcore and myReportDir\n");
+		}
+	}
+	my @tarFiles = ();
+	
+	my $core;
+	if( $gcore )
+	{
+		$core = gCore($pid, $workDir);
+	}
+	else
+	{
+		$core = getCore($pid, $workDir);
+		if( $spaceLimit )
+		{
+			my $spaceFree = getFreeSpace($reportDir);
+			if( $spaceFree < $spaceLimit )
+			{
+				syslog(LOG_WARNING,"$reportDir space < $spReportsFreeSpaceLimit. Skipping report generation!");
+				if ($core)
+				{
+					syslog(LOG_DEBUG,"deleting core file $core");
+					unlink $core;
+				}
+				return 0;
+			}
+		}
+	}
+	
+	push @tarFiles, $core if $core;
+
+	if( defined $myReportDir && -d $myReportDir )
+	{
+		push @tarFiles, $myReportDir;
+	
+		if( @childErrors)
+		{
+			my $fname = "$myReportDir/last-errors.txt";
+			my $err;
+			if( open $err, '>', $fname )
+			{
+				for my $m (@childErrors)
+				{
+					printf $err "%s.%06d  %s\n",
+						strftime('%b %d %H:%M:%S', localtime $m->{ts}[0]),
+						$m->{ts}[1], $m->{message};
+				}
+				close $err;
+			}
+			else
+			{
+				syslog(LOG_ERR, "Could not open $fname for writing: $!\n");
+			}
+		}
+	}
+		
+	my $shm = getShm($pid, $myType, $instanceId);
+	if( $shm )
+	{
+		push @tarFiles, $shm;
+		push @shmFiles, $shm;
+		
+		if( $myType !~ /server/ )
+		{
+			$shm = getShm($pid, 'server', 0);
+			if( $shm )
+			{
+				push @tarFiles, $shm;
+				push @shmFiles, $shm;
+			}
+		}
+		if( $spShmDumpBlock && $myType !~ /block/ )
+		{
+			$shm = getShm($pid, 'block', 0);
+			if( $shm )
+			{
+				push @tarFiles, $shm;
+				push @shmFiles, $shm;
+			}
+		}
+	}
+	
+	if( $spDeveloperMode && ! $gcore )
+	{
+		syslog(LOG_INFO, "developer mode enabled. Skipping report generation.", $msg);
+		return;
+	}
+
+	my $forkedOff = 0;
+	if( !$gcore )
+	{
+		my $pid = fork();
+		if( !defined($pid) )
+		{
+			die("Could not fork for the report generation: $!\n");
+		}
+		elsif( $pid == 0 )
+		{
+			$forkedOff = 1;
+			if( $spUseCGroups )
+			{
+				my @cmd = ('cgclassify', '-g', 'cpuset:system.slice', '-g', 'memory:system.slice', $$);
+				my $res = system { $cmd[0] } @cmd;
+				if( $res != 0 )
+				{
+					warn "Could not @cmd\n";
+				}
+			}
+		}
+		else
+		{
+			syslog(LOG_INFO, "Spawned process $pid to collect the report");
+			return;
+		}
+	}
+
+	my $tmp = getUname();
+	if( $tmp )
+	{
+		push @tarFiles, $tmp;
+		push @shmFiles, $tmp;
+	}
+	
+	syslog(LOG_INFO, 'Generating %s', $tempFile);
+	system("tar", "czphf", $tempFile, @tarFiles);
+	my $sret = $?;
+	if( $sret == -1 )
+	{
+		$msg = sprintf("failed to generate '$tempFile' ret:%d", $sret>>8);
+		if( $gcore )
+		{
+			die("$msg\n");
+		}
+		else
+		{
+			syslog(LOG_CRIT, "%s", $msg);
+		}
+	}
+	elsif( $sret>>8 == 0 )
+	{
+		if( -s $tempFile )
+		{
+			foreach $shm (@shmFiles)
+			{
+				unlink $shm if (-e $shm);
+			}
+			unlink $core if $core;
+
+			sp_chown( $tempFile );
+			rename $tempFile, $tarFile;
+
+			$msg = sprintf("(%d) created $tarFile", $sret>>8);
+			print "$msg\n" if $gcore;
+			syslog(LOG_INFO, "$msg");
+
+			removeMyReportDir();
+		}
+		else
+		{
+			$msg = sprintf("(%d) empty file $tempFile", $sret>>8);
+			print "$msg\n" if $gcore;
+			syslog(LOG_CRIT, "$msg");
+		}
+	}
+	else
+	{
+		$msg = sprintf("(%d) tar error $sret while generating $tempFile", $sret>>8);
+		print "$msg\n" if $gcore;
+		syslog(LOG_CRIT, "$msg");
+	}
+
+	if( $forkedOff )
+	{
+		exit( $sret >> 8 );
+	}
+	else
+	{
+		return $sret>>8;
+	}
+}
+
+sub updateCgroupFile($$)
+{
+	my ($fName, $val) = @_;
+	my $update = 1;
+	if ( open(my $f, '<', $fName) )
+	{
+		my @buf = <$f>;
+		close $f;
+		foreach my $l (@buf)
+		{
+			chomp $l;
+			if( $l eq $val )
+			{
+				$update = 0;
+				last;
+			}
+		}
+		undef @buf;
+	}
+	else
+	{
+		syslog(LOG_ERR,"updateCgroupFile($fName, $val): Can't open file for reading!($!)");
+		return;
+	}
+	
+#	syslog(LOG_DEBUG,"updateCgroupFile($fName, $val): %s",($update)?"UPDATE":"SKIP");
+	return unless $update;
+	
+	if ( open(my $f, '>>', $fName) )
+	{
+		print $f "$val\n" or syslog(LOG_ERR,"updateCgroupFile($fName, $val): Write failed!($!)");
+		close $f;
+	}
+	else
+	{
+		syslog(LOG_ERR,"updateCgroupFile($fName, $val): Can't open file for writing!($!)");
+		return;
+	}
+}
+
+sub setAffinityProc($$)
+{
+	my ($cpus, $pid) = @_;
+	
+    die "Internal error: setAffinityProc() should not be invoked with cgroups\n"
+        if $spUseCGroups;
+
+	if( open( my $f, '-|', 'taskset', '-c', '-p', $cpus, $pid) )
+	{
+		while ( my $l = <$f> ) { }
+		close $f;
+	}
+	else
+	{
+		syslog(LOG_ERR,"setAffinityProc('$cpus',$pid): Can't execute taskset!($!)");
+	}
+}
+
+sub setAffinityProcCGroup($$)
+{
+	my ($cgroup, $pid) = @_;
+	my @cmd = ('cgclassify', split(/\s+/, $cgroup), $pid);
+
+	if( open( my $f, '-|', @cmd ) )
+	{
+		while( my $l = <$f> ) { }
+		close $f;
+	}
+	else
+	{
+		syslog(LOG_ERR,"setAffinityProcCGroup('$cgroup',$pid): Can't execute '@cmd': $!");
+	}
+}
+
+sub setAffinityIRQ($$)
+{
+	my ($cpus, $irq) = @_;
+	
+	if( open( my $f, '>', "/proc/irq/$irq/smp_affinity_list" ) )
+	{
+		print $f $cpus;
+		close $f;
+	}
+	else
+	{
+		syslog(LOG_ERR,"setAffinityIRQ('$cpus', $irq): Can't open IRQ affinity file!($!)");
+	}
+}
+
+sub setAffinity($)
+{
+	my ($mode) = @_;
+	
+	my %config = ();
+	
+	return unless defined $spconf{'SP_CPUS_ALL'} || $spUseCGroups;
+	
+	foreach my $eKey (keys %spconf)
+	{
+		if( $eKey =~ /^SP_(CPUS_[0-9A-Z_]+)/ )
+		{
+			$config{lc($1)} = $spconf{$eKey};
+		}
+	}
+	# Fake it...
+	$config{'cpus_rdma'} = 1 if $spUseCGroups;
+	
+	#################################################################################
+	my %tasks = ();
+	my $skipProc = 0;
+	my $skipIRQ = 0;
+	
+	if( open my $ps, "-|", 'ps --no-headers -eL -o tid,cmd' )
+	{
+		while (my $l = <$ps>)
+		{
+			chomp $l;
+			my ($pid,$cmd) = ( $l =~ m/^\s*(\d+)\s+(.+)$/ );
+			next unless defined $pid;
+			
+			if ( $cmd =~ /^\/usr\/sbin\/storpool_([a-z]+)/ )
+			{
+				push @{$tasks{$1}}, $pid if defined $config{'cpus_'.$1};
+			}
+			elsif ( $cmd =~ /^\[sprdma ( DataSend | Rx | FlushFmr | NetThread ) \]$/x )
+			{
+				push @{$tasks{'rdma'}}, $pid if defined $config{'cpus_rdma'};
+			}
+			elsif ( $cmd !~ m/^\[/ )
+			{
+				push @{$tasks{'other'}}, $pid;
+			}
+		}
+		close $ps;
+	}
+	else
+	{
+		syslog(LOG_ERR,"setAffinity(): Can't execute ps! skipping proc");
+		$skipProc = 1;
+	}
+	
+	################################################################################
+
+	my %irqs = ();
+	{
+		if( open my $f, '<', '/proc/interrupts' )
+		{
+			my @a = <$f>;
+			close $f;
+			chomp for @a;
+			foreach my $irqName (keys %re_match)
+			{
+				@{$irqs{$irqName}} = map { if (/$re_match{$irqName}/) { int($1) } else { () } } @a;
+			}
+		}
+		else
+		{
+			syslog(LOG_ERR,"setAffinity($mode): Can't open /proc/interrupts!($!)");
+			$skipIRQ = 1;
+		}
+	}
+	
+	unless( $skipProc )
+	{
+		foreach my $key (keys %tasks)
+		{
+			if( $spUseCGroups )
+			{
+				next unless $key eq 'rdma';
+				syslog(LOG_INFO,"setAffinityProcCGroup cpus_%s cgroups:%s pid:%s", $key, $spCGroupsRDMA, join(',',@{$tasks{$key}})) if @{$tasks{$key}};
+				setAffinityProcCGroup( $spCGroupsRDMA, $_ ) for @{$tasks{$key}};
+			}
+			else
+			{
+				syslog(LOG_INFO,"setAffinityProc cpus_%s cpu:%s pid:%s", $key, $config{'cpus_'.$key}, join(',',@{$tasks{$key}})) if @{$tasks{$key}};
+				setAffinityProc( $config{'cpus_'.$key}, $_ ) for @{$tasks{$key}};
+			}
+		}
+	}
+	
+	unless( $skipIRQ )
+	{
+		foreach my $key (keys %irqs)
+		{
+			syslog(LOG_INFO,"setAffinityIRQ %s cpu:%s irq:%s", $key, $config{'cpus_'.$key.'_irq'}, join(',',@{$irqs{$key}})) if @{$irqs{$key}};
+			setAffinityIRQ( $config{'cpus_'.$key.'_irq'}, $_ ) for @{$irqs{$key}};
+		}
+	}
+}
+
+sub mkDirs
+{
+	for my $dir (@_)
+	{
+		unless( -d $dir )
+		{
+			unless( mkpath($dir, 0, 0755) )
+			{
+				die("Can't create $dir!\n");
+			}
+			syslog(LOG_INFO,"created $dir");
+		}
+	}
+}
+
+
+#
+# check if process with pid from pidfile exists
+# return pid if the process exists else 0
+#
+sub checkPidFile($)
+{
+	my ($pFile) = @_;
+	my $ret = 0;
+	if( open(F, $pFile) )
+	{
+		$ret = <F>;
+		close(F);
+		$ret =~ s/[^0-9]//g;
+		$ret = 0 unless $ret != $$ && kill 0, $ret;
+	}
+	return $ret;
+}
+
+sub daemonize($$)
+{
+	my ($workDir, $pidFile) = @_;
+	POSIX::setsid or die "setsid: $!";
+	
+	my $p = fork ();
+	if( ! defined $p )
+	{
+	   die "fork: $!";
+	}
+	elsif( $p )
+	{
+	   exit 0;
+	}
+	chdir "$workDir";
+	umask $spDaemonUmask;
+
+	# OK, so there's still a chance for buggy behavior if the loader is
+	# started with closed file descriptor 0, 1, or 2.  Let's hope that
+	# this won't happen too often, because the workaround is kind of ugly.
+	# (It *should* not ever happen in normal operation.)
+	#
+	closeSyslog();
+	foreach (3 .. (POSIX::sysconf (&POSIX::_SC_OPEN_MAX) || 1024))
+	{
+		POSIX::close $_;
+	}
+	openSyslog();
+
+	foreach (0 .. 2)
+	{
+		POSIX::close $_;
+	}
+	open( STDIN, "</dev/null");
+	open( STDOUT, ">/dev/null");
+	open( STDERR, ">&STDOUT");
+	if( open(F, ">$pidFile") )
+	{
+		print F "$$\n";
+		close(F);
+	}
+	else
+	{
+		die "Can't open '$pidFile' ($!)\n";
+	}
+}
+
+sub shell_escape($)
+{
+	my ($value) = @_;
+	$value =~ s/('+)/'"$1"'/g;
+	return "'$value'";
+}
+
+sub getSystemIPAddresses()
+{
+	open(my $f, '-|', 'ip', 'address', 'list') or
+		die "Could not execute 'ip address list': $!\n";
+	my %res;
+	my $iface;
+	while( <$f> )
+	{
+		if( /^
+			(?: [1-9][0-9]* )
+			: \s+
+			(?<iface> [^\s\@:]+ )
+			(?: # optional VLAN parent interface
+				@ (?: [^\s\@:]+ )
+			) ?
+			:
+			/x )
+		{
+			$iface = $+{iface};
+		}
+		elsif( /^
+			\s+ inet \s+
+			(?<address>
+				(?: 0 | [1-9][0-9]* )
+				(?:
+					\.
+					(?: 0 | [1-9][0-9]* )
+				){3}
+			)
+			\/
+			(?: 0 | [1-9][0-9]* )
+			/x )
+		{
+			my $address = $+{address};
+			if( !defined $iface )
+			{
+				die "Could not parse the output of 'ip address list': an IP address ($address) before any interface definition\n";
+			}
+			$res{$address} = {
+				address => $address,
+				interface => $iface,
+			};
+		}
+	}
+	close $f or die "The 'ip address list' command failed\n";
+
+	return %res;
+}
+
+sub iSCSIBringDownFloatingAddresses()
+{
+	my $dirname = "$workDir/iscsi/discovery";
+	opendir my $d, $dirname or
+		die "Could not open the iSCSI discovery directory $dirname: $!\n";
+	my @names = grep /^
+		(?: 0 | [1-9][0-9]* )
+		(?:
+			\.
+			(?: 0 | [1-9][0-9]* )
+		){3}
+		$/x, readdir $d;
+	closedir $d;
+
+	if( !@names )
+	{
+		syslog(LOG_INFO, 'No floating IP addresses to bring down');
+		return;
+	}
+	else
+	{
+		syslog(LOG_NOTICE, "About to bring down ".scalar(@names)." floating IP addresses: ".join(', ', @names));
+	}
+
+	my %addr2iface = getSystemIPAddresses;
+	my $errors = 0;
+	for my $name (@names)
+	{
+		my $def = $addr2iface{$name};
+		if( !defined $def )
+		{
+			syslog(LOG_INFO, "The $name floating IP address is not even up");
+		}
+		else
+		{
+			syslog(LOG_INFO, "Bringing down the $name floating IP address");
+			my @cmd = ('env', "SP_API_HTTP_HOST=$name", "SP_API_IFACE=$def->{interface}", '/etc/storpool/api-ip', 'down');
+			my $res = system { $cmd[0] } @cmd;
+			if( $res != 0 )
+			{
+				syslog(LOG_ERR, "Could not bring down the $name floating IP address: '/etc/storpool/api-ip down' failed");
+				$errors++;
+			}
+		}
+
+		my $target = readlink "$dirname/$name";
+		if( defined $target && $target ne '0' )
+		{
+			my %data = map { my ($var, $val) = split /=/, $_, 2; $var => $val } split /;/, $target;
+			if( defined $data{arping} && $data{arping} =~ m{^ [1-9] [0-9]* $}x)
+			{
+				my $pid = $data{arping};
+				my $commname = "/proc/$pid/comm";
+
+				my $is_arping = sub {
+					open my $f, '<', $commname or return 0;
+					my $line = <$f>;
+					close $f;
+					return 0 unless defined $line;
+					chomp $line;
+					$line =~ s{^ .* / }{}x;
+					return $line eq 'arping';
+				};
+
+				if( $is_arping->() )
+				{
+					syslog(LOG_INFO, "Stopping the $pid arping process");
+					kill 'KILL', $pid;
+				}
+			}
+		}
+
+		if( !unlink "$dirname/$name" )
+		{
+			syslog(LOG_ERR, "Could not remove the '$dirname/$name' marker file: $!");
+			$errors++;
+		}
+	}
+
+	if( $errors )
+	{
+		die "Errors encountered while bringing down the floating IP addresses\n" if $errors;
+	}
+	else
+	{
+		syslog(LOG_NOTICE, "Successfully brought down ".scalar(@names)." floating IP addresses: ".join(', ', @names));
+	}
+}
+
+sub sigPrint
+{
+	my ($signal) = @_;
+	syslog(LOG_INFO, "got signal:$signal\n");
+}
+
+### kill -l
+# 1) SIGHUP       2) SIGINT       3) SIGQUIT      4) SIGILL
+# 5) SIGTRAP      6) SIGABRT      7) SIGBUS       8) SIGFPE
+# 9) SIGKILL     10) SIGUSR1     11) SIGSEGV     12) SIGUSR2
+# 13) SIGPIPE     14) SIGALRM     15) SIGTERM     16) SIGSTKFLT
+# 17) SIGCHLD     18) SIGCONT     19) SIGSTOP     20) SIGTSTP
+# 21) SIGTTIN     22) SIGTTOU     23) SIGURG      24) SIGXCPU
+# 25) SIGXFSZ     26) SIGVTALRM   27) SIGPROF     28) SIGWINCH
+# 29) SIGIO       30) SIGPWR      31) SIGSYS 
+my @signals = qw / HUP ILL TRAP ABRT BUS FPE USR1 USR2 PIPE ALRM STKFLT CONT STOP/;
+my @signalsExit = qw/ INT STOP TERM QUIT SEGV /;
+
+sub sigPass
+{
+	my ($signal) = @_;
+	my $msg;
+	
+	if( defined($pid) ) {
+		if( $pid == 0 )
+		{
+			die("received signal $signal in the child process before the target daemon was started\n");
+		} else {
+			syslog(LOG_NOTICE, "sending SIG$signal to pid:$pid");
+			my $ret = kill "$signal", $pid;
+			return if $ret == 1;
+		}
+	}
+
+	# $pid == 0 or child process no longer alive
+	syslog(LOG_NOTICE, "no child process to send SIG$signal to");
+	foreach my $s (@signalsExit) {
+		next unless $s eq $signal;
+		$mywork = 0;
+		$pidLastSig = $pid;
+		syslog(LOG_NOTICE, "looks like our work is done");
+	}
+}
+
+sub sigExit
+{
+	my ($signal) = @_;
+	my $msg;
+	$mywork = 0;
+	$pidLastSig = $pid;
+	syslog(LOG_NOTICE, "received SIG$signal");
+	return unless defined($pid);
+	if( $pid == 0 )
+	{
+		die("received signal $signal in the child process before the target daemon was started\n");
+	}
+	$spRestartOnCrash = 0;
+	sigPass($signal);
+}
+foreach my $signal (@signals)
+{
+	$SIG{$signal} = \&sigPass;
+}
+foreach my $signal (@signalsExit)
+{
+	$SIG{$signal} = \&sigExit;
+}
+
+# If any more options should appear, make sure the ones that need to
+# be passed to the new loader (same as the old loader ;)) on restarting
+# are actually handled in the RESTART block below.
+#
+use vars qw($opt_d $opt_g $opt_X);
+my $opts = "dgX:";
+sub usage
+{
+	my ($opts) = @_;
+	print "Usage: $myName [-d]|[-g] -- [ target opts ]\n";
+	print "       -d daemonize\n";
+	print "       -g get core of running process\n";
+	die("Exit\n");
+}
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+sub VERSION_MESSAGE
+{
+	my ($fh) = @_;
+	print $fh "StorPool $myName loader v1.0\n";
+}
+sub HELP_MESSAGE
+{
+	my ($fh) = @_;
+	usage($opts);
+}
+
+
+getopts($opts) or usage($opts);
+
+if( $opt_d )
+{
+	$daemon = 1;
+}
+
+if( $opt_g )
+{
+	$gcore = 1;
+}
+
+if( $opt_X )
+{
+	if( $opt_X !~ m{
+		^
+		(?<first>0|[1-9][0-9]*)
+		(?<others>
+			:(?<other>0|[1-9][0-9]*)
+		)*
+		$}x )
+	{
+		die("Invalid value for the -X option\n");
+	}
+	@launchTimes = split /:/, $opt_X;
+}
+
+if( $#ARGV == -1 )
+{
+	push @args, "-l";
+	push @args, "-p";
+	push @args, $binPidFile;
+	push @args, params($myType);
+}
+else
+{
+	push @args, @ARGV;
+}
+
+if( $spUseCGroups )
+{
+	my $varname = 'SP_'.uc($myType.$instanceId).'_CGROUPS';
+	my $val = env_str $varname, '';
+	if( length $val == 0 )
+	{
+		die "SP_USE_CGROUPS set, but $varname not set\n";
+	}
+	my @cg_args = split /\s+/, $val;
+
+	# OK, let's try to set ourselves up there...
+	my @cmd = ('cgclassify', @cg_args, $$);
+	my $sres = system { $cmd[0] } @cmd;
+	if( $sres != 0 )
+	{
+		die "Could not @cmd\n";
+	}
+
+	# ...and make sure we start the service there, too.
+	unshift @args, 'cgexec', @cg_args;
+
+	if( length $spCGroupsRDMA == 0 )
+	{
+		die "SP_USE_CGROUPS set, but SP_RDMA_CGROUPS not set\n";
+	}
+}
+
+# Yes, this is invalid; it will be overwritten in due time.
+push @args, '-W', '-1';
+my $argWatcherFd = $#args;
+
+if( env_bool 'SP_TESTING_MODE' )
+{
+	print "# Storpool Testing mode\n";
+	print "# ".join(" ", @args)."\n";
+	exit(0);
+}
+
+umask $spDaemonUmask;
+
+preload($myType) unless env_bool 'SP_SKIP_PRELOAD';
+
+if( ! getBin($myPath, $binName) )
+{
+	die("$binName not found in $myPath\n");
+}
+
+
+if( $gcore )
+{
+	exit( report($myPath, $binName, $workDir, { pidfile => $binPidFile }) );
+}
+
+my $chkPid = checkPidFile($myPidFile);
+if ( $chkPid )
+{
+	die("already running with PID:$chkPid\n");
+}
+
+if( $daemon )
+{
+	daemonize($workDir, $myPidFile);
+}
+
+reconfigure();
+
+if( $myType eq "mgmt" )
+{
+	env_set_values($myType);
+	system "/etc/storpool/api-ip down";
+}
+elsif( $myType eq "iscsi" )
+{
+	if( ! -d "$workDir/iscsi/discovery" )
+	{
+		if( ! -d "$workDir/iscsi" )
+		{
+			mkdir "$workDir/iscsi", 0700 or
+				die "Could not create the $workDir/iscsi directory: $!\n";
+		}
+		mkdir "$workDir/iscsi/discovery", 0700 or
+			die "Could not create the $workDir/iscsi/discovery directory: $!\n";
+	}
+
+	iSCSIBringDownFloatingAddresses;
+}
+
+my $fdLatency;
+
+if( !defined($fdLatency) && -c '/dev/cpu_dma_latency' )
+{
+	open( $fdLatency, '>', '/dev/cpu_dma_latency' );
+	if( defined($fdLatency) ) {
+		$fdLatency->autoflush(1);
+		say $fdLatency $spCPUDMALatency;
+	}
+}
+
+if( $spaceLimit )
+{
+	my $spaceFree = getFreeSpace($reportDir);
+	if( $spaceFree < $spaceLimit )
+	{
+		syslog(LOG_WARNING,"%s space %u < %u. Exit...", $reportDir, $spaceFree, $spaceLimit);
+		goto ENDITALL;
+	}
+	syslog(LOG_INFO,"%s space %u limit %u", $reportDir, $spaceFree, $spaceLimit);
+}
+
+if( ! -d '/var/run/storpool' )
+{
+	mkdir '/var/run/storpool', 0755 or
+		die "Could not create /var/run/storpool: $!\n";
+}
+
+rebindNvme($myType);
+
+my $runtime_info = eval {
+	local ($SIG{__DIE__}, $SIG{__WARN__});
+
+	my $ininame = '/etc/storpool_version.ini';
+	my @res = run_command('confget',
+		'-f', $ininame, '-s', 'build', 'variant');
+	if( @res != 1 || $res[0] eq '' ) {
+		die "Could not find build.variant in $ininame\n";
+	}
+
+	my @uname = POSIX::uname;
+	my %libc = detect_libc($res[0]);
+
+	return <<"EORUN";
+
+[run]
+kernelname = $uname[2]
+libc_name = $libc{libc_name}
+libc_ver = $libc{libc_ver}
+EORUN
+};
+if( $@ )
+{
+	warn "Could not obtain the runtime configuration: $@\n";
+} else {
+	my $fixed = $runtime_info;
+	$fixed =~ s/[\r\n]+/ __ /msg;
+	syslog(LOG_INFO, "Runtime configuration: $fixed");
+}
+
+syslog(LOG_INFO, "Starting '$binName'");
+
+push @launchTimes, time();
+shift @launchTimes while @launchTimes > 3;
+
+unlink $binPidFile;
+if( !$mywork )
+{
+	syslog(LOG_INFO, "Not really, exiting as requested instead");
+	goto ENDITALL;
+}
+
+my @watcherPipe;
+
+if( defined($watcherPipe[0]) ) {
+	close($watcherPipe[0]);
+}
+if( !socketpair($watcherPipe[0], $watcherPipe[1], AF_UNIX, SOCK_STREAM, PF_UNSPEC) )
+{
+	die("Could not create the watcher socketpair: $!\n");
+}
+
+my @errorPipe;
+
+if( defined $errorPipe[0] ) {
+	close $errorPipe[0];
+}
+if( !socketpair($errorPipe[0], $errorPipe[1], AF_UNIX, SOCK_STREAM, PF_UNSPEC) )
+{
+	die("Could not create the stderr socketpair: $!\n");
+}
+
+my $sret;
+$SIG{CHLD} = sub
+{
+	local ($!, $?);
+
+	while (1)
+	{
+		my $wpid = waitpid -1, WNOHANG;
+		if( !defined $wpid )
+		{
+			warn "Got a SIGCHLD, but then couldn't waitpid: $!\n";
+			last;
+		}
+		elsif( $wpid <= 0 )
+		{
+			# Yep, that's <=, not <; waitpid() may also return 0
+			# if there are no more child processes, not just -1.
+			last;
+		}
+		next unless defined $pid && $wpid == $pid;
+
+		my $status = $?;
+		warn "Got a double waitpid() result for $pid: first $sret, then $status\n"
+			if defined $sret;
+		$sret = $status;
+	}
+};
+
+$pid = fork();
+if( ! defined $pid )
+{
+	die("can't fork: $!\n");
+}
+elsif ($pid == 0) # child
+{
+	close $errorPipe[1];
+	my $flags = fcntl( $errorPipe[0], F_GETFD, 0 ) or
+		die("Could not get fd $errorPipe[0]'s flags: $!\n");
+	fcntl( $errorPipe[0], F_SETFD, $flags & ~FD_CLOEXEC ) or
+		die("Could not set fd $errorPipe[0]'s flags: $!\n");
+	close STDERR;
+	POSIX::close 2;
+	open STDERR, '>&', $errorPipe[0] or
+		die "Could not reopen stderr to file descriptor ".fileno($errorPipe[0]).": $!\n";
+	POSIX::dup2 $errorPipe[0], 2;
+	close $errorPipe[0];
+
+	close($watcherPipe[0]);
+	$flags = fcntl( $watcherPipe[1], F_GETFD, 0 ) or
+		die("Could not get fd $watcherPipe[1]'s flags: $!\n");
+	fcntl( $watcherPipe[1], F_SETFD, $flags & ~FD_CLOEXEC ) or
+		die("Could not set fd $watcherPipe[1]'s flags: $!\n");
+	$args[$argWatcherFd] = fileno($watcherPipe[1]);
+
+	setrlimit(RLIMIT_CORE, -1, -1);
+	setrlimit(RLIMIT_STACK, 8*1024*1024, 8*1024*1024);
+
+	env_set_values($myType);
+
+	syslog(LOG_INFO, 'exec: %s', join ' ', @args);
+
+	exec( @args );
+	die("Could not run '@args': $!\n");
+}
+close($errorPipe[0]);
+close($watcherPipe[1]);
+
+@childErrors = ();
+storeChildMessage \@childErrors, '=== Service started ===';
+
+$myReportDir = "$reportDir/$myName.$pid";
+mkDirs($workDir, $myReportDir);
+
+for my $f (
+	"$myPath/$binName",
+	"$myPath/storpool_dump",
+	"/etc/storpool_revision",
+	"/etc/storpool_version.ini",
+	"/etc/storpool.conf",
+	)
+{
+	copy $f, "$myReportDir/".basename($f) if -f $f;
+}
+{
+	my $ininame = "$myReportDir/storpool_version.ini";
+	if( defined $runtime_info && -f $ininame )
+	{
+		eval {
+			local ($SIG{__DIE__}, $SIG{__WARN__});
+
+			open my $f, '>>', $ininame or
+				die "Could not open $ininame for appending: $!\n";
+			print $f $runtime_info;
+			close $f or
+				die "Could not append the [run] section to $ininame: $!\n";
+		};
+		if( $@ )
+		{
+			warn "Could not write the runtime configuration to $ininame: $@\n";
+		}
+	}
+}
+{
+	my $fname = "$myReportDir/config.txt";
+	if( !open my $outf, '>', $fname )
+	{
+		warn "Could not open $fname: $!\n";
+	}
+	else
+	{
+		for my $var (sort keys %spconf)
+		{
+			say $outf "$var=".shell_escape $spconf{$var};
+		}
+	}
+}
+
+if( !$mywork && ( !defined($pidLastSig) || $pidLastSig != $pid ) )
+{
+	# parent
+	# Whoa!  We managed to get a 'please go away' signal *just* before
+	# we forked, *after* the if ( !$mywork ) check above!
+	syslog(LOG_INFO, "Trying to stop the just-started child process $pid");
+	kill 'TERM', $pid;
+}
+
+my $ret = 0;
+$running = 1;
+syslog(LOG_INFO,"started childPid:$pid");
+
+my $affinityPid = fork();
+if( ! defined $affinityPid )
+{
+	my $msg = "can't fork for setAffinity()! " . $!;
+	syslog(LOG_ERR, "%s", $msg);
+}
+elsif ( $affinityPid == 0 )
+{
+	setAffinity('on');
+	exit 0;
+}
+
+my $errorFH = $errorPipe[1];
+while (<$errorFH>) {
+	s/[\r\n]*$//;
+	storeChildMessage \@childErrors, $_;
+	syslog(LOG_ERR, "Child $pid: $_");
+}
+$SIG{CHLD} = 'DEFAULT';
+close $errorFH;
+storeChildMessage \@childErrors, '=== Service pipe closed ===';
+
+while( !defined $sret )
+{
+	my $spid = waitpid -1, 0;
+	$sret = $? if $spid == $pid;
+}
+
+if( $myType eq "mgmt" )
+{
+	env_set_values($myType);
+	system "/etc/storpool/api-ip down";
+}
+elsif( $myType eq "bridge" )
+{
+	env_set_values($myType);
+	system "/etc/storpool/bridge-ip down";
+}
+
+# This is a highly Linux-specific implementation!
+sub WCOREDUMP($)
+{
+	my ($val) = @_;
+	
+	return $val & 0x80;
+}
+
+syslog(LOG_INFO, "childPid:$pid finished with sret:$sret");
+
+my $restartMe = 0;
+
+$keepReportDir = 0;
+
+if( $sret == -1 )
+{
+	syslog(LOG_ERR, "Failed to execute `$binName` pid:$pid");
+}
+elsif( WIFSIGNALED($sret) )
+{
+	syslog(LOG_CRIT, "lost $binName (pid:$pid) signal %d, %s coredump",
+			            WTERMSIG($sret),  WCOREDUMP($sret) ? 'with' : 'without');
+	if(WCOREDUMP($sret))
+	{
+		syslog(LOG_WARNING, "Kernel-initiated core dump detected. Please contact storpool support!");
+	}
+	$restartMe = 1 if( WTERMSIG($sret) == 12 );
+	if( WCOREDUMP($sret) or ( WTERMSIG($sret) != 15 && WTERMSIG($sret) != 12 ) )
+	{
+		# report() shall take care of removing the report directory
+		$keepReportDir = 1;
+		report($myPath, $binName, $workDir);
+	}
+	elsif( $dumpShm )
+	{
+		getShm($pid, $myType, $instanceId);
+	}
+}
+elsif( !WIFEXITED($sret) )
+{
+	syslog(LOG_CRIT, "unexpected waitpid() exit code for $pid: $sret - neither signalled nor exited");
+	report($myPath, $binName, $workDir);
+}
+elsif( WEXITSTATUS($sret) == 8 )
+{
+	syslog(LOG_CRIT, "child $binName (pid:$pid) needs to be restarted");
+	getShm($pid, $myType, $instanceId) if $dumpShm;
+	@launchTimes = ();
+	goto RESTART;
+}
+elsif( WEXITSTATUS($sret) == 9 )
+{
+	syslog(LOG_CRIT, "child $binName (pid:$pid) ran a custom signal handler after dumping core");
+	# report() shall take care of removing the report directory
+	$keepReportDir = 1;
+	report($myPath, $binName, $workDir);
+}
+else
+{
+	syslog(LOG_NOTICE, "lost $binName (pid:$pid) exited with %d", $sret >> 8);
+	getShm($pid, $myType, $instanceId) if $dumpShm;
+}
+
+if( $spRestartOnCrash )
+{
+	if( @launchTimes >= 3 && $launchTimes[0] + $spRestartOnCrash > time() )
+	{
+		syslog(LOG_CRIT,"%d crashes in %dsec", scalar @launchTimes, $spRestartOnCrash);
+		$ret = 1;
+		goto ENDITALL;
+	}
+	sleep(1);
+	syslog(LOG_INFO, "Restarting...");
+	goto RESTART;
+}
+elsif( $restartMe )
+{
+	syslog(LOG_INFO, "Restarting...");
+	goto RESTART;
+}
+
+ENDITALL:
+unlink $myPidFile;
+removeMyReportDir() unless $keepReportDir;
+
+iSCSIBringDownFloatingAddresses if $myType eq "iscsi";
+
+$ret //= -1;
+syslog(LOG_INFO, "Loader finished with Exit($ret)");
+
+closelog();
+
+exit($ret);
+
+RESTART:
+removeMyReportDir() unless $keepReportDir;
+
+if( !$mywork )
+{
+	iSCSIBringDownFloatingAddresses if $myType eq "iscsi";
+
+	syslog(LOG_INFO, "Loader exiting as requested");
+	exit(0);
+}
+
+# Drop the -d option, we have already detached once.
+# I hope we can't get here with the -g option :)
+# Pass @launchTimes as an argument to the -X option.
+#
+my @cmd = (
+	"$myPath/$myName",
+	(@launchTimes? ('-X', join ':', @launchTimes): ()),
+	'--',
+	@ARGV
+);
+
+syslog(LOG_INFO, "Re-executing '@cmd'");
+exec { $cmd[0] } @cmd;
+die("Could not execute '@cmd': $!\n");

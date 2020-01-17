@@ -1,0 +1,59 @@
+#!/bin/bash
+# returns the control to the nvme device driver
+set -e
+
+# if storpool_nvmed is working die
+if pgrep -f storpool_nvmed.bin &>/dev/null; then
+	echo "storpool_nvmed seems to be working, please stop the server instances controlling the NVMe drives on this node and only then stop storpool_nvme before proceeding further" 1>&2
+	exit 1
+fi
+
+# get nvme drives and expose to nvme driver
+nvme_pci_ids=( $(storpool_showconf -ne SP_NVME_PCI_ID 2>/dev/null) )
+if [[ -z ${nvme_pci_ids[*]} ]]; then
+	echo "No SP_NVME_PCI_ID configured for this node" 1>&2
+	exit 1
+fi
+sppci="/sys/bus/pci/drivers/storpool_pci"
+sppci_unbind="${sppci}/unbind"
+if [[ ! -w ${sppci_unbind} ]]; then
+	echo "${sppci_unbind} missing or not writable" 1>&2
+	exit 1
+fi
+nvme_sys_path="/sys/bus/pci/drivers/nvme"
+nvme_bind="${nvme_sys_path}/bind"
+if [[ ! -w $nvme_bind ]]; then
+	echo "${nvme_bind} missing or not writable" 1>&2
+	exit 1
+fi
+
+ret=0
+for pci_id in "${nvme_pci_ids[@]}"; do
+	# check if already bound to sppci
+	if [[ -d ${sppci}/${pci_id} ]]; then
+		# attempt to unbind from sppci
+		if ! echo "${pci_id}" > "${sppci_unbind}"; then
+			echo "Failed to unbind ${pci_id} from $sppci_unbind" 1>&2
+			ret=1
+			continue
+		else
+			echo "${pci_id} unbound from $sppci_unbind"
+		fi
+	else
+		echo "NVMe device $pci_id not bound in $sppci" 1>&2
+	fi
+
+	if [[ -d ${nvme_sys_path}/$pci_id ]]; then
+		echo "NVMe device $pci_id already bound in $nvme_sys_path" 1>&2
+	else
+		# attempt to bind to nvme driver
+		if ! echo "${pci_id}" > "$nvme_bind"; then
+			echo "Failed to bind ${pci_id} to $nvme_bind" 1>&2
+			ret=1
+		else
+			echo "${pci_id} bound to $nvme_bind"
+		fi
+	fi
+done
+
+exit "$ret"

@@ -1,0 +1,194 @@
+#!/bin/bash
+shopt -s extglob
+lservices="$(find "$(storpool_showconf -ne SP_WORKDIR)" -mindepth 1 -maxdepth 1 -type s -name '*.sock.*' -printf '%f\n' | sed -e 's/.*\.//' | sort)"
+lservicedelmt="$(printf -- '%s\n' "$lservices" | xargs -r | tr ' ' '|')"
+lservicepattern="$(printf -- '@(%s)' "$lservicedelmt")"
+
+if [[ -n $* ]]; then
+  while test -n "$1"; do
+    case "$1" in
+      -h|--help|help|usage)
+        echo "Usage: $(basename -- $0) [-n] [-v] [-p] [-j] [${lservicedelmt}] [0|1]"
+        echo "Prints average/max ping to remote StorPool (18.02+ release) hosts"
+        echo "By default uses storpool_ping with attempting to reach a remote block service (fails if the block is not running on the remoteId)"
+        echo "0|1 - only first or second network only"
+        echo "-j - use jumbo frames (default: off)"
+        echo "-l - list available services"
+        echo "-n - no-op mode - just print commands that will be executed and exit"
+        echo "-p - force ping (default: storpool_ping if available)"
+        echo "-v - verbose operation (default: off)"
+        echo "$lservicedelmt - use this local service instead of the default (block)"
+        exit 0
+        ;;
+      -l)
+        echo "Available services:" 1>&2
+        echo "$lservices" 1>&2
+        exit 0
+        ;;
+      -n)
+        echo "No-op mode" 1>&2
+        noop=1
+        shift
+        ;;
+      0)
+        netids=(0)
+        shift
+        ;;
+      1)
+        netids=(1)
+        shift
+        ;;
+      -j)
+        jumbo=1
+        sz=8900
+        shift
+        ;;
+      -p)
+        echo "Forcefully using ping" 1>&2
+        fping=1
+        shift
+        ;;
+      $lservicepattern)
+        lservice="$1"
+        shift
+        ;;
+      -v)
+        echo "Verbose mode" 1>&2
+        verbose=1
+        shift
+        ;;
+      *)
+        echo "No such option" 1>&2
+        exit 1
+        ;;
+    esac
+  done
+fi
+
+dprint(){
+      if [[ -n $verbose ]]; then
+         echo "Executing: $@" 1>&2
+      fi
+}
+
+spconfget="/usr/sbin/storpool_confget"
+spconfshow="/usr/sbin/storpool_confshow"
+spconf="/etc/storpool.conf"
+me="$(hostname)"
+myid="$(storpool_showconf -ne "SP_OURID")"
+if [[ -z $lservice ]]; then
+  lservice="block"
+  echo "Using $lservice" 1>&2
+fi
+
+if [[ ! -x $spconfget ]]; then
+  echo "$spconfget missing or not executable, please check" 1>&2
+  exit 1
+fi
+
+if [[ ! -x $spconfshow ]]; then
+  echo "$spconfshow missing or not executable, please check" 1>&2
+  exit 1
+fi
+
+if [[ ! -r $spconf ]]; then
+  echo "$spconf missing or not readable, please check" 1>&2
+  exit 1
+fi
+
+# just ensure the CPU is not sleeping during the test:
+# 5 means 5us maximum delay to wake up from the C-state (usually up to C1E)
+(echo 5; sleep 60) >/dev/cpu_dma_latency &
+disown
+
+if fgrep -q cpuset /proc/$$/cgroup; then
+  cgroup=$(grep cpuset /proc/$$/cgroup | cut -d: -f 3)
+  cpu=$( cgget -vnr cpuset.cpus $cgroup | awk -F'[,-]' '{ print $NF }' )
+  taskset="taskset -c $cpu"
+  # echo $taskset
+fi
+
+spping="/usr/lib/storpool/storpool_ping"
+if [[ -f $spping && -z $fping ]]; then
+  echo "Using storpool_ping" 1>&2
+  usespp=True
+  sz=8104
+  cargs="-c 10000 -f"
+  if [[ -z $jumbo ]]; then
+    pingcmd="$spping $cargs"
+  else
+    echo "Using jumbo frames ($sz)" 1>&2
+    pingcmd="$spping $cargs -s $sz"
+  fi
+else
+  unset usespp
+  if ! type -f ping &>/dev/null; then
+    echo "ping missing or not available" 1>&2
+    exit 1
+  else
+    ping=ping
+    cargs="-q -c 10000 -f"
+    if [[ -z $jumbo ]]; then
+      pingcmd="$ping $cargs"
+    else
+      echo "Using jumbo frames ($sz)" 1>&2
+      pingcmd="$ping $cargs -s $sz"
+    fi
+  fi
+fi
+
+if [[ -z ${netids[*]} ]]; then
+  netids=( 0 1 )
+fi
+declare -A nets
+for netid in ${netids[*]}; do
+  nets[$netid]="SP_IFACE$((netid+1))_CFG"
+done
+
+for id in ${!nets[*]}; do
+  netcfg=${nets[$id]}
+  for host in $("$spconfget" -q sections); do
+    if [[ $host == $me ]]; then
+      # do not ping myself
+      continue
+    fi
+    read version upper lower vlan ip resolve shared mac <<<"$("$spconfshow" -nes "$host" "$netcfg" | tr ':' ' ')"
+
+    if [[ -z $usespp ]]; then
+      if [[ -z $ip ]]; then
+        # handle hosts with only a single network interface
+        continue
+      fi
+      extraargs="$ip"
+    else
+      rhostid="c$("$spconfshow" -nes "$host" SP_OURID)"
+      extraargs="-S $lservice -N $id $rhostid"
+    fi
+    cmd="$pingcmd $extraargs"
+    if [[ -n $noop ]]; then
+      echo "$cmd"
+      continue
+    fi
+    if [[ -z $usespp ]]; then
+      checkcmd="$ping -i0.05 -c2 -W1 $ip"
+      dprint "$checkcmd"
+      if ! $checkcmd &>/dev/null; then
+        echo "$ip unreachable" 1>&2
+        continue
+      fi
+      dprint "$taskset $cmd"
+      $taskset $cmd | awk -v i="$ip" -F'/' '/avg/ { print "to "i" avg/max: " $5 "/" $6 }' &
+    else
+      checkcmd="$spping -f -c 100 -t 1 $extraargs"
+      dprint "$checkcmd"
+      if ! $checkcmd &>/dev/null; then
+        echo "$lservice unreachable over net $id for host $rhostid" 1>&2
+        continue
+      fi
+      dprint "$taskset $cmd"
+      $taskset $cmd | awk -v f="$lservice@$myid" -v r="$rhostid" -F'/' \
+        '/avg/ { print "from " f " to " r " avg/max: " $4 "/" $5 }' &
+    fi
+  done
+done
+wait

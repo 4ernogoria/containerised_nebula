@@ -1,0 +1,5 @@
+# /etc/cron.d/storpool_setirqaff: crontab entries for the StorPool Set IRQ Affinity tool
+
+PATH=/bin:/sbin/:/usr/sbin:/usr/bin
+
+*/5 *    * * *   root  /usr/lib/storpool/setirqaff do log >/dev/null 2>&1

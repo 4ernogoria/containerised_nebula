@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+
+SP_OURID=0
+
+. /usr/lib/storpool/storpool_confget.sh
+
+/sbin/modprobe --ignore-install storpool_bd
+

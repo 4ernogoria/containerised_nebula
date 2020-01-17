@@ -1,0 +1,195 @@
+#!/bin/bash
+
+if [[ -n $TERM ]]; then
+    bold=$(tput bold)
+    norm=$(tput sgr0)
+fi
+
+usage(){
+  cat >&1 <<EOUSAGE
+
+    ${bold}Usage: $(basename -- "$0") [host='host1 host2 ..'] [glob=<glob>|g=<glob>]${norm}
+
+  Reads build.conf file in the present directory and copies latest release package found for the
+   - kernel (e.g. 2.6.32-692.3.1.el6.x86_64)
+   - OS (e.g. centos_6)
+   - architecture (e.g. nehalem)
+
+  for each host presented on the lines of build.conf (the end of the line after the #)
+
+  ${bold}[host='<host1> <host2>..']${norm} - Do not use hosts after the # in each line of build.conf
+  search only for this space separated list of hosts instead.
+
+  ${bold}[glob='<string>']${norm} - Do not copy the latest package, use this glob to find the latest package, ex.:
+
+  - glob="8046-8" - search for package built from GerritID 8046 and patchset 8
+  - glob="sp-upgrade-16.02" - search for the latest sp-upgrade-16.02 package
+  - glob="16.02" - search for the latest 16.02 release package
+
+EOUSAGE
+}
+
+
+copy(){
+  chk(){
+    local host="$1"
+    if ! fgrep -qw "$host" ./build.conf; then
+      echo "$host not found in ./build.conf" 1>&2
+    fi
+    if ! fgrep -qw "$host" ./hosts.txt; then
+      echo "$host missing in ./hosts.txt, is ./build.conf recent? (perhaps run generate-build-conf)" 1>&2
+    fi
+  }
+  pause(){
+    local count="$1"
+    local trigger="$2"
+    if [[ $((count%trigger)) -eq 0 ]]; then
+      wait
+    fi
+  }
+  local host="$1"
+  local glob="$2"
+  if [[ $host == 'all' ]]; then
+    cmd="cat ./build.conf"
+  else
+    cmd="fgrep $host ./build.conf"
+  fi
+  while read line; do
+    if [[ -z "$line" ]]; then
+      continue
+    fi
+    count=1
+    while read kernel osrelease arch separator linehosts ; do
+      if [[ $separator != "#" ]]; then
+        echo "Something went wrong:" 1>&2
+        echo "line is:" 1>&2
+        echo "$line" 1>&2
+        echo "kernel $kernel" 1>&2
+        echo "osrelease $osrelease" 1>&2
+        echo "arch $arch" 1>&2
+        echo "separator $separator" 1>&2
+        echo "linehosts $linehosts" 1>&2
+      fi
+      case $osrelease in
+        centos_6|virtuozzo_6)
+          local OS="CENTOS6"
+          ;;
+        centos_7|virtuozzo_7)
+          local OS="CENTOS7"
+          ;;
+        ubuntu_14.04)
+          local OS="UBUNTULTS"
+          ;;
+        ubuntu_16.04)
+          local OS="UBUNTU1604"
+          ;;
+        debian_7)
+          local OS="DEBIAN7"
+          ;;
+        ubuntu_18.04)
+          local OS="UBUNTU1804"
+          ;;
+        debian_8)
+          local OS="DEBIAN8"
+          ;;
+        *)
+          echo "UNKNOWN OS '$osrelease'!!!"
+          exit 1
+          ;;
+      esac
+      pkg=
+      if [[ -n $glob ]]; then
+        # example:
+        # 4.4.0-83-generic/storpool-16.02.11.eabf888-UBUNTU1604-4.4.0-83-generic-nehalem.tar.gz
+        local fglob="storpool-*${glob}*${OS}-${kernel}-${arch}.tar.gz"
+        local pkg="$(ls -t ${kernel}/${fglob} | egrep -v debug | head -n 1)" # just ensure that we will never send a debug package remotely, no matter the name
+      else
+        local fglob="storpool-*${OS}-${kernel}-${arch}.tar.gz"
+        local pkg="$(ls -t ${kernel}/${fglob} | egrep -v debug | head -n 1)" # just ensure that we will never send a debug package remotely, no matter the name
+      fi
+      if [[ -z $pkg ]]; then
+        echo "Failed to find package built for host $host" 1>&2
+        echo "searched for $fglob" 1>&2
+        continue
+      fi
+      # deploy on remote
+      if [[ $host == 'all' ]]; then
+        hosts="$linehosts"
+      else
+        hosts="$host"
+      fi
+      for remote in $hosts ; do
+        chk "$remote"
+        ssh "$remote" 'mkdir -p storpool' &
+        count=$((count+1))
+        pause "$count" 5
+      done
+      wait
+      for remote in $hosts ; do
+        echo "Uploading to $remote"
+        scp "$pkg" "$remote":storpool/ &
+        count=$((count+1))
+        pause "$count" 5
+      done
+      wait
+      for remote in $hosts ; do
+        echo "Extracting on $remote"
+        ssh "$remote" '
+			cd storpool
+			pkg='$(basename -- ${pkg})' ;
+			tar -xf ${pkg}
+			' &
+		count=$((count+1))
+        pause "$count" 5
+      done
+      wait
+    done < <(echo $line)
+  done <<<"$($cmd)"
+}
+
+if ! [ -f build.conf ]; then
+    echo "${bold}Missing build conf in $(pwd), maybe you are in the wrong dir${norm}" 1>&2
+    echo "Run ${bold}generate-build-conf${norm} if the dir is the right one" 1>&2
+    exit 3
+fi
+
+if [[ -n $* ]]; then
+  while test -n "$1"; do
+    case "$1" in
+      -h|--help|usage|help)
+        usage
+        exit 0
+        shift
+        ;;
+      host=*)
+        hset=${1##*=}
+        hosts=( $hset )
+        echo "Using host(s) - ${hosts[*]}"
+        shift
+        ;;
+      glob=*|g=*)
+        glob=${1##*=}
+        echo "Using $glob to searching for package"
+        shift
+        ;;
+      debug)
+        debugf=1
+        echo "Printing debug messages"
+        set -x
+        shift
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+  done
+fi
+
+if [[ -n ${hosts[*]} ]]; then
+  for host in ${hosts[*]}; do
+    copy "$host" "$glob"
+  done
+else
+  copy all "$glob" #this will loop over all lines
+fi

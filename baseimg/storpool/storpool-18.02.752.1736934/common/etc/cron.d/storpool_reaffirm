@@ -1,0 +1,5 @@
+# /etc/cron.d/storpool_reaffirm: crontab entry for the StorPool reaffirm settings tool
+
+PATH=/bin:/sbin:/usr/sbin:/usr/bin
+
+* *    * * *   root [ -f /etc/storpool.conf ] && /usr/sbin/storpool_reaffirm -p 2>&1

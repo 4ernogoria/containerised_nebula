@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# shellcheck source=tools/update/update_functions.sh
+source /usr/lib/storpool/update_functions.sh
+usage(){
+	cat <<EOUSAGE
+
+${bold}Usage: $0 [module1] [module2] ... --yes${norm}
+
+	Restarts all running StorPool services in the proper order without causing delays in
+	the other nodes in the cluster.
+
+	${bold}[-h|--help]${norm}	- prints this message
+
+	${bold}--yes${norm} - required to actually perform the reload
+	${bold}--no-modules-check${norm} - skip the check that there are no changes in the installed and running modules  (${bold}UNSAFE${norm}, please make sure you know what you are doing)
+	${bold}--no-cgroup-check${norm} - skip the check that the cgroups exist (${bold}UNSAFE${norm}, please make sure you know what you are doing)
+
+EOUSAGE
+}
+
+unset forceflag nocgroups proceedf
+if [[ -n "$*" ]]; then
+	while test -n "$1"; do
+		case "$1" in
+			-h|--help|usage|help)
+				usage
+				exit 0
+				shift
+				;;
+			--no-cgroups-check)
+				nocgroups=1
+				shift
+				;;
+			--no-modules-check)
+				nomodulechecks=1
+				shift
+				;;
+			--yes)
+				proceedf=1
+				shift
+				;;
+			--force)
+				forceflag=1
+				shift
+				;;
+			*)
+			  echo "Unknown option ${bold}${1}${norm}"
+				exit 1
+				;;
+		esac
+	done
+fi
+
+# get all services just for the checks
+allservices=($(getservices "all"))
+chkprelinked "${allservices[*]}"
+
+# get all servers
+servers=($(getservices "disk"))
+
+chkifaces "$forceflag"
+
+if [[ -z $proceedf ]]; then
+	echo "Please use '--yes' to reload" 1>&2
+	exit 1
+fi
+
+unset running
+runningservers=($(getrunning "${servers[*]}"))
+echo -e "Running services:\n${running[*]}"
+
+chkhugepages "${running[*]}"
+
+chkcgroups "${running[*]}"
+
+chkmodulesupdate
+
+# stop just the servers
+stopservices "${runningservers[@]}"
+
+# restart just the beacon, to get the block/iscsi back faster
+service storpool_beacon restart
+
+# start back all servers
+startservices "${runningservers[@]}"

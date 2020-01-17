@@ -1,0 +1,541 @@
+#!/usr/bin/python
+# The MIT License (MIT)
+#
+# Copyright (c) 2015-2018 StorPool Storage AD
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import print_function
+
+import argparse
+import collections
+import fnmatch
+import json
+import os
+import re
+import sys
+import subprocess
+import time
+
+import storpool.spconfig
+
+
+def getargs():
+    '''returns argparse object'''
+    parser = argparse.ArgumentParser(
+        description='''
+        Reads interfaces configured for this node in storpool.conf or storpool.conf.d/*
+        Generates the (by default) {c} configuration for the VF helper functions
+        '''.format(c=CONFIG))
+    parser.add_argument(
+        "-N",
+        "--noop",
+        help="Do not write anything, just print what is generated.",
+        action='store_true'
+    )
+    parser.add_argument(
+        "-a",
+        "--apply",
+        help="""
+        Invokes /lib/udev/vf-udevhelper as if executed by udev.
+        Needs interface name, provide 'list' to print the configured
+        interfaces
+        """,
+        choices=['0', '1', 'all'],
+        type=str
+    )
+    parser.add_argument(
+        "-d",
+        "--disable-hw-acceleration",
+        help="Instruct the vf-udevhelper to *not* enable acceleration (default: accelerated)",
+        action='store_true'
+    )
+    parser.add_argument(
+        "-j",
+        "--json",
+        help="Dumps all the collected data as json output and exits",
+        action='store_true'
+    )
+    parser.add_argument(
+        "-r",
+        "--rxflow",
+        help="Change the default rx flow control (default: 'on')",
+        choices=['on', 'off']
+    )
+    parser.add_argument(
+        "-t",
+        "--txflow",
+        help="Change the default rx flow control (default: 'off')",
+        choices=['on', 'off']
+    )
+    parser.add_argument(
+        "-m",
+        "--mtu",
+        help="Change the default mtu (default: 9000)",
+        type=int
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        help="Use this path to the config file instead of the default (useful for testing)",
+        type=str
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        help="Use for verbose messages and output (default off)",
+        action='store_true'
+    )
+    return parser.parse_args()
+
+
+def getrawspeedwidth(pciid, output):
+    '''pciid: str
+    output: float speed, int width of the PCI-e under pciid
+    returns tuple of speed, width'''
+    lines = output.split('\n')
+    lindex = None
+    try:
+        lindex = lines.index(
+            [l for l in lines if l.startswith(pciid)][0]
+        )
+    except IndexError:
+        return None
+    reg = re.compile(
+        r'''.* LnkSta: .* Speed \s+ # everything in the beginning of the line
+        (?P<speed> \d+ (?: \. \d*)? ) # speed value
+        GT/s \, \s+ Width \s+ x # between speed and width
+        (?P<width> \d+) # width value
+        ''',
+        re.X
+    )
+    for line in lines[lindex+1:]:
+        mch = reg.search(line)
+        if mch:
+            speed = mch.group('speed')
+            width = mch.group('width')
+            if speed:
+                speed = float(speed)
+            if width:
+                width = int(width)
+            return speed, width
+    return None
+
+
+def getpcispeed(pciid, output):
+    '''
+    pciid: str device ID
+    output: str output from lspci
+    returns tuple of ints with:
+    effective speed in Mbps as returned by lspci, raw speed, raw width'''
+    res = getrawspeedwidth(pciid, output)
+    if res:
+        speed, width = res
+    if res and all([speed, width]):
+        if speed < 8:
+            # slash speed by 20%, due to PCI-e 2.0 (and lower) overhead
+            effspeed = speed * 0.8
+        else:
+            # slash speed by ~2%, due to PCI-e 3.0 overhead
+            effspeed = speed * 0.98
+        return int(effspeed * width * 1000), speed, width
+    else:
+        print('Could not determine the speed of the underlying link, bailing out', file=sys.stderr)
+        return None
+
+
+def getifaces(cfg):
+    '''cfg: storpool.spconfig.SPConfig object
+    reads the lower interfaces from storpool.conf
+    returns list of lower interfaces only'''
+    keys = [key for key in ['SP_IFACE{n}_CFG'.format(n=net) for net in [1, 2]] if key in cfg]
+    if not keys:
+        print(
+            "Both SP_IFACE1_CFG/SP_IFACE2_CFG missing in /etc/storpool.conf",
+            file=sys.stderr
+        )
+        exit(1)
+    elif len(keys) < 2:
+        print(
+            "Warning: only one interface configured (through '{k}')".format(k=keys[0]),
+            file=sys.stderr
+        )
+    return [
+        cfg.get(key, None).split(':')[2] for key in keys
+    ]
+
+
+def get_iscsi_ifaces(cfg):
+    '''cfg: storpool.spconfig.SPConfig object
+    reads the iscsi interfaces from storpool.conf
+    returns list of iscsi interfaces only'''
+    ifaces_iscsi = cfg.get('SP_ISCSI_IFACE', None)
+    if ifaces_iscsi is not None:
+        return ifaces_iscsi.split(':')
+    else:
+        return []
+
+
+def telf(path):
+    '''path: path to a filename'''
+    with open(path, 'rb') as handle:
+        hdr = handle.read(32)
+        return len(hdr) == 32 and hdr.startswith('\x7fELF\x02') and \
+            hdr.endswith('@\x00\x00\x00\x00\x00')
+    return False
+
+
+def getnumberofservices():
+    '''returns int, how many StorPool services (requiring VFs) are installed'''
+    bpath = '/usr/sbin'
+    binaries = [
+        name for name in os.listdir(bpath)
+        if fnmatch.fnmatch(name, 'storpool_*.bin') and telf(os.path.join(bpath, name))
+    ]
+    return len(binaries)
+
+
+def getmac(driverpath, pciid, interface):
+    '''returns the mac or 'macmissing' in case of failure to read it'''
+    try:
+        mfile = os.path.join(driverpath, pciid, 'net', interface, 'address')
+        with open(mfile) as mfile:
+            return mfile.read().rstrip('\n')
+    except IOError:
+        return 'macmissing'
+
+
+def getifacespeed(ifpath):
+    '''returns int - speed of the interface per the value in sys'''
+    try:
+        sfile = os.path.join(ifpath, 'speed')
+        with open(sfile) as sfileh:
+            speed = sfileh.read().rstrip('\n')
+            return int(speed)
+    except IOError:
+        return None
+
+
+def getifacemtu(devpath):
+    '''returns int - mtu of the interface per the value in sys'''
+    try:
+        sfile = os.path.join(devpath, 'mtu')
+        with open(sfile) as sfileh:
+            return int(sfileh.read().rstrip('\n'))
+    except IOError:
+        return None
+
+
+def gettxflowcontrol(interface, ifpath, pciid, mconfig):
+    '''interface, ifpath, pciid:  strings
+    - name of the interface
+    - path to device in /sys
+    - ID of the PCI device
+    - mconfig: dict to update the details into
+    returns list of two strings: flowcontrol on/off, detailed info on collected
+    speed, throughput, pci-e revision, etc.
+    '''
+    result = 'off'
+    thrtup = getpcispeed(pciid, LSPCIOUT)
+    if thrtup:
+        pcithr, pcierev, width = thrtup
+        hrpcithr = '"effective_throughput": "{p} Mbps"'.format(p=pcithr)
+        hrpcierev = '"transfer_rate": "{p} GTs"'.format(p=pcierev)
+        hrwidth = '"width": "{p}x"'.format(p=width)
+        mconfig['effective_throughput'].append(pcithr)
+        mconfig['transfer_rate'].append(pcierev)
+        mconfig['width'].append(width)
+    else:
+        return result
+    ifacespeed = getifacespeed(ifpath)
+    mconfig['speed'].append(ifacespeed)
+    if not ifacespeed:
+        print(
+            'Warning: could not determine the speed of {i}'.format(i=interface),
+            file=sys.stderr
+        )
+    elif ifacespeed > pcithr:
+        print(
+            'Warning: Interface speed ({i}) higher than PCIe throughput ({p}, {v}, {w})'.format(
+                i=str(ifacespeed)+'Mbps',
+                p=hrpcithr,
+                v=hrpcierev,
+                w=hrwidth
+            ),
+            file=sys.stderr
+        )
+        result = 'on'
+    return result
+
+
+def getupdstr(tstmp, cfg, disableacc, dumpjson):
+    '''tstmp: int time.time
+    cfg: dict with lists of strings, with certain expected keys:
+        pciid, rxflowcontrol, txflowcontrol, mtu, vfs
+    disableacc: bool to instruct vfudevhelper to not enable HW acceleration
+    dumpjson: prints all details only in json on stdout and exits
+    returns the final configuration file'''
+    hrtstmp = time.strftime("%a, %d %b %Y %H:%M:%S", time.localtime(tstmp))
+    updstr = ''
+    updstr += "# Autogenerated by {me} on {d}\n".format(me=ME, d=hrtstmp)
+    for index in range(max(len(v) for v in cfg.values())):
+        ddict = dict([(k, cfg[k][index]) for k in cfg])
+        updstr += '# {n}\n'.format(n=str(ddict).strip('{}'))
+
+    updstr += 'PCI_SLOT_LIST="{p}"\n'.format(p=','.join(cfg['pciid']))
+    updstr += 'PCI_RXFLCTRL_LIST="{rf}"\n'.format(rf=','.join(cfg['rxflowcontrol']))
+    updstr += 'PCI_TXFLCTRL_LIST="{tf}"\n'.format(tf=','.join(cfg['txflowcontrol']))
+    if cfg['mtu']:
+        updstr += 'PCI_MTU_LIST="{m}"\n'.format(m=','.join([str(m) for m in cfg['mtu']]))
+    if cfg['vfs']:
+        updstr += 'PCI_NUMVFS_LIST="{v}"\n'.format(v=','.join([str(v) for v in cfg['vfs']]))
+    if disableacc:
+        updstr += 'HWACC=\n'
+    if dumpjson:
+        print(json.dumps(cfg, sort_keys=True, indent=4))
+        sys.exit(0)
+    return updstr
+
+
+def applyconfig(ifpath, pciid, driver):
+    '''
+    ifpath: str path to inteface in /sys (used only to determine iface name)
+    pciid: str PCIe ID
+    driver: str name of the driver
+    Executes /lib/udev/vf-udevhelper with parameters supplied by udev
+    returns None'''
+    environment = {
+        'PCI_SLOT_NAME': pciid,
+        'DEVPATH': '{i}'.format(i=ifpath),
+        'ACTION': 'add',
+        'DRIVER': '{d}'.format(d=driver),
+    }
+    cmd = [
+        'bash',
+        '-x',
+        '/lib/udev/vf-udevhelper'
+    ]
+    print(
+        'Executing: {c}'.format(c=' '.join(cmd))
+    )
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment
+    )
+    output, error = process.communicate()
+    process.wait()
+    if process.returncode != 0:
+        print(
+            'Execution failed, stdout:\n{s}\nstderr:\n{e}\nretcode:{r}'.format(
+                s=output,
+                e=error,
+                r=process.returncode
+            )
+        )
+        return process.returncode
+    else:
+        print('Execution successful, please check syslog for messages from vf-udevhelper')
+        if ARGS.verbose:
+            print(
+                'stdout:\n{s}\nstderr:\n{e}\nretcode:{r}'.format(
+                    s=output,
+                    e=error,
+                    r=process.returncode
+                )
+            )
+        return process.returncode
+
+def chkconfig(driver, interface):
+    '''driver, interface: str name of the driver and interface
+    protests if a suitable configuration was not found in /etc/modprobe.d
+    for the driver and interace in question'''
+    if driver == 'ixgbe' or driver == 'i40e':
+        reg = re.compile(
+            r'''^ (\s+)?
+            blacklist
+            (\s+)
+            {d}vf
+            (\s+)?$'''.format(d=re.escape(driver)),
+            re.X
+        )
+        fixmsg = 'echo "blacklist {d}vf" >> /etc/modprobe.d/{d}.conf'.format(d=driver)
+    elif driver == 'mlx4_core':
+        reg = re.compile(
+            r'''^ (\s+)?
+            options
+            (\s+){d}(\s+)
+            log_num_mgm_entry_size
+            (\s+)? = (\s+)? -1 (\s+)? $'''.format(
+                d=re.escape(driver)
+            ),
+            re.X
+        )
+        fixmsg = 'echo "options mlx4_core log_num_mgm_entry_size=-1" >> /etc/modprobe.d/mlx4.conf'
+    else:
+        return
+    mdir = '/etc/modprobe.d'
+    for root, _, files in os.walk(mdir):
+        files = [
+            os.path.join(root, f) for f in files
+            if f.endswith('.conf')
+        ]
+        for fname in files:
+            with open(fname) as ftarget:
+                lines = ftarget.readlines()
+                matches = [m for m in lines if reg.match(m)]
+                if matches:
+                    return
+    print(
+        'Warning: module configuration missing for {i} (driver {d}), fix with:\n\n{f}\n'.format(
+            d=driver,
+            i=interface,
+            f=fixmsg
+        ),
+        file=sys.stderr
+    )
+
+def main(interfaces, interfaces_iscsi, numservices, rxflowoverride, txflowoverride, mtuoverride):
+    '''Generates and writes the CONFIG per the driver requirements for each interface'''
+    mconfig = collections.defaultdict(list)
+    defaultmtu = 9000
+    applyargs = []
+    for interface in interfaces + interfaces_iscsi:
+        ifpath = '/sys/class/net/{i}'.format(i=interface)
+        dev = os.path.join(ifpath, 'device')
+        drv = '/sys/class/net/{i}/device/driver'.format(i=interface)
+        if not os.path.isdir(dev):
+            print(
+                '{i} not found in sysfs: {d} missing'.format(i=interface, d=dev),
+                file=sys.stderr
+            )
+            exit(1)
+        pciid = os.path.basename(os.readlink(dev))
+        driver = os.path.basename(os.readlink(drv))
+        chkconfig(driver, interface)
+        applyargs.append((ifpath, pciid, driver, interface))
+	if interface in interfaces_iscsi:
+            numvfs = 1
+        elif numservices >= 8:
+            numvfs = 16
+        else:
+            numvfs = 8
+        mac = getmac(drv, pciid, interface)
+        # construct some detailed info for the interface
+        mconfig['interface'].append(interface)
+        mconfig['driver'].append(driver)
+        mconfig['mac'].append(mac)
+        mconfig['pciid'].append(pciid)
+        # configure rx flowcontrol
+        if not rxflowoverride:
+            mconfig['rxflowcontrol'].append('on')
+        else:
+            print(
+                '{i} rx flowcontrol overridden to "{r}"'.format(i=interface, r=rxflowoverride),
+                file=sys.stderr
+            )
+            mconfig['rxflowcontrol'].append(rxflowoverride)
+        # configure tx flowcontrol
+        txflowcontrol = gettxflowcontrol(interface, ifpath, pciid, mconfig=mconfig)
+        if txflowoverride:
+            print(
+                '{i} tx flowcontrol overridden, setting to "{t}"'.format(
+                    i=interface,
+                    t=txflowoverride
+                ),
+                file=sys.stderr
+            )
+            mconfig['txflowcontrol'].append(txflowoverride)
+            mconfig['txflowoverride'].append(txflowoverride)
+        else:
+            mconfig['txflowcontrol'].append(txflowcontrol)
+        if driver in ['ixgbe', 'i40e', 'bnx2x']:
+            if driver == 'bnx2x' and numvfs > 8:
+                print(
+                    'Warning: reducing number of VFs for {i} to the max supported 8'.format(
+                        i=interface
+                    ),
+                    file=sys.stderr
+                )
+                numvfs = 8
+        else:
+            numvfs = 0
+        mconfig['vfs'].append(numvfs)
+        # get MTU
+        ifacemtu = getifacemtu(ifpath)
+        if mtuoverride:
+            mconfig['mtuoverride'].append(mtuoverride)
+            mconfig['mtu'].append(mtuoverride)
+        else:
+            if ifacemtu and ifacemtu != defaultmtu:
+                print(
+                    'MTU for {i} is {m}, different than the default {d}'.format(
+                        i=interface,
+                        m=ifacemtu,
+                        d=defaultmtu
+                    ),
+                    file=sys.stderr
+                )
+            mconfig['mtu'].append(defaultmtu)
+    if ARGS.apply:
+        if ARGS.apply == 'all':
+            print(
+                'Applying on both interfaces: {p}'.format(
+                    p=' '.join([i[3] for i in applyargs])
+                    )
+            )
+            appresults = [applyconfig(*args[:3]) for args in applyargs]
+            sys.exit(max(appresults))
+
+        try:
+            args = applyargs[int(ARGS.apply)]
+            print('Applying on interface net {n}, interface {i}'.format(n=ARGS.apply, i=args[3]))
+            sys.exit(applyconfig(*args[:3]))
+        except IndexError:
+            print('Net {n} probably not configured, please check'.format(n=ARGS.apply))
+            sys.exit(1)
+
+    tstmp = time.time()
+    updstr = getupdstr(tstmp, mconfig, ARGS.disable_hw_acceleration, ARGS.json)
+    if ARGS.noop:
+        print('Noop selected, will not update any files', file=sys.stderr)
+        print(updstr)
+        exit(0)
+    if os.path.isfile(CONFIG):
+        cfgbkp = CONFIG + '-{t}.bkp'.format(t=int(tstmp))
+        print('{c} exists, moving to {b}'.format(c=CONFIG, b=cfgbkp))
+        os.rename(CONFIG, cfgbkp)
+    with open(CONFIG, 'w') as cfghandle:
+        cfghandle.write(updstr)
+
+
+if __name__ == '__main__':
+    ME = sys.argv[0]
+    CONFIG = "/etc/vf-udevhelper.conf"
+    ARGS = getargs()
+    if ARGS.config:
+        CONFIG = ARGS.config
+    SPCFG = storpool.spconfig.SPConfig()
+    IFACES = getifaces(SPCFG)
+    IFACES_ISCSI = get_iscsi_ifaces(SPCFG)
+    NUMSERVICES = getnumberofservices()
+    PROC = subprocess.Popen(['lspci', '-Dvv'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    LSPCIOUT, _ = PROC.communicate()
+    main(IFACES, IFACES_ISCSI, NUMSERVICES, ARGS.rxflow, ARGS.txflow, ARGS.mtu)

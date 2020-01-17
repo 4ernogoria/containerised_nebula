@@ -1,0 +1,144 @@
+#!/bin/bash
+#
+#-
+# Copyright (c) 2013, 2015  StorPool.
+# All rights reserved.
+#
+
+#####################################################################
+# edit /etc/default/irqbalance and add one of the following to
+# the OPTIONS line (adding a new OPTIONS line if none is set):
+#
+# For irqbalance 1.0.4 or earlier:
+# OPTIONS="--banscript=/usr/lib/storpool/irqbalance_banscript"
+#
+# For irqbalance 1.0.5 or later:
+# OPTIONS="--policyscript=/usr/lib/storpool/irqbalance_banscript"
+#####################################################################
+
+function splog() { /usr/bin/logger -t "${0##*/}" "$*"; }
+
+SYSFS=$1
+IRQ=$2
+
+[ -z "$IRQ" ] && exit 1
+
+. /usr/lib/storpool/storpool_confget.sh
+
+[ -z "$SP_IFACE" ] && exit 0
+
+# First, try to determine whether we have been invoked in a proper way
+unset mode
+
+basedir='/usr/lib/storpool'
+fn_ban='irqbalance_banscript'
+fn_policy='irqbalance_policyscript'
+
+if [ -f "$basedir/$fn_ban" ] && [ -f "$basedir/$fn_policy" ]; then
+	# OK, both exist, now how have we been invoked?
+
+	n=`basename "$0" .sh`
+	if [ "$n" = "$fn_ban" ]; then
+		mode='ban'
+	elif [ "$n" = "$fn_policy" ]; then
+		mode='policy'
+	fi
+fi
+
+if [ -z "$mode" ]; then
+	# Nah, not invoked as irqbalance_{ban,policy}script{,.sh}, try to figure
+	# something else out.
+	#
+	# Determine which version of irqbalance we are running under
+
+	# Pff, maybe we should use "lsb_release -is" in some way, but that would
+	# lead to an even larger multitude of cases.  Anyway, lsb_release isn't even
+	# always installed, so there.
+
+	if [ -f '/etc/redhat-release' ]; then
+		ver=`rpm -q --qf '%{Version}' irqbalance`
+		if [ -z "$ver" ]; then
+			splog 'Unable to determine the irqbalance version: rpm -q returned nothing'
+			exit 1
+		fi
+
+		# Yes, I *can* write a real package version comparison function in
+		# Bourne/Bash shell script; however, I really, really don't want to.
+		if [[ $ver =~ ^1\.0\.[0-4](\.|~|$) ]]; then
+			mode='ban'
+		else
+			mode='policy'
+		fi
+	elif [ -f '/etc/debian_version' ]; then
+		ver=`dpkg-query -W -f '${Version}' irqbalance`
+		if [ -z "$ver" ]; then
+			splog 'Unable to determine the irqbalance version: dpkg-query returned nothing'
+			exit 1
+		fi
+
+		if dpkg --compare-versions "$ver" '<<' '1.0.5'; then
+			mode='ban'
+		else
+			mode='policy'
+		fi
+	else
+		splog 'Unable to determine the irqbalance version: unknown Linux distribution'
+		exit 1
+	fi
+fi
+
+# Okay, fine, now determine the list of interfaces to process.
+#
+# Basically:
+# - SP_IFACE: iface1,iface2=mtu,iface3
+# - SP_CPUS_type_REGEX: foo bar (iface|iface) baz quux
+#
+# So extract the relevant parts, split on either "|" for the _REGEX or
+# "(=mtu)?," for _IFACE, place the interface names as hash keys in res[].
+#
+# Then sort and output just the keys of res[].
+
+awkprog='
+	{
+		if (match($0, "^SP_CPUS_[A-Z0-9._]+_REGEX=.*[(]([^)]+)[)]", m) ||
+			match($0, "^SP_IFACE=[[:space:]]*(.*)", m)) {
+				split(m[1], f, "(=[^|,]+)?[|,]+");
+				for (fld in f) {
+					res[f[fld]] = 1;
+				}
+			}
+	}
+
+	END {
+		asorti(res);
+		for (idx in res) {
+			print res[idx];
+		}
+	}
+'
+list=`set | awk -- "$awkprog"`
+
+ban='false'
+for match in $list; do
+	if egrep -qe '^[[:space:]]*'"$IRQ"'\:.+[[:space:]]'"$match"'(-[^[:space:]]+)?$' /proc/interrupts; then
+		ban='true'
+		break
+	fi
+done
+
+case "$mode" in
+	ban)
+		if [ "$ban" = 'true' ]; then
+			exit 1
+		fi
+		;;
+
+	policy)
+		echo "ban=$ban"
+		;;
+
+	*)
+		splog "Internal error: invalid value '$mode' for the mode"
+		exit 1
+		;;
+esac

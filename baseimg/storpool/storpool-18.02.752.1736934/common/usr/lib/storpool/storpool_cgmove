@@ -1,0 +1,198 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2015  StorPool.
+# All rights reserved.
+#
+
+
+# Scan all processes and move processes out of the cgroup cpuset:/ and cgroup memory:/
+# Moves processes to cpuset:/system.slice, and memory:/system.slice
+
+# depends on service cgconfig to mount, create and configure cgroups
+
+#Dependencies:
+# CentOS 6: yum -y install perl
+# CentOS 7: yum -y install perl-core
+# Debian: apt-get -y install perl
+
+############################################################################################
+use v5.10;
+use strict;
+use warnings;
+
+use Sys::Syslog qw(:standard :macros);
+
+sub logAndOutput($ $)
+{
+    my ($msg, $fatal) = @_;
+
+    $msg =~ s/[\r\n]*$//;
+    my $safe = $msg;
+    $safe =~ s/[\r\n]+/_/g;
+
+    if( $fatal )
+    {
+        syslog(LOG_CRIT, 'Fatal: %s', $safe);
+        print STDERR "Fatal: $msg\n";
+        exit(2);
+    }
+    else
+    {
+        syslog(LOG_WARNING, 'Warning: %s', $safe);
+        print STDERR "$msg\n";
+    }
+}
+
+sub openSyslog()
+{
+    openlog("storpool_cgmove", 'ndelay,pid', 'daemon') or
+        die("openlog failed: $!\n");
+    $SIG{'__WARN__'} = sub { logAndOutput($_[0], 0); };
+    $SIG{'__DIE__'} = sub { logAndOutput($_[0], 1); };
+}
+
+sub closeSyslog()
+{
+    closelog() or
+        die("closelog() failed: $!\n");
+    undef @SIG{'__WARN__', '__DIE__'};
+}
+
+openSyslog();
+
+sub logsystem(@)
+{
+	my @args = @_;
+	syslog(LOG_DEBUG,"executing: %s", join " ", @args);
+	system @args;
+}
+
+sub cg_get_root($)
+{
+	my ($cgroup) = @_;
+	my $ret = '';
+	open my $fs,"<", "/proc/mounts" or die "Can't open /proc/mounts";
+	my @mounts = <$fs>;
+	close $fs;
+	for my $line ( @mounts )
+	{
+		chomp $line;
+		my ($cgpath, $opts) = $line =~ m{^cgroup\s+(/[\w/]+)\s+cgroup\s+([\w\,]+)};
+		next unless $opts;
+		return $cgpath if grep { $_ eq $cgroup } split ',', $opts;
+	}
+}
+
+sub load_tasks_in_root($)
+{
+	my ($cgroup) = @_;
+	
+	my $cg_root = cg_get_root($cgroup);
+	
+	die "Cannot find $cgroup cgroup. Not mounted cgroup?" if ! $cg_root;
+	
+	open my $fd, "<", "$cg_root/tasks" or die "Cannot open $cg_root/tasks ($!)";
+	my @tids = <$fd>;
+	close $fd;
+	
+	chomp for @tids;
+	
+	return @tids;
+}
+
+sub get_cmds(@)
+{
+	my @tids = @_;
+	my %res = ();
+	
+	my %tids_index = map { $_ => 1 } @tids;
+	
+	my @ps = `ps -eL -o tid,cmd --no-headers`;
+	for my $line (@ps)
+	{
+		chomp $line;
+		my ($tid,$cmd) = $line =~ m/^\s*(\d+)\s+(.*)/;
+		
+		if ($tids_index{$tid})
+		{
+			$res{$tid} = $cmd;
+		}
+	}
+	
+	return %res;
+}
+
+sub get_conf_value($ $)
+{
+	my ($var, $default) = @_;
+
+	my $value = `/usr/sbin/storpool_confshow -n "$var"`;
+	$value =~ s/[\r\n]*$//ms;
+	return $value eq '' ? $default : $value;
+}
+
+MAIN:
+{
+	openSyslog();
+	my $changed = 0;
+	do
+	{
+		my $slice = get_conf_value 'SP_CGMOVE_SLICE', '/system.slice';
+		my @cgroups = split /\s+/, get_conf_value 'SP_CGMOVE_CGROUPS', 'cpuset memory';
+		for my $cg ( @cgroups )
+		{
+			if (open my $cgget, "-|", "cgget -g \"$cg:$slice\" 2>&1")
+			{
+				my $err;
+				while (<$cgget>) {
+					if (m/cannot find/i)
+					{
+						print;
+						logAndOutput($_, 0);
+						logAndOutput("Set SP_CGMOVE_SLICE and SP_CGMOVE_CGROUPS environment variables properly.", 0);
+						$err = 1;
+					}
+				}
+				close $cgget;
+				next if $err;
+			}
+			
+			my @tmp = load_tasks_in_root($cg);
+			my %tasks_in_root = get_cmds(@tmp);
+			
+			my @storpool_procs;
+			my @other_procs;
+			while (my ($tid,$cmd) = each %tasks_in_root)
+			{
+				if ( $cmd =~ m(^(/usr/sbin/storpool|\[sprdma)) ) # storpool processes/threads
+				{
+					logAndOutput("StorPool process ($cmd) in $cg:/", 0);
+					push @storpool_procs, $tid;
+				}
+				elsif ( $cmd =~ m(^\[(kvm-pit|vhost)) ) # heavy kvm processes/threads
+				{
+					push @other_procs, $tid;
+				}
+				elsif ( $cmd =~ m(^\[) )
+				{
+					# don't touch kernel threads
+				}
+				else
+				{
+					push @other_procs, $tid;
+				}
+			}
+			
+			syslog(LOG_INFO, "%s:%s procs:%s", $cg, $slice, join(",",@other_procs)) if @other_procs;
+			
+			$changed = 0;
+			for my $tid ( sort { $a <=> $b } @other_procs )
+			{
+				logsystem "cgclassify", "-g", "$cg:$slice", $tid;
+				$changed = 1;
+			}
+		}
+	} while ($changed);
+	closeSyslog();
+}

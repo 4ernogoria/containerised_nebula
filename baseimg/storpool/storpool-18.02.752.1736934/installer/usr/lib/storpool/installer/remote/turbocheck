@@ -1,0 +1,139 @@
+#!/bin/bash
+
+usage(){
+  cat <<EOUSAGE
+
+  Usage: $(basename -- $0) [-d|--debug]
+
+  Runs turbostat for 5 seconds, then prints
+  space separated "Bzy_MHz" and "TSC_MHz"
+
+  Exit status is 0 if the max "Bzy_MHz" > max "TSC_MHz"
+  Exit status 1 otherwise.
+
+  Requires root privileges
+
+  -d|--debug - prints the output from turbostat
+EOUSAGE
+}
+
+readfile(){
+  local tfile="$1"
+  local debug="$2"
+python -c '
+import sys
+lines = [
+  line.split() for line in open(sys.argv[1]).readlines()
+  if len(line.split()) > 1 and "sec" not in line.split()
+  ]
+try:
+  if sys.argv[2]:
+    for l in lines:
+      print >> sys.stderr, l
+except IndexError:
+  pass
+def p(s, lines):
+        result = 0
+        for el in lines:
+                if s in el:
+                        j = lines.index(el)
+                        i = el.index(s)
+                        try:
+                          result = max([ l[i] for l in lines[j+1:]])
+                        except IndexError:
+                          pass
+        return result
+bzy = p("Bzy_MHz",lines)
+tsc = int(p("TSC_MHz",lines))
+if tsc == 0:
+  turbo = 0
+elif float(bzy)/tsc * 100 < 101:
+  # less than a percent
+  # probably not working
+  turbo = 0
+else:
+  # probably works
+  turbo = 1
+print bzy, tsc, turbo
+' "$tfile" "$debug"
+}
+
+while [[ -n "$1" ]]; do
+  case "$1" in
+    -d|--debug)
+      dflag=1
+      shift
+      ;;
+    *)
+      usage 1>&2
+      exit
+      ;;
+  esac
+done
+
+tfile="$(mktemp)"
+trap "rm -f ${tfile}" INT HUP EXIT TERM QUIT
+
+if ! which turbostat &>/dev/null; then
+  echo "turbostat not installed or not in PATH" 2>&1
+  exit 1
+fi
+
+(
+  modprobe msr &>/dev/null
+  cpusetcgpath="$(awk '$2 ~ /cpuset/ { print $2; exit(0); }' /proc/mounts)"
+  cpusettasks="$cpusetcgpath/tasks"
+  if [[ -e $cpusettasks ]]; then
+    echo "$BASHPID" 2>/dev/null > "$cpusettasks"
+  fi
+
+  timeout -s SIGINT 3 turbostat -i 2 -- cat /dev/zero > /dev/null 2> "${tfile}" 
+  )
+
+if fgrep -qi "warning: turbostat" "${tfile}"; then
+  # Catches the 'WARNING: turbostat not found for kernel 3.16.0-46' message
+  echo "$(cat $tfile)" 1>&2
+  exit 1
+elif [[ ! -s $tfile ]]; then
+  echo "Something went wrong, ${tfile} empty" 1>&2
+  exit 1
+fi
+
+seconds="$(date +%-S)"
+if [[ $((60-seconds)) -le 3 ]]; then
+  # only three seconds left to round minute
+  # wait for storpool_cgmove to finish
+  sleep 4
+fi
+
+count=0
+mBzy_MHz=0
+mTSC_MHz=0
+turbo=
+while [[ $mBzy_MHz -eq 0 && $mTSC_MHz -eq 0 && -z $turbo ]]; do
+  # retry
+  read mBzy_MHz mTSC_MHz turbo <<<"$(readfile "$tfile" "$dflag")"
+  if [[ $count -gt 2 ]] ; then
+    echo "Something went wrong, retried 2 times" 1>&2
+    exit 1
+  fi
+  sleep 0.5
+  count=$((count+1))
+done
+
+echo "$mBzy_MHz" "$mTSC_MHz"
+
+if [[ -n $dflag ]]; then
+  cat "$tfile"
+fi
+
+if [[ -z $mBzy_MHz || -z $mTSC_MHz || -z $turbo ]]; then
+  echo "Something went wrong mBzy_MHz or mTSC_MHz empty" 1>&2
+  exit 2
+elif [[ $turbo -gt 0 ]]; then
+  [[ -n $dflag ]] && echo "Turbo working" 1>&2
+  exit 0
+else
+  [[ -n $dflag ]] && echo "Turbo probably disabled or not supported on this CPU" 1>&2
+  exit 1
+fi

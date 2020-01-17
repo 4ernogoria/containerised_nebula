@@ -1,0 +1,110 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2018 StorPool.
+# All rights reserved.
+#
+#
+# chkconfig: - 21 89
+# description: StorPool hugepages reservation
+#
+#
+### BEGIN INIT INFO
+# Provides: storpool_hugepages
+# Required-Start: $local_fs cgconfig
+# Required-Stop: $local_fs cgconfig
+# Should-Start: $syslog
+# Should-Stop: $syslog
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: StorPool hugepages reservation
+# Description: call /usr/sbin/storpool_hugepages
+
+### END INIT INFO
+NAME=storpool_hugepages
+
+# rpm based distros
+if [ -d /etc/sysconfig ]; then
+        [ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
+fi
+
+[ -n "$SP_LOCK_FILE" ] || SP_LOCK_FILE="/var/lock/subsys/${NAME}"
+
+# set secure PATH
+PATH="/sbin:/bin:/usr/sbin:/usr/bin"
+
+success()
+{
+        echo -ne "[  OK  ]\r"
+}
+
+failure()
+{
+        echo -ne "[FAILED]\r"
+}
+
+
+# rpm based distros
+if [ -d /etc/sysconfig ]; then
+	[ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
+fi
+
+start()
+{
+	echo -n "${NAME}:  "
+	/usr/sbin/storpool_hugepages -R
+	RET=$?
+	if [ "$RET" -eq 0 ]; then
+		local sp_lock_dir=`dirname -- "$SP_LOCK_FILE"`
+		[ -d "$sp_lock_dir" ] && touch "$SP_LOCK_FILE"
+		success
+	else
+		failure
+	fi
+	echo
+	return "$RET"
+}
+
+stop()
+{
+	
+	echo -n "${NAME}: not implemented "
+	success
+	rm -f -- "$SP_LOCK_FILE"
+	echo
+	return 0
+}
+
+reload()
+{
+	stop
+	start
+}
+
+status()
+{
+	echo -n "${NAME}: not implemented "
+	success
+	echo
+	return 0
+}
+
+case "$1" in
+	start)
+			start
+			;;
+	stop)
+			stop
+			;;
+	restart)
+			reload
+			;;
+	reload)
+			reload
+			;;
+	status)
+			status
+			;;
+	*)
+			echo "$0 [start|stop|restart|reload|status]"
+esac

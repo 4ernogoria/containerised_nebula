@@ -1,0 +1,209 @@
+#!/usr/bin/perl
+
+use v5.10;
+use strict;
+use warnings;
+
+use Digest::MD5 qw(md5 md5_hex);
+use IO::Socket::SSL;
+use JSON::XS;
+use Socket qw(sockaddr_in unpack_sockaddr_in AF_INET SOCK_STREAM SOL_SOCKET SO_KEEPALIVE);
+
+my $DEBUG = 0;
+
+my $TIMEOUT = 15;
+my $TIMEOUT_CMD = "timeout $TIMEOUT";
+
+my %res; # results of all commands
+my @errors;  # any errors reported
+my $cluster;
+my $ourid;
+
+my $json = JSON::XS->new->utf8->canonical->pretty;
+
+my %storpool_cmds = (
+	'disk' => 'disk list',
+	'service' => 'service list',
+	'net' => 'net list',
+	'attach' => 'attach list',
+	'tasks' => 'task list',
+	'volumes' => 'volume list',
+	'snapshots' => 'snapshot list',
+	'placementgroup' => 'placementGroup list',
+	'template' => 'template status',
+	'balancer' => 'balancer status',
+	'relocator' => 'relocator status',
+	'mgmtConfig' => 'mgmtConfig list',
+);
+
+# external executables returing json on stdout
+my %cmds = (
+    'latthreshold' => '/usr/lib/storpool/latthreshold.py GLOBAL_TIMEOUT=30000 J=1',
+);
+
+sub tcp_first($ @)
+{
+	my ($port, $vhost, @hosts) = @_;
+
+	my @conns;
+	for my $host (@hosts) {
+		my $s = IO::Socket::INET->new(
+			Type => SOCK_STREAM,
+			Proto => 'tcp',
+			PeerHost => $host,
+			PeerPort => $port,
+			Blocking => 0,
+		);
+		if (!defined $s) {
+			warn "Could not start a TCP connection to $host:$port: $!\n";
+			next;
+		}
+		$s->setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1);
+		push @conns, $s;
+	}
+	if (!@conns) {
+		die "Could not start a TCP connection to any of the StorPool hosts\n";
+	}
+
+	while (1) {
+		my $write = '';
+		vec($write, fileno $_, 1) = 1 for @conns;
+		my $exc = $write;
+		my $n = select(undef, $write, $exc, undef);
+		my @left;
+		for my $s (@conns) {
+			my $fd = $s->fileno;
+
+			if (vec($write, $fd, 1)) {
+				if ($s->connected) {
+					$s->blocking(1);
+					IO::Socket::SSL->start_SSL($s,
+						SSL_hostname => $vhost,
+
+						# FIXME: maybe not 'none'?  But where to find
+						# the bundle?  Can we depend on its being in, say,
+						# /etc/ssl/certs/ or something?
+						#
+						SSL_verify_mode => SSL_VERIFY_NONE,
+					) or die "Could not upgrade a connection to SSL: ".IO::Socket::SSL::errstr;
+					return $s;
+				}
+				# If not connected, do not copy $conn to @left.
+			} elsif (vec($exc, $fd, 1)) {
+				# Do not copy $conn to @left.
+			} else {
+				push @left, $s;
+			}
+		}
+		if (!@left) {
+			die "Could not connect to any of the StorPool hosts (@hosts)\n";
+		}
+		@conns = @left;
+	}
+}
+
+sub json_cmd {
+    my ($cmd) = @_;
+	my $res = `$TIMEOUT_CMD $cmd`;
+	push @errors, "Could not execute the '$cmd' query: (" . ($?>>8) . ")\n"
+		unless $? == 0;
+	my $jres; #JSON encoded result
+	if ($?>>8 == 124){
+		$jres = { error => { code=>124, descr=>"ID: $ourid; timeout" }};
+	} elsif ($? > 0) {
+		$jres = { error => { code=>$?>>8, descr => "ID: $ourid; $res" }};
+	} else {
+		$jres = eval { $json->decode($res);};
+		$jres = { error => { code=>64, descr => "ID: $ourid; $@ $res" }} if $@;
+	}
+	return $jres;
+}
+
+sub storpool_cli {
+	my ($cmd) = @_;
+	return json_cmd("/usr/sbin/storpool -Bj " . $cmd);
+}
+
+$cluster = `$TIMEOUT_CMD /usr/sbin/storpool_confshow -n SP_CLUSTER_NAME`;
+die "Could not obtain the StorPool cluster name: $!\n" unless $? == 0;
+chomp $cluster;
+
+$ourid = `$TIMEOUT_CMD /usr/sbin/storpool_confshow -n SP_OURID`;
+push @errors, "Could not obtain the StorPool server id: $!\n" unless $? == 0;
+chomp $ourid;
+
+# pseudo random delay
+my $delay = unpack("S", md5($cluster)) % 30;
+sleep $delay unless $DEBUG;
+
+# check first if we're active, save result to use it later in the response.
+my $service = storpool_cli('service list');
+
+
+# we got mgmt status sucessfully, but we're not active - > exit
+if ($ourid && $service->{data} && ! @errors &&
+		! $service->{data}{mgmt}{$ourid}{active}) {
+	exit 0;
+}
+
+# Execute all monitoring commands only if this is the active management
+# If error while geting management status, continue to send error report
+if ($ourid && $service->{data} &&
+		$service->{data}{mgmt}{$ourid}{active}) {
+
+	$res{service} = $service;
+
+	# monitoring commands
+	foreach (keys %storpool_cmds) {
+		$res{$_} = storpool_cli($storpool_cmds{$_});
+	}
+
+	foreach (keys %cmds) {
+		$res{$_} = json_cmd($cmds{$_});
+	}
+}
+
+
+my $conffile = '/etc/storpool/storpool_genreport.conf';
+if (-f "$conffile") {
+	my $val = `. "$conffile" && printf '%s\n' "\$ignored_services"`;
+	die "Could not source $conffile: $!\n" unless $? == 0;
+	if (defined $val) {
+		chomp $val;
+		$res{'ignstr'} = $val unless $val eq '';
+	}
+}
+
+$res{user} = $cluster;
+$res{pass} = md5_hex("spnagios.$cluster");
+$res{errors} = \@errors;
+$res{ourid} = $ourid;
+
+# Sigh...
+my $vhost = 'spnagios.storpool.com';
+my $body = $json->encode(\%res);
+my $data = sprintf
+	"POST %s HTTP/1.1\r\n".
+	"Host: %s\r\n".
+	"User-Agent: %s/%s\r\n".
+	"Connection: close\r\n".
+	"Content-Length: %d\r\n".
+	"\r\n".
+	'%s',
+	'/confupd/recv-json.php',
+	$vhost,
+	'storpool-monitor', '0.2.0',
+	length($body),
+	$body;
+
+die $data if $DEBUG;
+
+my $conn = tcp_first 443, $vhost, qw(mon1.storpool.com mon2.storpool.com mon3.storpool.com);
+print $conn $data or die "Could not post to the StorPool server\n";
+my $line = <$conn>;
+if (!defined $line) {
+	die "Could not get the POST reply from the StorPool server\n";
+} elsif ($line !~ m{^ HTTP/1\.1 \s+ 200 \s }x) {
+	chomp $line;
+	die "Could not post to the StorPool server: $line\n";
+}

@@ -1,0 +1,28 @@
+#
+#-
+# Copyright (c) 2017  StorPool.
+# All rights reserved.
+#
+
+[Unit]
+Description=StorPool nvmed service
+After=syslog.target
+After=storpool_hugepages.service
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=storpool_server.service
+
+[Service]
+Type=forking
+PIDFile=/var/run/storpool_nvmed.pid
+ExecStart=/usr/sbin/storpool_nvmed -d
+ExecStopPost=/bin/rm -f /var/run/storpool_nvmed.pid
+StandardInput=null
+StandardOutput=inherit
+StandardError=inherit
+KillMode=process
+Slice=storpool.slice
+BlockIOAccounting=false
+CPUAccounting=false
+MemoryAccounting=false

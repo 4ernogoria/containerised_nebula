@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2014  StorPool.
+# All rights reserved.
+#
+
+PATH=/bin:/sbin:/usr/bin/:/usr/sbin:$PATH
+
+KDUMP_CONF_RH=/etc/kdump.conf
+KDUMP_CONF_DEB=/etc/default/kdump-tools
+
+unset SP_CRASH_USER
+
+. /usr/lib/storpool/storpool_confget.sh
+
+if [ -z "$SP_CRASH_USER" ]; then
+	# Nothing to do, but no complaints, please
+	exit 0
+fi
+
+if ! getent -- passwd "$SP_CRASH_USER" > /dev/null; then
+	echo "Nonexistent account '$SP_CRASH_USER' specified by SP_CRASH_USER'" 1>&2
+	exit 1
+fi
+
+unset crashDir
+[ -d /var/crash ] && crashDir=/var/crash
+
+if [ -f "$KDUMP_CONF_RH" ]; then
+	path=`awk -- '$1 == "path" { print $2; exit(0); }' "$KDUMP_CONF_RH"`
+	if [ -n "$path" ]; then
+		crashDir="$path"
+	fi
+elif [ -f "$KDUMP_CONF_DEB" ]; then
+	path=`unset KDUMP_COREDIR; . "$KDUMP_CONF_DEB"; echo "$KDUMP_COREDIR"`
+	if [ -n "$path" ]; then
+		crashDir="$path"
+	fi
+fi
+
+if [ -n "$crashDir" ] && [ -d "$crashDir" ] && [ "$crashDir" != '/' ]; then
+	# for all directories inside crashDir
+	find -- "$crashDir/" -mindepth 1 -maxdepth 1 -type d \! -user "$SP_CRASH_USER" | while read subDir ; do
+		chown -R -- "$SP_CRASH_USER" "$subDir"
+		if [ ! -f "${subDir}/vmcore-dmesg-incomplete.txt" ] || [ -s "${subDir}/vmcore-dmesg-incomplete.txt" ]; then
+			continue
+		fi
+		if ! type makedumpfile 2>/dev/null >/dev/null; then
+			continue
+		fi
+		# get the kernel version from the vmcore file
+		kernel_version="$( timeout 180 strings -- "${subDir}/vmcore" 2>/dev/null | egrep -e '^OSRELEASE=[a-z0-9\-\_\.]+' | tail -n 1 | cut -d'=' -f2 )"
+		if [ -z "$kernel_version" ]; then
+			continue
+		fi
+		# check that there is a debug vmlinux in /usr/src or /usr/lib/debug
+		vmlinux="$( find -- /usr/src /usr/lib/debug/ -type f -name "vmlinux-${kernel_version}" 2>/dev/null | head -n 1 )"
+		if [ -z "$vmlinux" ]; then
+			continue
+		fi
+		# attempt to extract dmesg with --dump-dmesg parameter (timeout necessary)
+		if timeout 160 makedumpfile --dump-dmesg -x "$vmlinux" -- "${subDir}/vmcore" "${subDir}/vmcore-dmesg"; then
+			rm -f "${subDir}/vmcore-dmesg-incomplete.txt"
+			chown -- "$SP_CRASH_USER" "${subDir}/vmcore-dmesg"
+		fi
+	done
+fi

@@ -1,0 +1,115 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2013, 2014  StorPool.
+# All rights reserved.
+#
+# Authors:
+#  Anton Todorov <a.todorov@storpool.com>
+#
+# chkconfig: - 21 89
+# description: StorPool kdump helper srvice
+#
+#
+### BEGIN INIT INFO
+# Provides: storpool_kdump
+# Required-Start: $local_fs
+# Required-Stop: $local_fs
+# Should-Start: $syslog
+# Should-Stop: $syslog
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: StorPool kdump helper Service
+# Description: call /usr/sbin/storpool_kdump
+
+### END INIT INFO
+NAME=storpool_kdump
+KILL_TIMEOUT=60
+
+# rpm based distros
+if [ -d /etc/sysconfig ]; then
+        [ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
+fi
+
+[ -n "$SP_LOCK_FILE" ] || SP_LOCK_FILE="/var/lock/subsys/${NAME}"
+
+# set secure PATH
+PATH="/sbin:/bin:/usr/sbin:/usr/bin"
+
+success()
+{
+        echo -ne "[  OK  ]\r"
+}
+
+failure()
+{
+        echo -ne "[FAILED]\r"
+}
+
+
+# rpm based distros
+if [ -d /etc/sysconfig ]; then
+	[ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
+fi
+
+start()
+{
+	echo -n "${NAME}:  "
+	/usr/lib/storpool/storpool_kdump
+	RET=$?
+	if [ "$RET" -eq 0 ]; then
+		local sp_lock_dir=`dirname -- "$SP_LOCK_FILE"`
+		[ -d "$sp_lock_dir" ] && touch "$SP_LOCK_FILE"
+		success
+	else
+		failure
+	fi
+	echo
+	return "$RET"
+}
+
+stop()
+{
+	
+	echo -n "${NAME}: not implemented "
+	success
+	rm -f -- "$SP_LOCK_FILE"
+	echo
+# intentionally commented out
+#	rm -f "$UNLOAD_LOCK_FILE"
+	return 0
+}
+
+reload()
+{
+	stop
+	start
+}
+
+status()
+{
+	echo -n "${NAME}: not implemented "
+	success
+	echo
+	return 0
+}
+
+case "$1" in
+	start)
+			start
+			;;
+	stop)
+			stop
+			;;
+	restart)
+			reload
+			;;
+	reload)
+			reload
+			;;
+	status)
+			status
+			;;
+	*)
+			echo "$0 [start|stop|restart|reload|status]"
+esac

@@ -1,0 +1,587 @@
+#!/usr/bin/python
+'''
+Used for generating interface configuration by a predefined yaml config file or
+through the configured network interface configuration in storpool.conf
+'''
+# The MIT License (MIT)
+#
+# Copyright (c) 2015-2018 StorPool Storage AD
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import print_function
+
+import argparse
+import datetime
+import os
+import re
+import socket
+import sys
+import time
+import jinja2
+import yaml
+import storpool.spconfig
+
+CENTOSLIKE = ['centos_6', 'centos_7']
+CENTOSCONFIGPATH = '/etc/sysconfig/network-scripts'
+DEBIANLIKE = ['debian_8', 'debian_9', 'ubuntu_16.04', 'ubuntu_18.04']
+DEBIANCONFIGPATH = '/etc/network/interfaces.d'
+ME = sys.argv[0]
+TMPLDIR = '/usr/lib/storpool'
+
+
+def getargs():
+    '''returns argparse object'''
+    parser = argparse.ArgumentParser(
+        description="""
+        Generates configuration settings for interfaces based on the operating
+        system either from previously prepared YAML files or by reading the
+        interfaces configured in the /etc/storpool.conf and
+        /etc/storpool.conf.d/*.conf files.
+
+        The configuration generated will be placed in the relevant directories
+        accordingly:
+         - CentOS 6/7 - {c}/ifcfg-<device_name>
+         - Debian 8/9, Ubuntu 16.04 - {d}/<device_name>
+        """.format(c=CENTOSCONFIGPATH, d=DEBIANCONFIGPATH)
+    )
+    parser.add_argument(
+        "YAML_source",
+        type=str,
+        nargs='*',
+        help="File(s) to dump configuration from, expected <device_name>.yaml"
+    )
+    parser.add_argument(
+        "-N",
+        "--noop",
+        help="Do not write anything, just print what will be generated.",
+        action='store_true'
+    )
+    parser.add_argument(
+        "-o",
+        "--overwrite",
+        help="Overwrite existing files.",
+        action='store_true'
+    )
+    parser.add_argument(
+        "-a",
+        "--auto",
+        help=(
+            "Read the configured SP_IFACE[12]_CFG from "
+            "storpool.conf and autoconfigure"
+        ),
+        action='store_true'
+    )
+    parser.add_argument(
+        "-t",
+        "--templatedir",
+        type=str,
+        help=(
+            "Use this directory for templates instead of the default"
+            "({t})".format(t=TMPLDIR)
+        )
+    )
+    return parser.parse_args()
+
+
+class Interface(object):
+    """Base class for Interface, to be used for common methods as mixin."""
+    def __init__(self, interface, ipaddr=None, iftype=None,
+                 bonding_master=None):
+        '''interface, ipaddr, iftype, bonding_master: str names of the:
+         - interface
+         - IP address
+         - interface type (e.g. VLAN, Bond, etc.)
+         - name of the bond master
+        '''
+        super(Interface, self).__init__()
+        self.interface = interface
+        if ipaddr:
+            self.ipaddr = ipaddr
+        reg = re.compile(
+            r'''^
+            (?P<rawname> [a-zA-Z0-9]+ )
+            (?: \. (?P<vlan> \d+ ) )?''',
+            re.X
+        )
+        self.match = reg.match(self.interface)
+        if self.match:
+            if self.match.group('rawname'):
+                self.rawname = self.match.group('rawname')
+            else:
+                self.rawname = self.interface
+            if self.match.group('vlan'):
+                self.vlan = self.match.group('vlan')
+            else:
+                self.vlan = None
+        if not iftype:
+            if self.vlan:
+                self.iftype = 'Vlan'
+                self.physdev = self.rawname
+            else:
+                self.iftype = 'Ethernet'
+        else:
+            self.iftype = iftype
+        if bonding_master:
+            self.bonding_master = bonding_master
+
+class BondInterface(Interface):
+    """
+    Just a different type of interface with
+    few more details for bonding
+    """
+    def __init__(self, interface, ipaddr=None,
+                 bond_mode=None, arp_ip_target=None):
+        '''bond_mode: str type of the bond
+        arp_ip_target - list of IPs to use for switching active interface
+        (for active-backup bond)'''
+        super(BondInterface, self).__init__(interface, ipaddr, iftype='Bond')
+        self.bond_mode = bond_mode
+        self.arp_ip_target = arp_ip_target
+
+
+class SPNet(object):
+    """Single StorPool network class"""
+    def __init__(self, ifacestr):
+        '''
+        ifacestr: string as returned by storpool_showconf -ne SP_IFACE1_CFG
+        '''
+        fields = [
+            'configversion',
+            'resolveiface',
+            'rawiface',
+            'vlan',
+            'ipaddr',
+            'resolve',
+            'shared',
+            'mac'
+        ]
+        self.spl = ifacestr.split(':')
+        assert len(self.spl) == len(fields)
+        for idx, name in enumerate(fields):
+            setattr(self, name, self.spl[idx])
+
+
+class SPNetConfig(object):
+    """The class that would be holding the whole net configuration"""
+    def __init__(self):
+        super(SPNetConfig, self).__init__()
+        self.spc = storpool.spconfig.SPConfig()
+        nets = [
+            self.spc.get('SP_IFACE{i}_CFG'.format(i=n), None) for n in [1, 2]
+        ]
+        self.nets = []
+        self.interfaces = []
+        for ind in [0, 1]:
+            if nets[ind]:
+                self.nets.append(SPNet(nets[ind]))
+        if len(self.nets) < 2:
+            exit('Single network is not supported')
+        # if the resolve interfaces are the same assume bond
+        n0r = self.nets[0].resolveiface
+        n1r = self.nets[1].resolveiface
+        if n0r == n1r:
+            print(
+                'Same resolve interface {r} for both nets,'
+                ' assuming bond'.format(r=n0r)
+            )
+            self.bond()
+        else:
+            print(
+                'Resolve interfaces differ ({r}/{r1}), '
+                'assuming exclusive interfaces'.format(
+                    r=n0r,
+                    r1=n1r
+                )
+            )
+            self.exclusive()
+
+    @property
+    def singlevlan(self):
+        '''Returns true if both nets are with the same vlan '''
+        return len(set([v.vlan for v in self.nets])) == 1
+
+    def matchproperty(self, prop):
+        '''prop: str name of the property
+        returns True of it matches for both networks, else
+        False'''
+        if len(set([getattr(n, prop) for n in self.nets])) > 1:
+            return False
+        return True
+
+    def addifaces(self, master=None):
+        '''master: string name of the bond interface master if any
+        if master, adds a dummy and both nets raw interfaces *and* the master
+        itself, else just the raw interfaces'''
+        if master:
+            self.interfaces.append(
+                Interface(
+                    'dummy0',
+                    iftype='dummy',
+                    bonding_master=master.interface
+                )
+            )
+            self.interfaces.append(master)
+        for net in self.nets:
+            iface = Interface(net.rawiface)
+            if master:
+                iface.bonding_master = master.interface
+            self.interfaces.append(iface)
+
+    def chkproperties(self, props):
+        '''
+        props: list of str props to check
+        exits with an error if the property doesn't match
+        between the two nets
+        '''
+        for prop in props:
+            if not self.matchproperty(prop):
+                exit(
+                    'The "{p}" property should match (n0: '
+                    '{n0}, n1: {n1}), bailing out'.format(
+                        p=prop,
+                        n0=getattr(self.nets[0], prop),
+                        n1=getattr(self.nets[1], prop)
+                        )
+                )
+
+    def getarptargets(self, ipaddr):
+        '''ipaddr: str IP of the resolveiface
+        returns list of str IP addresses for the other
+        server nodes for the arp monitoring
+        prints warning if some of them is not from the same net
+        '''
+        result = []
+        hostname = socket.gethostname()
+        otherservers = [
+            node for node in self.spc.get_all_sections()
+            if node != hostname and not storpool.spconfig.SPConfig(
+                section=node,
+            ).get('SP_NODE_NON_VOTING', None)
+        ]
+        otherinstances = [
+            storpool.spconfig.SPConfig(
+                section=node
+            ) for node in otherservers
+        ]
+        otherips = [
+            SPNet(i.get("SP_IFACE1_CFG", None)).ipaddr for i in otherinstances
+        ]
+        rspl = ipaddr.split('.')
+        for otherip in otherips:
+            if otherip.split('.')[:3] == rspl[:3]:
+                result.append(otherip)
+            else:
+                print(
+                    'Warning: skipping {i} '
+                    '(does not match the {n}.0 net)'.format(
+                        i=otherip,
+                        n='.'.join(rspl[:3])
+                    )
+                )
+        return result
+
+    def exclusive(self):
+        '''
+        Does some additional checks and configures
+        exclusive type configuration
+        '''
+        if self.singlevlan:
+            self.chkproperties(['resolve', 'shared', 'mac'])
+        if self.matchproperty('ipaddr'):
+            exit(
+                'The IP address matches between the interfaces, '
+                'but should be different, please check'
+            )
+        for net in self.nets:
+            resolveiface = Interface(net.resolveiface)
+            if resolveiface.vlan:
+                # tagged vlan, ensure same vlan is used
+                if resolveiface.vlan != net.vlan:
+                    exit(
+                        'Error: different vlan configured, please check\n'
+                        'resolveiface/vlan: {r}/{v}'.format(
+                            r=resolveiface.interface,
+                            v=net.vlan
+                        )
+                    )
+                # add the underlying raw interface
+                self.interfaces.append(Interface(resolveiface.rawname))
+            resolveiface.ipaddr = net.ipaddr
+            self.interfaces.append(resolveiface)
+
+    def bond(self):
+        '''
+        Does some additional checks and detects/configures
+        bond type configuration
+        '''
+        if not self.singlevlan:
+            exit(
+                'Only single vlan supported with bond interface configuration'
+            )
+        props = ['ipaddr', 'resolve', 'shared', 'mac']
+        self.chkproperties(props)
+        values = [getattr(self.nets[0], prop) for prop in props]
+        if values[1:] == ['b', 's', 'P']:
+            print('An active-backup bond interface detected')
+            resolveiface = Interface(self.nets[0].resolveiface)
+            resolveiface.ipaddr = values[0]
+            targets = self.getarptargets(resolveiface.ipaddr)
+            if not targets:
+                exit(
+                    'Could not find other nodes that could be used for'
+                    ' ARP IP targets'
+                )
+            if resolveiface.vlan:
+                self.interfaces.append(resolveiface)
+                # add the underlying bonding interface as well
+                biface = BondInterface(
+                    resolveiface.rawname,
+                    bond_mode="active-backup",
+                    arp_ip_target=targets
+                )
+            else:
+                # add bonding details to resolveiface
+                biface = BondInterface(
+                    resolveiface.interface,
+                    bond_mode="active-backup",
+                    arp_ip_target=targets,
+                    ipaddr=resolveiface.ipaddr
+                )
+            self.addifaces(master=biface)
+        elif values[1:] == ['b', 's', 'v']:
+            print('An 802.3ad bond interface detected')
+            resolveiface = Interface(self.nets[0].resolveiface)
+            resolveiface.ipaddr = values[0]
+            if resolveiface.vlan:
+                self.interfaces.append(resolveiface)
+                biface = BondInterface(
+                    resolveiface.rawname,
+                    bond_mode="802.3ad",
+                )
+            else:
+                biface = BondInterface(
+                    resolveiface.interface,
+                    bond_mode="802.3ad",
+                    ipaddr=resolveiface.ipaddr
+                )
+            self.addifaces(master=biface)
+        else:
+            exit(
+                'The {t} setup is not handled'.format(t=":".join(values[1:]))
+            )
+
+    def dump(self):
+        '''shows all interfaces through load'''
+        for iface in self.interfaces:
+            print(load(OPSYS, iface.interface, iface, noop=ARGS.noop))
+
+
+def getos():
+    ''' return running OS'''
+    osrel = '/etc/os-release'
+    rhrel = '/etc/redhat-release'
+    unk = None
+    cfg = {}
+    if os.path.isfile(osrel):
+        with open(osrel) as relfile:
+            contents = relfile.read()
+            for i in contents.split('\n'):
+                if len(i) > 1:
+                    key, val = i.split('=')
+                    cfg[key] = val.strip('"')
+            return '{i}_{v}'.format(i=cfg['ID'], v=cfg['VERSION_ID'])
+    elif os.path.isfile(rhrel):
+        with open(rhrel) as relfile:
+            contents = relfile.read()
+            if re.search(re.compile('(?i)centos release 6'), contents):
+                return 'centos_6'
+    return unk
+
+
+def autoconfigure():
+    '''Attempts to find what configuration is required by reading the
+    provided config in /etc/storpool.conf and /etc/storpool.conf.d/*.conf files
+    '''
+    SPNetConfig().dump()
+
+
+def chkdebiface(ifacename, noop=None, ifile='/etc/network/interfaces'):
+    '''
+    Checks that the interface is not already configured into the
+    /etc/network/interfaces configuration file. Exits the script in
+    case it is.
+    '''
+    chknetplan()
+    chknetifaces()
+    reg = re.compile(r'^(\s+)?auto\s+{i}(\s+)?(\#.*)?$'.format(i=ifacename))
+    errmsg = '{i} already configured in {f}'.format(
+        i=ifacename,
+        f=ifile
+    )
+    if noop is None:
+        noop = ARGS.noop
+    try:
+        with open(ifile) as ifaces:
+            lines = ifaces.readlines()
+            for line in lines:
+                if reg.match(line):
+                    if noop:
+                        print('Warning: {e}'.format(e=errmsg), file=sys.stderr)
+                    else:
+                        exit('Critical: {e}'.format(e=errmsg))
+    except IOError as err:
+        exit(err)
+
+
+def chknetplan(ifstate='/run/network/ifstate'):
+    '''ensures the ifstate file exists, othrewise this might be
+    a netplan installation'''
+    if not os.path.exists(ifstate):
+        exit(
+            '{i} does not exist, perhaps a netplan installation?'.format(
+                i=ifstate
+            )
+        )
+
+
+def chknetifaces(noop=None, ifile='/etc/network/interfaces'):
+    '''Does a check if the default source-directory parameter was already
+    added in the /etc/network/interfaces configuration file'''
+    reg = re.compile(
+        r'''^ # line start
+        (\s+)? source-directory # main parameter
+        \s+ (/etc/network/)? interfaces\.d (/)? # match path
+        (\s+)? (\#.*)? $ # end of the line stuff
+        ''',
+        re.X
+    )
+    errmsg = '{i} is missing a required parameter, please add:\n'.format(
+        i=ifile
+    )
+    if noop is None:
+        noop = ARGS.noop
+    errmsg += 'source-directory interfaces.d'
+    with open(ifile) as tgt:
+        matches = [l for l in tgt.readlines() if reg.match(l)]
+    if not matches:
+        if noop:
+            print('Warning: {e}'.format(e=errmsg), file=sys.stderr)
+        else:
+            exit('Critical: {e}'.format(e=errmsg))
+
+
+def load(opsys, ifacename, yobj, noop=True, templdir=None):
+    '''opsys: str name of the operating system
+    ifacename: str name of the interface
+    yobj: dict containing details for the interface either from an yaml or
+    constructed out of other sources (i.e. storpool.conf)
+    noop: bool - trigger wether to just print or write the configuration
+    if noop returns string output from what would be created, else None
+    '''
+    result = ''
+    if not templdir:
+        templdir = TMPLDIR
+    tstamp = int(time.time())
+    j2env = jinja2.Environment(loader=jinja2.FileSystemLoader(templdir))
+    if opsys in CENTOSLIKE:
+        baseline = j2env.get_template(os.path.join('rheliface.j2'))
+        configdir = CENTOSCONFIGPATH
+        configfile = os.path.join(configdir, 'ifcfg-{i}'.format(i=ifacename))
+    elif opsys in DEBIANLIKE:
+        baseline = j2env.get_template(os.path.join('debiface.j2'))
+        configdir = DEBIANCONFIGPATH
+        configfile = os.path.join(
+            configdir, '{i}'.format(
+                i=ifacename.replace('.', '_')
+            )
+        )
+        chkdebiface(ifacename, noop)
+    else:
+        exit('{o} not supported'.format(o=opsys))
+    contents = baseline.render(item=yobj)  # pylint: disable=no-member
+    if noop:
+        return(
+            'Noop selected, would create '
+            '{y} with the following contents:\n\n{c}'.format(
+                y=configfile,
+                c=contents
+            )
+        )
+    if os.path.exists(configfile):
+        if not ARGS.overwrite:
+            result += (
+                '{c} exists, please use -o to replace\n'.format(c=configfile)
+            )
+            return result
+        bfile = os.path.join(
+            configdir,
+            '.{c}-{t}'.format(
+                c=ifacename,
+                t=tstamp
+            )
+        )
+        contents = '# backup file moved into {b}\n'.format(b=bfile) + contents
+        result += 'Moving old {c} into {b}'.format(c=configfile, b=bfile)
+        os.rename(configfile, bfile)
+    with open(configfile, 'w') as cfile:
+        hrtime = datetime.datetime.utcfromtimestamp(tstamp).strftime(
+            '%Y-%m-%d %H:%M:%S'
+        )
+        contents = '# Autogenerated by {s} on {t}\n{c}\n'.format(
+            s=ME,
+            t=hrtime,
+            c=contents
+        )
+        cfile.write(contents)
+    return result
+
+
+if __name__ == '__main__':
+    ARGS = getargs()
+    OPSYS = getos()
+    if not OPSYS:
+        sys.exit("Could not determine the OS, bailing out")
+    if ARGS.templatedir:
+        print(
+            'Using {t}, instead of the default {d}'.format(
+                t=ARGS.templatedir,
+                d=TMPLDIR
+            )
+        )
+        TMPLDIR = ARGS.templatedir
+    if ARGS.YAML_source:
+        exitcode = 0
+        for ymf in ARGS.YAML_source:
+            if not ymf.endswith('.yaml'):
+                print('Warning: {y} not ending in .yaml'.format(y=ymf))
+            IFACE = os.path.basename(re.sub(r'\.yaml$', '', ymf))
+            print('Generating {y}'.format(y=ymf))
+            try:
+                YOBJ = yaml.safe_load(open(ymf))
+            except IOError as err:
+                exitcode = 1
+                print(err, file=sys.stderr)
+                continue
+            print(load(OPSYS, IFACE, YOBJ, noop=ARGS.noop))
+        exit(exitcode)
+    elif ARGS.auto:
+        autoconfigure()
+    else:
+        exit("Please either use \"--auto\" or provide yaml source file")

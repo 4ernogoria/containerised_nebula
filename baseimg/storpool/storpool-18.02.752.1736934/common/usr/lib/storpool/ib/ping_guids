@@ -1,0 +1,69 @@
+#!/bin/bash
+
+usage(){
+	cat <<EOUSAGE
+	Usage: $(basename -- $0) [-h|--help] [-q|--quiet]
+
+	Checks if SP_RDMA_GUIDS_MAP in storpool.conf or storpool.conf.d directory.
+	Attempts to ping all configured GUIDs and prints short status report or error in case of unreachability.
+
+	[-h|--help]	- print this message
+	[-q|--quiet]	- Prints errors only
+
+EOUSAGE
+}
+
+if [[ -n $* ]]; then
+	while test -n "$1"; do
+		case "$1" in
+			-q|--quiet)
+				quietf=1
+				shift
+				;;
+			-h|--help)
+				usage
+				exit
+				;;
+			*)
+				echo "$1 not understood" 1>&2
+				usage 1>&2
+				exit 1
+				;;
+		esac
+	done
+fi
+
+SP_RDMA_GUIDS_MAP=( $(storpool_showconf -en SP_RDMA_GUIDS_MAP) )
+
+if [[ -z ${SP_RDMA_GUIDS_MAP[*]} ]]; then
+	echo "SP_RDMA_GUIDS_MAP empty, please check storpool.conf" 1>&2
+	exit 1
+fi
+
+if ! type -f ibping &>/dev/null; then
+	echo "I need ibping, but it doesn't seem to be installed" 1>&2
+	exit 1
+fi
+
+for pair in ${SP_RDMA_GUIDS_MAP[*]}; do
+	node="${pair%%:*}"
+	guid="${pair#*:}"
+	(
+		cmd="timeout 3 ibping -t 100 -c 2 -G $guid"
+		out="$( $cmd 2>&1 )"
+		es=$?
+		if [[ $es -eq 255 || $es -eq 124 ]]; then
+			echo "'$cmd' returned exit status $es"
+			echo "$out"
+		fi
+		if echo "$out" | fgrep -qe "100% packet loss"; then
+			echo "$pair unreachable"
+			echo "$cmd"
+			echo "$out"
+		fi
+		if [[ -z $quietf && $es == 0 ]]; then
+			echo "$pair reachable"
+		fi
+	) &
+done
+wait

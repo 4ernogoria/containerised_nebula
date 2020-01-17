@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -e
+
+. /usr/lib/storpool/storpool_confget.sh
+
+for f in /dev/shm/storpool.cache*; do
+	b=$(basename "$f")
+	suffix="${b#storpool.cache_}"
+	if [ "$suffix" = "$b" ]; then
+		inst=0
+	else
+		inst="$suffix"
+	fi
+	/usr/sbin/storpool_server.bin -i"$SP_OURID" -I"$inst" ${SP_CACHE_SIZE+"-C$SP_CACHE_SIZE"} -w
+done

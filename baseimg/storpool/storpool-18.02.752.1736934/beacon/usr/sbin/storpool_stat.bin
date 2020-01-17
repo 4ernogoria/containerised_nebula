@@ -1,0 +1,838 @@
+#!/usr/bin/python
+
+import argparse
+import collections
+import copy
+import gzip
+import fcntl
+import glob
+import hashlib
+import logging
+import logging.handlers
+import os
+import re
+import resource
+import select
+import shutil
+import signal
+import socket
+import StringIO
+import subprocess
+import sys
+import time
+import traceback
+
+from storpool import spconfig
+
+import requests
+
+if __name__ == '__main__':
+    sys.path.append('/usr/lib/storpool/python')
+
+
+from sp.cgroups import hierarchy, filters
+from sp.process import sppidutil
+from sp.util import misc as utils
+from sp.util import decorators as spd
+from sp.util.file import readers, writers
+
+
+BUFSIZE = 65536
+PUSHSIZE = 10
+SERVER_STAT_BINARIES = ("/usr/lib/storpool/server_stat",)
+
+
+class SPStatConfig(object):
+    cluster = ""
+    ourid = ""
+    hostname = ""
+    remotes = []
+    logger = None
+    dstdir = ""
+    prefix = ""
+    ppid = 0
+    noop = ""
+    stat_funcs = []
+    pids = []
+
+
+def getconf():
+    return getconf.STATCONFIG
+
+getconf.STATCONFIG = SPStatConfig()
+
+
+class StatFile(object):
+    _FORMAT = '{directory}/{ts}.{stat}'
+    _FNAME_RE = r'(?P<ts>\d+)\.(?P<stat>.*)'
+
+    @staticmethod
+    def from_fpath(fpath):
+        directory, name = os.path.dirname(fpath), os.path.basename(fpath)
+        namem = re.match(StatFile._FNAME_RE, name)
+        if namem is None:
+            raise ValueError('{0} is not a valid stat file'.format(fpath))
+        return StatFile(directory, int(namem.group('ts')), namem.group('stat'))
+
+    def __init__(self, directory, timestamp, stat_name):
+        self.directory = directory
+        self.timestamp = timestamp
+        self.stat = stat_name
+
+    @property
+    def fpath(self):
+        return StatFile._FORMAT.format(directory=self.directory,
+                                       ts=self.timestamp, stat=self.stat)
+
+
+def file_ts(fpath):
+    try:
+        return StatFile.from_fpath(fpath).timestamp / 1e9
+    except ValueError:
+        return 0
+
+
+def dumpdata(who, lines):
+    conf = getconf()
+    if conf.noop:
+        print repr(lines)
+        sys.exit(0)
+    timestamp = int(time.time() * 1e9)
+    fprog = StatFile(os.path.join(conf.dstdir, 'in_progress'), timestamp, who)
+    fqueues = [StatFile(os.path.join(conf.dstdir, 'queue.{0}'.format(q)), timestamp, who)
+               for q in range(len(conf.remotes))]
+    writers.write_file(fprog.fpath, '\n'.join(lines))
+    for fqueue in fqueues:
+        os.link(fprog.fpath, fqueue.fpath)
+    os.unlink(fprog.fpath)
+
+
+# because the line protocol is a fucking idiot and treats quotation
+# as part of the strings, some escaping is needed.
+#
+# this feels like telling some one
+# The password is "asdf" without the quotes
+def ix_esc(string):
+    return re.sub(r'([,"= ])', r'\\\1', string)
+
+
+def stat_exit(status=0, children_signal=signal.SIGTERM):
+    for pid in getconf().pids:
+        os.kill(pid, children_signal)
+    sys.exit(status)
+
+
+def sigterm(_, __):
+    stat_exit(0, signal.SIGTERM)
+
+
+def create_poller(pfd):
+    poller = select.poll()
+    if pfd is not None:
+        poller.register(pfd, select.POLLIN)
+    return poller
+
+
+def check_parent(poller, timeout):
+    for _fd, event in poller.poll(timeout * 1000):  # timeout is in ms for poll
+        if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+            getconf().logger.error('Stat master process died. Terminating.')
+            sys.exit(0)
+
+
+IOPARAMS = ('ts', 'disk', 'reads', 'read_bytes', 'server_reads', 'server_read_bytes',
+            'reads_completion_time', 'disk_reads_completion_time',
+            'disk_read_operations_completion_time', 'pct_utilization_reads',
+            'pct_utilization_server_reads', 'max_outstanding_read_requests',
+            'queued_read_requests', 'writes', 'write_bytes', 'trims', 'writes_completion_time',
+            'disk_writes_completion_time', 'transfer_average_time', 'max_transfer_time',
+            'disk_write_operations_completion_time', 'pct_utilization_writes',
+            'max_outstanding_write_requests', 'queued_write_requests', 'pct_utilization_user',
+            'aggregations', 'aggregation_completion_time', 'pct_utilization_aggregation',
+            'entry_group_switches', 'metadata_completion_time', 'pct_utilization_metadata',
+            'pct_utilization_sys', 'pct_utilization_total')
+
+
+class ServerStatReader(object):
+
+    class BrokenStatError(Exception):
+        pass
+
+    def __init__(self, binary, sleeper):
+        self.binary = binary
+        self.sleeper = sleeper
+        self.pipe = None
+        self.ioparams = None
+        self.strict_matcher = None
+        self.matcher = None
+        self.bad_timestamp = None
+        self._init_reads()
+
+    def _line_ts(self, line):
+        return line.split(',')[0]
+
+    def _getline(self):
+        return self.pipe.readline().strip().replace(' ', '')
+
+    def _validate_line(self, line):
+        if self.matcher.match(line) is None:
+            raise ServerStatReader.BrokenStatError()
+        if self.strict_matcher.match(line) is None:
+            getconf().logger.error('Output line from server_stat was expected to'
+                                   ' have {0} columns, but has {1} instead.'
+                                   .format(len(self.ioparams), len(line.split(','))))
+
+    def _readline(self):
+        line = self._getline()
+        self._validate_line(line)
+        return line
+
+    def _init_pipe(self):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        devnull = open(os.devnull, 'wb')
+        self.pipe = subprocess.Popen(self.binary + ' -c', shell=True, bufsize=BUFSIZE,
+                                     stdout=subprocess.PIPE, stderr=devnull).stdout
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        devnull.close()
+
+    def _set_ioparams(self, ioparams):
+        self.ioparams = ioparams
+        base_re = r'\d+(,[\.\d\w]+)'
+        self.strict_matcher = re.compile(base_re + r'{{{0}}}'.format(len(self.ioparams) - 1))
+        self.matcher = re.compile(base_re + r'+')
+
+    def _init_reads(self):
+        while True:
+            try:
+                self._init_pipe()
+                line = self._getline()
+                if line.startswith('ts,'):
+                    self._set_ioparams(line.split(','))
+                    line = self._readline()
+                else:
+                    self._set_ioparams(IOPARAMS)
+                    self._validate_line(line)
+                self.bad_timestamp = self._line_ts(line)
+                return
+            except Exception:
+                self.sleeper(1800)
+
+    def get_line(self):
+        while True:
+            try:
+                line = self._readline()
+                while self._line_ts(line) == self.bad_timestamp:
+                    line = self._readline()
+                return line
+            except Exception:
+                self._init_reads()
+
+
+def pss(parent_watch_fd):
+    poller = create_poller(parent_watch_fd)
+    # serverstat tends to coredump
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    def _check_binary(binary):
+        if utils.is_exe(binary):
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+            devnull = open(os.devnull, 'wb')
+            proc0 = subprocess.Popen(binary + " -c", shell=True, bufsize=BUFSIZE,
+                                     stdout=subprocess.PIPE, stderr=devnull).stdout
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+            devnull.close()
+            line = proc0.readline().strip()
+            if len(line) < 2:
+                return False
+            if line.startswith("ts,"):
+                proc0.close()
+                return True
+            # not the nice version with the column list
+            line = proc0.readline().strip()
+            # if this is not the version were a coma was missing, we can use it.
+            if re.search(r'[0-9]\s+[0-9]', line) is None:
+                proc0.close()
+                return True
+        return False
+
+    # chose serverstat binary
+    def _get_binary():
+        while True:
+            for ssbin in SERVER_STAT_BINARIES:
+                if _check_binary(ssbin):
+                    return ssbin
+            # no binary. sleep and try again
+            check_parent(poller, 120)
+
+    stat_reader = ServerStatReader(_get_binary(), lambda timeout: check_parent(poller, timeout))
+
+    COMMON_PREFIX = 'diskstat,hostname={hn},server={s}'\
+                    .format(hn=ix_esc(getconf().hostname), s=getconf().ourid)
+    PREFIX_TEMPLATE = COMMON_PREFIX + ',disk={disk} '
+    pushdata = []
+    while True:
+        data = stat_reader.get_line().split(',')
+        try:
+            timestamp = int(data[0]) * 1000000
+        except ValueError:
+            continue
+
+        prefix = PREFIX_TEMPLATE.format(disk=data[1])
+        metrics = ','.join(('{0}={1}'.format(param, value)
+                            for param, value in zip(stat_reader.ioparams[2:], data[2:])))
+        dataline = '{p} {d} {ts}\n'.format(p=prefix, d=metrics, ts=timestamp)
+
+        pushdata.append(dataline)
+        if len(pushdata) > PUSHSIZE:
+            dumpdata('diskstat', pushdata)
+            pushdata = []
+        check_parent(poller, 0)
+
+
+class VolumeDataStore(object):
+    BD_PATH = '/sys/devices/virtual/storpool_bd/storpool_bd/info/'
+
+    def __init__(self):
+        self.__volumes = collections.defaultdict(dict)
+        map(self._read_volume, glob.glob(VolumeDataStore.BD_PATH + '*'))
+
+    def _read_volume(self, vol_dir):
+        v_id = 'sp-{0}'.format(os.path.basename(vol_dir))
+        name_file = os.path.join(vol_dir, 'name')
+        try:
+            self.__volumes[v_id]['name'] = readers.file_content(name_file).strip()
+            return True
+        except (OSError, IOError):
+            return False
+
+    def try_ensure_volume(self, v_id):
+        if v_id not in self.__volumes:
+            return self._read_volume(VolumeDataStore.BD_PATH + v_id[3:])
+        return True
+
+    def get_stat(self, v_id):
+        if not self.try_ensure_volume(v_id):
+            return None
+        return copy.deepcopy(self.__volumes[v_id].get('stat', None))
+
+    def get_name(self, v_id):
+        if not self.try_ensure_volume(v_id):
+            return None
+        return self.__volumes[v_id]['name']
+
+    def update_stat(self, v_id, stat):
+        if not self.try_ensure_volume(v_id):
+            return False
+        self.__volumes[v_id]['stat'] = stat
+        return True
+
+    def update_name(self, v_id):
+        self._read_volume(VolumeDataStore.BD_PATH + v_id[3:])
+
+
+def pcs(parent_watch_fd):
+    poller = create_poller(parent_watch_fd)
+    conf = getconf()
+
+    DISKSTATS_FILE = '/proc/diskstats'
+    COMMON_PREFIX = 'iostat,hostname={hn},server={s}'.format(hn=ix_esc(conf.hostname), s=conf.ourid)
+    PREFIX_TEMPLATE = COMMON_PREFIX + ',volume={v_id}'
+
+    NAMES_REREAD_TICKS = 180
+    ticks = 0
+
+    def stat_is_for_sp_volume(stat):
+        return len(stat) >= 2 and stat[2].startswith('sp-')
+
+    def data(old_value, new_value, info):
+        if info['type'] == 'counter':
+            data = new_value - old_value
+        if info['type'] == 'gauge':
+            data = new_value
+        data *= info['mult']
+        return (info['name'], data)
+
+    ioparams = [
+        {'name' : 'reads', 'type' : 'counter', 'mult' : 1},
+        {'name' : 'reads_merges', 'type' : 'counter', 'mult' : 1},
+        {'name' : 'read_bytes', 'type' : 'counter', 'mult' : 512},
+        {'name' : 'r_wait', 'type' : 'counter', 'mult' : 1000},
+        {'name' : 'writes', 'type' : 'counter', 'mult' : 1},
+        {'name' : 'write_merges', 'type' : 'counter', 'mult' : 1},
+        {'name' : 'write_bytes', 'type' : 'counter', 'mult' : 512},
+        {'name' : 'w_wait', 'type' : 'counter', 'mult' : 1000},
+        {'name' : 'queue_depth', 'type' : 'gauge', 'mult' : 1},
+        {'name' : 'utilization', 'type' : 'counter', 'mult' : 1000},
+        {'name' : 'wait', 'type' : 'counter', 'mult' : 1000},
+    ]
+    store = VolumeDataStore()
+    pushdata = []
+    timestamp = int(time.time() * 1e9)
+
+    while True:
+        stats = [re.split(r'\s+', statl.strip()) for statl in
+                 readers.file_content(DISKSTATS_FILE).split('\n')]
+        stats = filter(stat_is_for_sp_volume, stats)
+        devs = [stat[2] for stat in stats]
+        stats = [map(int, stat[3:]) for stat in stats]
+        for dev, stat in zip(devs, stats):
+            if not store.try_ensure_volume(dev):
+                continue
+            old_stat = store.get_stat(dev)
+            store.update_stat(dev, stat)
+            if old_stat is None:
+                continue
+            vals = dict(data(*stats) for stats in zip(old_stat, stat, ioparams))
+            if any(val < 0 for val in vals.values()):
+                continue
+            prefix = PREFIX_TEMPLATE.format(v_id=ix_esc(store.get_name(dev)))
+            dev_data = ','.join(('{k}={v}'.format(k=k, v=v) for k, v in vals.items()))
+            dataline = '{p} {d} {t}\n'.format(p=prefix, d=dev_data, t=int(timestamp))
+            pushdata.append(dataline)
+
+        if len(pushdata) > PUSHSIZE:
+            dumpdata('iostat', pushdata)
+            pushdata = []
+
+        timestamp += 1e9
+        waittime = (timestamp / 1e9) - time.time()
+        check_parent(poller, max(0, waittime))
+        if waittime < 0:
+            conf.logger.info("We overslept by {w}".format(w=waittime))
+            timestamp = int(time.time() * 1e9)
+
+        if ticks == NAMES_REREAD_TICKS:
+            map(store.update_name, devs)
+            ticks = 0
+        ticks += 1
+
+    return # doesn't happen
+
+
+def re_delta(rematcher, lines_start, lines_end):
+    def cpu_re_stat(rematcher, lines):
+        stats = {}
+        for stats_match in map(rematcher.match, lines):
+            if stats_match is None:
+                continue
+            stat = dict([(k, int(v)) for k, v in stats_match.groupdict().items()
+                         if k != 'n' and v is not None])
+            stats[int(stats_match.group('n'))] = stat
+        return stats
+
+    def intdict_delta(first, second):
+        delta = {}
+        for key in first:
+            if key in second:
+                delta[key] = first[key] - second[key]
+        return delta
+
+    start = cpu_re_stat(rematcher, lines_start)
+    end = cpu_re_stat(rematcher, lines_end)
+    delta = {}
+    for cpu in end:
+        if cpu in start:
+            delta[cpu] = intdict_delta(end[cpu], start[cpu])
+    return delta
+
+
+@spd.static_vars(sp_slc=None)
+def current_sp_cpus():
+    if current_sp_cpus.sp_slc is None:
+        current_sp_cpus.sp_slc = sppidutil.sp_cg_config()['beacon']['cpuset'].split('/')[0]
+
+    cpuset_info = hierarchy.get().cpuset_info()
+    cpu_service = collections.defaultdict(list)
+    for group, info in cpuset_info.items():
+        if filters.is_sp_subgroup(group):
+            cpu = info['cpuset.cpus'][0]
+            service = group.split('/')[1]
+            cpu_service[cpu].append(service)
+    sp_cpus = cpuset_info[current_sp_cpus.sp_slc]['cpuset.cpus']
+    for cpu in sp_cpus:
+        if not cpu_service[cpu]:
+            tag = 'nic' if cpu == sp_cpus[0] else 'empty'
+            cpu_service[cpu].append(tag)
+    return dict(cpu_service.items())
+
+
+def pcpus(parent_watch_fd):
+    HZ = os.sysconf(os.sysconf_names['SC_CLK_TCK']) # jiffies per second
+    CPU_SCHED_M = re.compile(r"cpu(?P<n>\d+)(\s\d+){6} (?P<run>\d+) (?P<wait>\d+) (\d+)")
+    CPU_STATS_M = re.compile(r"cpu(?P<n>\d+) (?P<user>\d+) (?P<nice>\d+) (?P<system>\d+)"
+                             r" (?P<idle>\d+) ?(?P<iowait>\d+)? ?(?P<irq>\d+)? ?(?P<softirq>\d+)?"
+                             r" ?(?P<steal>\d+)? ?(?P<guest>\d+)? ?(?P<guest_nice>\d+)?")
+    ORDER = {'cpu': 0, 'user': 1, 'nice': 2, 'system': 3, 'idle': 4,
+             'iowait': 5, 'irq': 6, 'softirq': 7, 'steal': 8, 'guest': 9,
+             'guest_nice': 10, 'run': 11, 'wait': 12, 'runwait' : 13}
+    SCHEDSTAT_FILE = '/proc/schedstat'
+    STAT_FILE = '/proc/stat'
+    SP_CPUS_REREAD_TICKS = 300
+    conf = getconf()
+    COMMON_PREFIX = 'cpustat,hostname={hn},server={s}'.format(hn=ix_esc(conf.hostname),
+                                                              s=conf.ourid)
+    PREFIX_TEMPLATE = COMMON_PREFIX + ',cpu={ncpu},labels={l}'
+
+    poller = create_poller(parent_watch_fd)
+
+    while not os.path.isfile(STAT_FILE) or not os.path.isfile(SCHEDSTAT_FILE):
+        check_parent(poller, 3600)
+
+    sp_cpu_service = current_sp_cpus()
+    def cpustats_str((cpu, stats)):
+        cputags = '|'.join([''] + sp_cpu_service[cpu] + [''])\
+                  if cpu in sp_cpu_service else '|nosp|'
+        cpuprefix = PREFIX_TEMPLATE.format(ncpu=cpu, l=cputags)
+        # add aggregate stats
+        stats['runwait'] = stats['run'] + stats['wait']
+        cpudata = ','.join('{s}={v}'.format(s=stat, v=value) for stat, value in
+                           sorted(stats.items(), key=lambda x: ORDER[x[0]]))
+        return '{p} {d} {t}\n'.format(p=cpuprefix, d=cpudata, t=int(stamp_start * 1e9))
+    stat_lines_start = readers.lines(STAT_FILE)
+    sched_lines_start = readers.lines(SCHEDSTAT_FILE)
+    stamp_start = time.time()
+    ticks = 0
+    pushdata = []
+    while True:
+        stamp_start += 1
+        waittime = stamp_start - time.time()
+        check_parent(poller, max(0, waittime))
+        if waittime < 0:
+            conf.logger.info("We overslept by {w}".format(w=waittime))
+        stat_lines_end = readers.lines(STAT_FILE)
+        sched_lines_end = readers.lines(SCHEDSTAT_FILE)
+        sched_delta = re_delta(CPU_SCHED_M, sched_lines_start, sched_lines_end)
+        stat_delta = re_delta(CPU_STATS_M, stat_lines_start, stat_lines_end)
+        for _, stats in sched_delta.items():
+            for stat in stats:
+                stats[stat] /= float(1e9) # schedstats are in nanos, conv to s
+        for _, stats in stat_delta.items():
+            for stat in stats:
+                stats[stat] /= float(HZ) # stats are in jiffies
+        all_stats = {}
+        for cpu in stat_delta:
+            merged = stat_delta[cpu].copy()
+            merged.update(sched_delta[cpu])
+            all_stats[cpu] = merged
+
+        pushdata.extend(map(cpustats_str, all_stats.items()))
+        if len(pushdata) > PUSHSIZE:
+            dumpdata('cpustat', pushdata)
+            pushdata = []
+        if ticks == SP_CPUS_REREAD_TICKS:
+            ticks = 0
+            sp_cpu_service = current_sp_cpus()
+        sched_lines_start = sched_lines_end
+        stat_lines_start = stat_lines_end
+        ticks += 1
+
+    return # never go back :))
+
+
+def pmems(parent_watch_fd):
+    poller = create_poller(parent_watch_fd)
+    conf = getconf()
+    cgh = hierarchy.get()
+
+    def is_interesting(group):
+        return filters.is_direct_root_child(group) or filters.is_sp_cgroup(group)
+
+    COMMON_PREFIX = 'memstat,hostname={hn},server={s}'.format(hn=ix_esc(conf.hostname),
+                                                              s=conf.ourid)
+    PREFIX_TEMPLATE = COMMON_PREFIX + ',cgroup={group}'
+
+    pushdata = []
+    timestamp = int(time.time() * 1e9)
+    while True:
+        for group in filter(is_interesting, cgh.groups('memory')):
+            prefix = PREFIX_TEMPLATE.format(group=group)
+            gdata = cgh.get_option('memory', group, 'memory.stat').rstrip()\
+                    .replace('\n', ',').replace(' ', '=')
+            dataline = '{p} {d} {t}\n'.format(p=prefix, d=gdata, t=int(timestamp))
+            pushdata.append(dataline)
+        if len(pushdata) > PUSHSIZE:
+            dumpdata('memstat', pushdata)
+            pushdata = []
+        timestamp += 1e9
+        waittime = (timestamp / 1e9) - time.time()
+        check_parent(poller, max(0, waittime))
+        if waittime < 0:
+            conf.logger.info("We overslept by {w}".format(w=waittime))
+            timestamp = int(time.time() * 1e9)
+
+    return  # never :)
+
+
+def processdir(sender, dpath, max_files=10, max_size=1024*1024):
+    def _too_old(fpath):
+        return time.time() - file_ts(fpath) > 2 * 24 * 60 * 60  # 2 days
+
+    def _select_to_send(files):
+        to_send = []
+        while files and len(to_send) < max_files and sum(map(os.path.getsize, to_send)) < max_size:
+            to_send.append(files.pop(0))
+        return to_send
+
+    files = sorted(glob.glob(dpath + '/*'))
+    while files:
+        old = filter(_too_old, files)
+        map(os.unlink, old)
+        files = [f for f in files if f not in old]
+        to_send = _select_to_send(files)
+        while to_send:
+            if not sender.submit(''.join(map(readers.file_content, to_send))):
+                return
+            map(os.unlink, to_send)
+            to_send = _select_to_send(files)
+        files = sorted(glob.glob(dpath + '/*'))
+
+
+def gzip_compress(data):
+    out = StringIO.StringIO()
+    gzipf = gzip.GzipFile(fileobj=out, mode='w')
+    gzipf.write(data)
+    gzipf.close()
+    return out.getvalue()
+
+
+TIMEOUT_S = 180
+
+
+class DataSender(object):
+
+    def __init__(self, remote_url):
+        self.url = remote_url
+        self._init_session()
+
+    def _init_session(self):
+        self.session = requests.Session()
+        self.session.headers.update({'Content-Encoding': 'gzip'})
+        self.session.verify = True
+        self.session.trust_env = False
+
+    @spd.timeout(seconds=TIMEOUT_S)
+    def _send_zdata(self, zdata):
+        try:
+            try:
+                return self.session.post(self.url, data=zdata, timeout=(10, TIMEOUT_S))
+            except ValueError:
+                # requests v. 2.2 does not support tuple for timeout, leaving the larger value only
+                return self.session.post(self.url, data=zdata, timeout=TIMEOUT_S)
+        except Exception as err:
+            getconf().logger.critical('Could not send data. Error: {0}'.format(err))
+            return None
+
+    def _handle_response(self, response, original_data):
+        if response.status_code == 400:
+            getconf().logger.critical("Broken data, {d}".format(d=original_data))
+            return True # do not retry this piece of data
+        elif response.status_code == 401:
+            getconf().logger.critical("Auth failed")
+            self._init_session()
+            return False
+        elif response.status_code != 204:
+            getconf().logger.critical("Failed submitting data, {s}".format(s=response.text))
+            self._init_session()
+            return False
+        else:  # 204
+            return True
+
+    def submit(self, data, retries=10):
+        zdata = gzip_compress(data)
+        for _ in range(retries):
+            response = self._send_zdata(zdata)
+            if response is not None:
+                return self._handle_response(response, data)
+            else:
+                self._init_session()
+        return False
+
+
+def run_extra_sender(parent_watch_fd, remote, queue_number):
+    assert queue_number >= 1
+    poller = create_poller(parent_watch_fd)
+    dpath = os.path.join(getconf().dstdir, 'queue.{0}'.format(queue_number))
+    sender = DataSender(remote)
+    while True:
+        processdir(sender, dpath)
+        check_parent(poller, 1)
+
+
+def run_main_sender(remote, watch_fd):
+    conf = getconf()
+    dpath = os.path.join(conf.dstdir, 'queue.0')
+    poller = create_poller(watch_fd)
+
+    sender = DataSender(remote)
+    while True:
+        processdir(sender, dpath)
+        for pid in conf.pids:
+            try:
+                wpid, _ = os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                conf.pids.remove(pid)
+            if wpid == pid:
+                conf.pids.remove(pid)
+
+        if len(conf.pids) != len(conf.stat_funcs) + len(conf.remotes) - 1:
+            stat_exit(0)
+
+        for (fd, event) in poller.poll(1 * 1000):
+            if fd != watch_fd:
+                conf.logger.error('Internal error: poll on fd {watch_fd} returned fd {fd}'
+                                  .format(watch_fd=watch_fd, fd=fd))
+                stat_exit(1)
+            if event & select.POLLIN:
+                # Oof, why is the loader trying to talk to us?
+                os.read(watch_fd, 4096)
+            if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                # Okay, the loader has quit on us, so follow suit
+                conf.logger.error('The StorPool loader has quit on us')
+                stat_exit(1, 15)
+
+
+def get_logger():
+    try:
+        logger = logging.getLogger(sys.argv[0])
+        logger.setLevel(logging.INFO)
+        dhandler = logging.handlers.SysLogHandler(address='/dev/log')
+        formatter = logging.Formatter('%(name)s[%(process)d]: %(message)s')
+        dhandler.setFormatter(formatter)
+        logger.addHandler(dhandler)
+    except Exception as err:
+        print >> sys.stderr, "Unable to instantiate logger, bailing out: {e}".format(e=err)
+        traceback.print_stack(file=sys.stderr)
+        sys.exit(1)
+    return logger
+
+
+def prepare_conf(args):
+    conf = getconf()
+    cfg = spconfig.SPConfig()
+
+    conf.cluster = cfg['SP_CLUSTER_NAME']
+    conf.ourid = cfg['SP_OURID']
+    conf.hostname = socket.gethostname()
+
+    sp_url = 'https://{username}:{password}@{dest}/write?db={db}'\
+             .format(username=conf.cluster,
+                     password=hashlib.md5("storpool." + conf.cluster).hexdigest(),
+                     dest=conf.cluster.replace('_', '-') + '.influx.storpool.com',
+                     db=conf.cluster)
+    conf.remotes.append(sp_url)
+
+    cl_urls = cfg.get('SP_STATDB_ADDITIONAL', None)
+
+    if cl_urls is not None:
+        conf.remotes.extend(cl_urls.split())
+
+    conf.noop = args.noop
+    conf.ppid = os.getpid()
+    conf.prefix = "storpool_stat"
+    conf.dstdir = os.path.join("/tmp/", conf.prefix)
+    conf.stat_funcs = [pss, pcs, pcpus, pmems]
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Process stats to submit to StorPool")
+    parser.add_argument('-N', '--noop', action='store_true', default=False,
+                        help='Loop once, process data, die')
+    parser.add_argument('-l', '--syslog', action='store_true', default=True,
+                        help='Log through syslog (ignored, always true)')
+    parser.add_argument('-p', '--pidfile', type=str,
+                        default='/var/run/storpool/storpool_stat.bin.pid',
+                        help='The full path of the PID file to store')
+    parser.add_argument('-W', '--watch-fd', type=int, help='The file descriptor'
+                        ' used for tracking the connection to storpool_daemon')
+    return parser.parse_args()
+
+
+def ensure_dirs():
+    maindir = getconf().dstdir
+    dirs = [maindir, os.path.join(maindir, 'in_progress')]
+    for qnum in range(len(getconf().remotes)):
+        dirs.append(os.path.join(maindir, 'queue.{0}'.format(qnum)))
+    for dpath in dirs:
+        if not os.path.isdir(dpath):
+            os.makedirs(dpath, 0700)
+
+
+def clean_old_dirs():
+    conf = getconf()
+    old_dirs = glob.glob("/tmp/" + conf.prefix + "*")
+    old_dirs.remove(conf.dstdir)
+    fqueues = [os.path.join(conf.dstdir, 'queue.{0}'.format(q)) for q in range(len(conf.remotes))]
+    for old_dir in filter(os.path.isdir, old_dirs):
+        for fstat in glob.glob(old_dir + '/*.done'):
+            for fqueue in fqueues:
+                os.link(fstat, os.path.join(fqueue, os.path.basename(fstat)))
+        shutil.rmtree(old_dir)
+
+
+def ensure_non_blocking_fd(bfd):
+    flags = fcntl.fcntl(bfd, fcntl.F_GETFL)
+    if flags & os.O_NONBLOCK == 0:
+        fcntl.fcntl(bfd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+
+def main():
+    cmd_args = get_args()
+    prepare_conf(cmd_args)
+    conf = getconf()
+    writers.write_file(cmd_args.pidfile, str(conf.ppid))
+    print "Running in '{cl}', id {ourid}".format(cl=conf.cluster, ourid=conf.ourid)
+
+    if not conf.noop:
+        ensure_dirs()
+        clean_old_dirs()
+
+    if cmd_args.watch_fd is not None:
+        ensure_non_blocking_fd(cmd_args.watch_fd)
+
+    def _spawn_child(child_func, *args, **kwargs):
+        rfd, wfd = os.pipe()
+        map(ensure_non_blocking_fd, (rfd, wfd))
+        pid = os.fork()
+        if pid == -1:
+            conf.logger.critical("Fork failed")
+            stat_exit(6)
+        if pid == 0:
+            conf.logger.info('spawned {name} child {pid}'
+                             .format(name=child_func.func_name, pid=os.getpid()))
+            if cmd_args.watch_fd is not None:
+                os.close(cmd_args.watch_fd)
+            os.close(wfd)
+            try:
+                child_func(rfd, *args, **kwargs) # should not return
+            except Exception as err:
+                conf.logger.info("Child {pid} main function exited with error: {err}"
+                                 .format(pid=os.getpid(), err=err))
+                getconf().logger.exception(''.join(traceback.format_stack()))
+                sys.exit(1)
+            # if somehow the child function returns - exit
+            conf.logger.info("Child {pid} main function returned".format(pid=os.getpid()))
+            sys.exit(1)
+        os.close(rfd)
+        conf.pids.append(pid)
+
+    map(_spawn_child, conf.stat_funcs)
+
+    if conf.noop:
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, sigterm)
+    signal.signal(signal.SIGINT, sigterm)
+
+    main_remote = conf.remotes[0]
+    for qnum, remote in enumerate(conf.remotes[1:], 1):
+        _spawn_child(run_extra_sender, remote, qnum)
+    run_main_sender(main_remote, cmd_args.watch_fd) # never returns
+
+
+if __name__ == '__main__':
+    getconf().logger = get_logger()  # will sys.exit on failure to create logger
+    try:
+        main()
+    except Exception:
+        getconf().logger.exception(''.join(traceback.format_stack()))
+        stat_exit()

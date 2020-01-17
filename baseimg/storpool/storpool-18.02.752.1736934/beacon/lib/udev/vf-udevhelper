@@ -1,0 +1,188 @@
+#!/bin/bash
+# The MIT License (MIT)
+#
+# Copyright (c) 2015-2018 StorPool Storage AD
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+#---------------------------------------------------------------------------
+# This file should be placed in /lib/udev/
+#
+# It is called by udev rule when  module is loaded to set the number of VF interfces
+
+set -e
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:$PATH
+
+NUMVFS_WAIT="${NUMVFS_WAIT:-30}"
+
+function splog()
+{
+	logger -t "[$SEQNUM] ${0##*/}" "[$DRIVER:$INTERFACE] $*" &>/dev/null
+}
+
+function runcmd()
+{
+	local cmd="$1"
+	if ! out="$($cmd 2>&1)"; then
+		splog "$cmd (ret:$?)"
+	else
+		splog "$cmd (soft fail, ret:$?)"
+		splog "output:$out"
+	fi
+}
+
+loadmodules(){
+	local modules=($1)
+	local cmd='' mod=''
+	for mod in "${modules[@]}" ; do
+		cmd="modprobe $mod"
+		runcmd "$cmd"
+	done
+}
+
+HWACC="${HWACC:-1}" # Hardware acceleration is on by default
+
+if [ -f "/etc/vf-udevhelper.conf" ]; then
+	source "/etc/vf-udevhelper.conf"
+fi
+
+if [ "$DRIVER" = "" ]; then
+	DRIVER="$(readlink "/sys/$DEVPATH/device/driver" || true)"
+	DRIVER="${DRIVER##*/}"
+fi
+
+if [ -n "$DEBUG" ]; then
+	splog "DEVPATH=$DEVPATH"
+fi
+
+if [ -z "$HWACC" ]; then
+	splog "Hardware acceleration disabled (HWACC empty), bailing out"
+	exit
+fi
+
+case "$ACTION" in
+	add)
+		if [ "$DRIVER" = "ixgbe" ] || [ "$DRIVER" = "i40e" ] || [ "$DRIVER" = "bnx2x" ] || [ "$DRIVER" = "mlx4_core" ] || [ "$DRIVER" = "mlx5_core" ]; then
+			PCI_ARRAY=(${PCI_SLOT_LIST//,/ })
+			PCI_NUMVFS=(${PCI_NUMVFS_LIST//,/ })
+			PCI_MTU_ARRAY=(${PCI_MTU_LIST//,/ })
+			PCI_RXFLCTRL_ARRAY=(${PCI_RXFLCTRL_LIST//,/ })
+			PCI_TXFLCTRL_ARRAY=(${PCI_TXFLCTRL_LIST//,/ })
+			if [ "$PCI_SLOT_NAME" = "" ]; then
+				PCI_SLOT_NAME=${DEVPATH%/net*}
+				PCI_SLOT_NAME=${PCI_SLOT_NAME##*/}
+			fi
+			for idx in "${!PCI_ARRAY[@]}"; do
+				PFNAME="${DEVPATH##*/}"
+				RXFLCTRL="${PCI_RXFLCTRL_ARRAY[idx]}"
+				TXFLCTRL="${PCI_TXFLCTRL_ARRAY[idx]}"
+				cmd="ethtool -A $PFNAME rx $RXFLCTRL tx $TXFLCTRL"
+				runcmd "$cmd"
+			done
+			if [ "$DRIVER" = "mlx4_core" ]; then
+				modules=("mlx4_en" "mlx4_ib" "ib_uverbs" "dummy")
+				loadmodules "${modules[*]}"
+			elif [ "$DRIVER" = "mlx5_core" ]; then
+				modules=("mlx5_ib" "ib_uverbs" "dummy")
+				loadmodules "${modules[*]}"
+			elif [ "$DRIVER" = "ixgbe" ] || [ "$DRIVER" = "i40e" ] || [ "$DRIVER" = "bnx2x" ]; then
+				for idx in "${!PCI_ARRAY[@]}"; do
+					NUMVFS="${PCI_NUMVFS[idx]:-0}"
+					PFNAME="${DEVPATH##*/}"
+					pci_MTU="${PCI_MTU_ARRAY[idx]}"
+					if [ -n "$DEBUG" ]; then
+						splog "$idx $PCI_SLOT_NAME PCI_SLOT ${PCI_ARRAY[idx]} NUMVFS $NUMVFS"
+					fi
+					if [ "${PCI_ARRAY[idx]}" != "$PCI_SLOT_NAME" ]; then
+						continue
+					fi
+					
+					OLDMTU="$(ip link show "$PFNAME" | head -n 1 | awk '{print $5}')"
+					if [ -n "$pci_MTU" ] && [ "$pci_MTU" != "$OLDMTU" ]; then
+						cmd="ip link set dev $PFNAME mtu $pci_MTU"
+						runcmd "$cmd"
+					fi
+					
+					if [ "$DRIVER" = "bnx2x" ]; then
+						cmd="ip link set dev $PFNAME up"
+						runcmd "$cmd"
+					fi
+					
+					if [ -n "$NUMVFS" ] && [ "${NUMVFS//[[:digit:]]/}" = ""  ] && [ "$NUMVFS" -gt 0 ] ; then
+						retry="${NUMVFS_WAIT:-10}"
+						while [ "$retry" -gt 0 ]; do
+							if [ -f "/sys/module/${DRIVER}/drivers/pci:${DRIVER}/$PCI_SLOT_NAME/sriov_numvfs" ]; then
+								splog "enabling $NUMVFS VF on PCI slot $PCI_SLOT_NAME {$((NUMVFS_WAIT-retry))}"
+								echo "$NUMVFS" >"/sys/module/${DRIVER}/drivers/pci:${DRIVER}/$PCI_SLOT_NAME/sriov_numvfs"
+								break
+							elif [ -n "$DEBUG" ]; then
+								splog "[try:$retry] /sys/module/${DRIVER}/drivers/pci:${DRIVER}/$PCI_SLOT_NAME/sriov_numvfs not found"
+							fi
+							retry=$((retry-1))
+							sleep 0.1
+						done
+						if [ -n "$DEBUG" ]; then
+							splog "/sys/module/${DRIVER}/drivers/pci:${DRIVER}/$PCI_SLOT_NAME/sriov_numvfs: $(<"/sys/module/${DRIVER}/drivers/pci:${DRIVER}/$PCI_SLOT_NAME/sriov_numvfs")"
+						fi
+						VFID=0
+						if [ "$DRIVER" = "ixgbe" ] || [ "$DRIVER" = "i40e" ]; then
+							if [ "$DRIVER" = "ixgbe" ]; then
+								cmd="ethtool -K $PFNAME ntuple on"
+								runcmd "$cmd"
+							fi
+							while [ "$VFID" -lt "$NUMVFS" ]; do
+								cmd="ip link set dev $PFNAME vf $VFID trust on"
+								runcmd "$cmd"
+								((VFID=VFID+1))
+							done
+						fi
+					else
+						if [ -n "$NUMVFS" ]; then
+							splog "Skipped $PCI_SLOT_NAME because NUMVFS not number ($NUMVFS)"
+						else
+							splog "No PCI_NUMVFS set for $PCI_SLOT_NAME (idx:$idx)"
+						fi
+					fi
+					VFID=0
+					while [ "$VFID" -lt "$NUMVFS" ]; do
+						VF_PATH="/sys/bus/pci/devices/$PCI_SLOT_NAME/virtfn$VFID"
+						VF_TARGET_PATH="$(readlink "$VF_PATH")"
+						VF_PCI_ADDR="$(basename "$VF_TARGET_PATH")"
+						VF_DRIVER_PATH="$VF_PATH"/driver
+						if [ -d "$VF_DRIVER_PATH" ]; then
+							VF_DRIVER_PATH="$(readlink -e "$VF_DRIVER_PATH")"
+							VF_DRIVER_NAME=$(basename "$VF_DRIVER_PATH")
+							if [ "$VF_DRIVER_NAME" != "storpool_pci" ]; then
+								echo "$VF_PCI_ADDR" > "$VF_DRIVER_PATH"/unbind
+							fi
+						fi
+						if [ ! -d "$VF_DRIVER_PATH" ]; then
+							if [ -d /sys/bus/pci/drivers/storpool_pci ]; then
+								echo "$VF_PCI_ADDR" > /sys/bus/pci/drivers/storpool_pci/bind
+							fi
+						fi
+						((VFID=VFID+1))
+					done
+				done
+			fi
+		fi
+	;;
+esac

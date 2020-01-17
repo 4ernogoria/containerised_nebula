@@ -1,0 +1,26 @@
+[Unit]
+Description=storpool_stat
+After=storpool_beacon.service
+After=storpool_block.service
+After=storpool_server.service
+After=storpool_server_1.service
+After=storpool_server_2.service
+After=storpool_server_3.service
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/storpool_stat.pid
+ExecStart=/usr/sbin/storpool_stat -d
+ExecStopPost=/bin/rm -f /var/run/storpool_stat.pid
+StandardInput=null
+StandardOutput=inherit
+StandardError=inherit
+KillMode=process
+Slice=system.slice
+BlockIOAccounting=false
+CPUAccounting=false
+MemoryAccounting=false
+LimitAS=1024M:1200M

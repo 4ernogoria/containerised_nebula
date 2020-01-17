@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:$PATH
+me=${0##*/}
+
+log=/dev/null
+
+LXC_ROOT=${LXC_ROOTFS_PATH%/*}
+
+logger -t "$me" "$LXC_ROOT"
+
+if [ -f /etc/lxc/storpool.containers ]; then
+	. /etc/lxc/storpool.containers
+else
+	logger -t "$me" "/etc/lxc/storpool.containers is missing! Exit 0"
+	exit 0
+fi
+
+eval cmd=\$$LXC_NAME
+
+if [ -n "$cmd" ]; then
+	logger -t "$me" "Processing $LXC_NAME"
+else
+	logger -t "$me" "$LXC_NAME not in /etc/lxc/storpool.containers! Exit 0"
+	exit 0
+fi
+
+if [ -f /usr/lib/storpool/storpool_confget.sh ]; then
+	. /usr/lib/storpool/storpool_confget.sh
+fi
+
+if [ -n "$SP_OURID" ]; then
+	logger -t "$me" "umount $LXC_ROOTFS_PATH"
+	umount -v "$LXC_ROOTFS_PATH" 2>&1 >>$log
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "umount Failed! ($ret)"
+	fi
+	
+	logger -t "$me" "storpool detach volume $LXC_NAME"
+	storpool detach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>$log
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "storpool detach Failed! ($ret)"
+	fi
+else
+	logger -t "$me" "SP_OURID missing! not a storpool cluster?"
+fi

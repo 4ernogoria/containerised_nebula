@@ -1,0 +1,187 @@
+#!/bin/bash
+#
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:$PATH
+me=${0##*/}
+
+log=/dev/null
+
+waitLink()
+{
+	local lnk i
+	lnk="$1"
+	logger -t "$me" "waitLink() $lnk"
+	for i in {1..60}; do
+		if [ -L "$lnk" ]; then
+			return 0
+		fi
+		sleep 0.5
+	done
+	return 1
+}
+
+LXC_ROOT=${LXC_ROOTFS_PATH%/*}
+
+if [ -f /etc/lxc/storpool.containers ]; then
+	. /etc/lxc/storpool.containers
+else
+	logger -t "$me" "/etc/lxc/storpool.containers is missing! Exit 0"
+	exit 0
+fi
+
+eval cmd=\$$LXC_NAME
+
+if [ -n "$cmd" ]; then
+	logger -t "$me" "Processing $LXC_NAME"
+else
+	logger -t "$me" "$LXC_NAME not in /etc/lxc/storpool.containers! Exit 0"
+	exit 0
+fi
+
+[ -f /usr/lib/storpool/storpool_confget.sh ] && . /usr/lib/storpool/storpool_confget.sh
+
+if [ ! -n "$SP_OURID" ]; then
+	logger -t "$me" "Error: SP_OURID not set! Exit 1"
+	exit 1
+fi
+
+#check if the volume exists
+storpool -B volume list 2>&1 >>"$log"
+ret=$?
+if [ "$ret" -ne 0 ]; then
+	logger -t "$me" "Error: storpool volume list. Exit $ret"
+	exit "$ret"
+fi
+
+storpool -B volume list | grep " $LXC_NAME " 2>&1 >>"$log"
+ret=$?
+
+if [ "$ret" -ne 0 ]; then
+	logger -t "$me" "volume $LXC_NAME not found!"
+	tmpdir=`mktemp -q -d -p "/var/lib/lxc/${LXC_NAME}/" "${LXC_NAME}.XXXXXX" ` || exit 0
+	trap "rm -rf '$tmpdir'" EXIT
+	
+	if [ ! -d "${LXC_ROOTFS_PATH}/etc" ]; then
+		logger -t "$me" "Error: $LXC_ROOTFS_PATH is empty. Exit 1"
+		exit 1
+	fi
+	
+	logger -t "$me" "create volume ${LXC_NAME} $cmd"
+	storpool -B volume "${LXC_NAME}" $cmd 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "create Failed!($ret). Exit 0"
+		exit 0
+	fi
+	
+	logger -t "$me" "attach volume ${LXC_NAME}"
+	storpool -B attach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "attach Failed! ($ret). Exit 0"
+		storpool -B volume "$LXC_NAME" delete "$LXC_NAME" 
+		exit 0
+	else
+		waitLink "/dev/storpool/${LXC_NAME}"
+		ret=$?
+		if [ "$ret" -ne 0 ]; then
+			logger -t "$me" "waitLink Failed! ($ret). Exit 0"
+			storpool -B detach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+			storpool -B volume "$LXC_NAME" delete "$LXC_NAME" 2>&1 >>"$log"
+			exit 0
+		fi
+	fi
+	
+	mkfs.ext4 "/dev/storpool/${LXC_NAME}" 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "mkfs.ext4 Failed! ($ret). Exit 0"
+		storpool -B detach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+		storpool -B volume "$LXC_NAME" delete "$LXC_NAME" 2>&1 >>"$log"
+		exit 0
+	fi
+	
+	tune2fs -c 0 -i 0 -L "${LXC_NAME}" "/dev/storpool/${LXC_NAME}" 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "tune2fs Failed! ($ret)"
+	fi
+	
+	mount -v -t ext4 "/dev/storpool/${LXC_NAME}" "$tmpdir" 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "mount Failed! ($ret). Exit 0"
+		storpool -B detach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+		storpool -B volume "$LXC_NAME" delete "$LXC_NAME" 2>&1 >>"$log"
+		exit 0
+	fi
+
+	logger -t "$me" "cp ${LXC_ROOTFS_PATH}/* ${tmpdir}/"
+	#(anton)TODO:use rsync
+	cp -a "${LXC_ROOTFS_PATH}"/* "${tmpdir}/"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "cp Failed! ($ret). Exit 0"
+		umount -v "/dev/storpool/${LXC_NAME}" 2>&1 >>"$log"
+		storpool -B detach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+		storpool -B volume "$LXC_NAME" delete "$LXC_NAME" 2>&1 >>"$log"
+		exit 0
+	else
+		logger -t "$me" "rm ${LXC_ROOTFS_PATH}/*"
+		rm -rf "${LXC_ROOTFS_PATH}"/*
+		sync
+	fi
+	umount -v "/dev/storpool/${LXC_NAME}" 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "umount /dev/storpool/${LXC_NAME} ret:$?"
+	fi
+fi
+
+if [ -d "${LXC_ROOTFS_PATH}"/etc ]; then
+	logger -t "$me" "${LXC_ROOTFS_PATH} not empty! Exit 0"
+	exit 0
+fi
+
+cid=`storpool -B attach list | fgrep -e " $LXC_NAME " | fgrep -cve '---'`
+case "$cid" in
+	0)
+		logger -t "$me" "attach volume ${LXC_NAME} client $SP_OURID"
+		storpool -B attach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+		ret=$?
+		if [ "$ret" -ne 0 ]; then
+			logger -t "$me" "attach Failed! ($ret). Exit 1"
+			exit 1
+		fi
+		waitLink "/dev/storpool/${LXC_NAME}"
+		if [ "$?" -ne 0 ]; then
+			logger -t "$me" " waitLink /dev/storpool/${LXC_NAME} Failed! ($ret). Exit 1"
+			storpool -B detach volume "$LXC_NAME" client "$SP_OURID" 2>&1 >>"$log"
+			exit 1
+		fi
+		;;
+	1)
+		if [ -L "/dev/storpool/${LXC_NAME}" ]; then
+			logger -t "$me" "${LXC_NAME} is attached to our host"
+		else
+			logger -t "$me" "${LXC_NAME} is attached to another host. Exit 1"
+			exit 1
+		fi
+		;;
+	*)
+		logger -t "$me" "$LXC_NAME attached to more than one host! Exit 1"
+		storpool -B attach list | fgrep -e " $LXC_NAME " | fgrep -ve '---' >>"$log"
+		exit 1
+esac
+
+if mount | fgrep -qe "on ${LXC_ROOTFS_PATH}"; then
+	logger -t "$me" "${LXC_ROOTFS_PATH} already mounted" >>"$log"
+else
+	logger -t "$me" "mount -t ext4 /dev/storpool/${LXC_NAME} ${LXC_ROOTFS_PATH}"
+	mount -v -t ext4 "/dev/storpool/${LXC_NAME}" "${LXC_ROOTFS_PATH}" 2>&1 >>"$log"
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		logger -t "$me" "mount Failed! ($ret). Exit $ret"
+		exit "$ret"
+	fi
+fi

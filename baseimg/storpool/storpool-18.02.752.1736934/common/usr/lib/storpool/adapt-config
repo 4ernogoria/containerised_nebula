@@ -1,0 +1,305 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2016  StorPool
+# All rights reserved.
+#
+
+use v5.10;
+use strict;
+use warnings;
+
+use File::Basename qw(dirname);
+use File::Temp;
+use Getopt::Std;
+
+my $debug = 0;
+
+# Will be initialized after parsing the options.
+my $mode;
+
+my %m = (
+	logrotate => {
+		defaults => {
+			src => '/etc/logrotate.d/syslog',
+			out => '/etc/logrotate.d/storpool',
+		},
+
+		extract => {
+			start => sub {
+				my ($line, $fname, $res) = @_;
+	
+				if ($line =~ $mode->{re}{def_start}) {
+					return 'def';
+				} elsif ($line !~ $mode->{re}{start}) {
+					die "Unexpected line at the start of ".
+					    "the source file $fname: $line\n";
+				}
+				return '';
+			},
+	
+			def => sub {
+				my ($line, $fname, $res) = @_;
+	
+				if ($line =~ $mode->{re}{postrotate}) {
+					return 'postrotate';
+				} elsif ($line =~ $mode->{re}{def_end}) {
+					die "Could not find a postrotate stanza in ".
+					    "the first definition of the source ".
+					    "file $fname\n";
+				}
+				return '';
+			},
+	
+			postrotate => sub {
+				my ($line, $fname, $res) = @_;
+	
+				if ($line =~ $mode->{re}{endscript}) {
+					return undef;
+				} else {
+					${$res} .= "$line\n";
+				}
+				return '';
+			},
+		},
+
+		re => {
+			start		=> qr{^(\s*#.*|\s*|/[A-Za-z0-9._/-]+)$},
+			def_start	=> qr/^\s*{\s*$/,
+			postrotate	=> qr /^\s*postrotate\s*$/,
+			endscript	=> qr/^\s*endscript\s*$/,
+			def_end		=> qr/^\s*}\s*$/,
+		},
+
+		subst => {
+			start => sub {
+				my ($line, $template) = @_;
+	
+				if ($line =~ $mode->{re}{def_start}) {
+					return 'def';
+				} elsif ($line !~ $mode->{re}{start}) {
+					die "Unexpected line at the start of ".
+					    "the template file $template: $line\n";
+				}
+				return '';
+			},
+	
+			def => sub {
+				my ($line, $template) = @_;
+	
+				if ($line =~ $mode->{re}{postrotate}) {
+					return 'postrotate';
+				} elsif ($line =~ $mode->{re}{def_end}) {
+					die "Could not find a postrotate stanza in ".
+					    "the first definition of the template ".
+					    "file $template\n";
+				}
+				return '';
+			},
+	
+			postrotate => sub {
+				my ($line, $template) = @_;
+	
+				if ($line =~ $mode->{re}{endscript}) {
+					die "Empty postrotate section in the template file $template\n";
+				}
+				return undef;
+			},
+
+			skipping => sub {
+				my ($line, $template) = @_;
+	
+				if ($line !~ $mode->{re}{endscript}) {
+					return undef;
+				}
+				return 'copy';
+			},
+	
+			copy => sub {
+				return '';
+			},
+		},
+
+		what => 'the postrotate section',
+	},
+);
+
+sub debug($)
+{
+	say STDERR "RDBG $_[0]" if $debug;
+}
+
+sub version()
+{
+	say 'adapt-config 1.0.0';
+}
+
+sub usage($)
+{
+	my ($err) = @_;
+	my $s = <<EOUSAGE
+Usage:	adapt-config [-v] [-f srcfile] [-o outfile] -m mode -t template
+	adapt-config -m mode -q
+	adapt-config -l
+	adapt-config -V | -h
+
+	-h	display program usage information and exit
+	-f	specify the logrotate file to copy the post-rotate from
+	-l	list the available modes of operation
+	-o	specify the logrotate file to generate
+	-q	show the default filenames for the specified mode
+	-t	specify the StorPool /var/log/debug logrotate template
+	-V	display program version information and exit
+	-v	verbose operation; display diagnostic output
+EOUSAGE
+	;
+
+	if ($err) {
+		die $s;
+	} else {
+		print "$s";
+	}
+}
+
+sub extract_data($)
+{
+	my ($fname) = @_;
+
+	my $res = '';
+	my $state = 'start';
+
+	debug "About to extract $mode->{what} from $fname";
+	open my $f, '<', $fname or
+	    die "Could not open the source file $fname: $!\n";
+	while (my $line = <$f>) {
+		chomp $line;
+		debug "- state '$state', line '$line'";
+		my $handler = $mode->{extract}{$state};
+		if (!defined $handler) {
+			die "Internal error: bad state '$state' while ".
+			    "parsing the source file $fname\n";
+		} else {
+			my $new = $handler->($line, $fname, \$res);
+			$state = $new unless defined $new && $new eq '';
+			last unless defined $state;
+		}
+	}
+	close $f or die "Could not close the source file $fname: $!\n";
+	if (defined $state) {
+		die "Could not extract $mode->{what} from the source file ".
+		    "$fname, left in state '$state', extracted:\n$res\n";
+	}
+	debug 'Extracted:'; debug $_ for split /\r*\n/, $res;
+	return $res;
+}
+
+sub subst_data($ $ $)
+{
+	my ($outf, $template, $replace) = @_;
+
+	my $res = '';
+	my $state = 'start';
+
+	debug "About to replace $mode->{what} from $template into $outf";
+	open my $f, '<', $template or
+	    die "Could not open the template file $template: $!\n";
+	while (my $line = <$f>) {
+		chomp $line;
+		debug "- state '$state', line '$line'";
+		my $handler = $mode->{subst}{$state};
+		if (!defined $handler) {
+			die "Internal error: bad state '$state' while ".
+			    "parsing the template file $template\n";
+		} else {
+			my $new = $handler->($line, $template);
+			if (defined $new) {
+				if ($state eq 'skipping') {
+					die "Internal error: bad state ".
+					    "'$state' at the end of ".
+					    "the skipped part, expected ".
+					    "'copy' while parsing ".
+					    "the template file $template\n"
+					    unless $new eq 'copy';
+
+					print $outf $replace;
+				}
+				say $outf $line;
+				$state = $new unless $new eq '';
+			} else {
+				die "Internal error: no skipping in ".
+				    "the 'copy' state while parsing ".
+				    "the template file $template\n"
+				    if $state eq 'copy';
+
+				$state = 'skipping';
+			}
+		}
+	}
+	close $f or die "Could not close the template file $template: $!\n";
+	if ($state ne 'copy') {
+		die "Could not replace $mode->{what} from the template file ".
+		    "$template, left in state '$state'\n";
+	}
+}
+
+MAIN:
+{
+	my %opts;
+
+	getopts('f:hlm:o:qt:Vv', \%opts) or usage 1;
+	version if $opts{V};
+	usage 0 if $opts{h};
+	exit 0 if $opts{V} || $opts{h};
+	$debug = $opts{v};
+
+	if ($opts{l}) {
+		say 'adapt-config modes of operation:';
+		say "\t$_" for sort keys %m;
+		exit 0;
+	}
+	usage 1 unless $opts{m};
+	$mode = $m{$opts{m}};
+	die "Unknown mode '$opts{m}', use -l for a list\n" unless defined $mode;
+	if ($opts{q}) {
+		say "Mode $opts{m} default filenames:";
+		say "\tsource file $mode->{defaults}{src}";
+		say "\toutput file $mode->{defaults}{out}";
+		exit 0;
+	}
+	my $template = $opts{t};
+	usage 1 unless $template;
+
+	my $src = $opts{f} // $mode->{defaults}{src};
+	my $out = $opts{o} // $mode->{defaults}{out};
+	debug "Generating $out from $template and $src";
+
+	my $postrotate = extract_data $src;
+
+	my $f = File::Temp->new(TEMPLATE => '.storpool.XXXXXX',
+	    DIR => dirname($out));
+	debug "Using tempfile $f";
+	subst_data $f, $template, $postrotate;
+
+	debug "About to copy the access rights of $src to $f";
+	my @stat = stat $src or
+	    die "Could not stat $src: $!\n";
+	my @fstat = stat $f or
+	    die "Could not stat $f: $!\n";
+	if ($fstat[2] != $stat[2]) {
+		chmod $stat[2], $f or
+		    die "Could not set the permissions of $f to ".
+		        sprintf('%o', $stat[2]).": $!\n";
+	}
+	if ($> == 0 &&
+	    ($fstat[5] != $stat[5] || $fstat[4] != $stat[4])) {
+		chown $stat[4], $stat[5], $f or
+		    die "Could not set the user:group of $f to ".
+		        "$stat[4]:$stat[5]: $!\n";
+	}
+
+	debug "About to rename $f to $out";
+	rename $f, $out or
+	    die "Could not rename $f to $out: $!\n";
+	$f->unlink_on_destroy(0);
+	debug 'Done!';
+}

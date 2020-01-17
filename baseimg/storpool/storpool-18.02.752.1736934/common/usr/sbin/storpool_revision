@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+#-
+# Copyright (c) 2016  StorPool.
+# All rights reserved.
+#
+
+usage(){
+	cat <<EOUSAGE
+	Usage: $(basename -- $0) [-h|--help] [-v|--verbose]
+	Prints list of StorPool binaries found in /usr/sbin and their according "storpool_revision"
+
+	[-h|--help]	- print this message
+	[-v]		- verbose output
+EOUSAGE
+}
+
+strings=$(type -p strings)
+
+if [[ -z $strings ]]; then
+	echo "I need 'strings', but it seems to be missing, please install binutils and re-run" 1>&2
+	exit 1
+fi
+
+if [[ -n $* ]]; then
+	while test -n "$1"; do
+		case "$1" in
+			-h|--help)
+				usage
+				exit 0
+				;;
+			-v|--verbose)
+				verbose=1
+				shift
+				;;
+			*)
+				usage
+				exit 1
+				;;
+		esac
+	done
+fi
+
+storpool_binaries=( $(find -L /usr/sbin -mindepth 1 -maxdepth 1 -type f -name 'storpool_*.bin') )
+
+basedir="$HOME/$(uname -r)"
+unset debugbins
+declare -a debugbins
+
+rev=/etc/storpool_revision
+if [[ -s $rev ]]; then
+	cat "$rev"
+fi
+fmt='%-40s%-s'
+printf "${fmt}\n" 'path' 'revision'
+for spbin in ${storpool_binaries[@]} ; do
+	sprev=$( "$strings" "$spbin" | fgrep -m1 'storpool_revision=' )
+	sprev_short="${sprev##*=}"
+	unset dbg
+	if file "$spbin" | fgrep -q "not stripped"; then
+		printf "${fmt}\t%s\n" "$spbin" "$sprev_short" "not stripped"
+	else
+		printf "$fmt\n" "$spbin" "$sprev_short"
+	fi
+
+	if [[ -d $basedir ]]; then
+		dirs=( $(find -- "$basedir/" -mindepth 1 -maxdepth 1 -type d -name "*$sprev_short*") )
+		if [[ ${#dirs[@]} -eq 0 ]]; then
+			[[ -n $verbose ]] && echo "No StorPool installation package found at $basedir/*$sprev_short*" 1>&2
+			continue
+		elif [[ ${#dirs[@]} -gt 1 ]]; then
+			[[ -n $verbose ]] && echo "More than one directory $basedir/*$sprev_short*, not checking for debug" 1>&2
+			continue
+		fi
+		debugbin="${dirs[0]}/debug/usr/lib/debug/$spbin"
+		if [[ ! -f $debugbin && -n $verbose ]]; then
+			echo "No debug binary $debugbin" 1>&2
+			continue
+		fi
+		debugbins["${#debugbins[@]}"]="$debugbin"
+	fi
+done
+
+if [[ -d $basedir ]]; then
+	echo "debug binaries"
+	printf "%s\n" "${debugbins[@]}"
+fi

@@ -1,0 +1,221 @@
+#!/bin/bash
+#
+#-
+# Copyright (c) 2013, 2014  StorPool.
+# All rights reserved.
+#
+
+# This script should be called from /sbin/ifup-local as follow
+#  [ -x /usr/lib/storpool/ifvxlan ] && /usr/lib/storpool/ifvxlan $1 up
+# from /sbin/ifdown-local as follow
+#  [ -x /usr/lib/storpool/ifvxlan ] && /usr/lib/storpool/ifvxlan $1 down
+#
+# SP_IPROUTE2_PATH should be in /etc/storpool.conf
+#
+# set CONNECTED_MODE, MTU and vxlan* in
+# /etc/sysconfig/network-scripts/ifcfg-ibN:
+# CONNECTED_MODE=yes
+# MTU=65520
+# BROADCAST={defaults tp ibN broadcast address}
+# vxlanID=42 # optional, defaults to (42+N)
+# vxlanNAME=vx0  # optional, defaults to vxN
+# vxlanLLADDR=00:00:00:00:00:00 # optional, defaults to 00:00:00:00:00:00
+# vxlanIPADDR=ipv4/{CIDR|ipmask}
+
+ifLogger=$(which logger)
+ifLog() {
+	local msg=$1
+	local err=$2
+	if [ -n "$ifLogger" ]; then
+		if [ -n "$err" ] && [ $err -ne 0 ]; then
+			lLogger="$ifLogger -s -p mark.err"
+		else
+			lLogger="$ifLogger -p mark.info"
+		fi
+		lLogger="$lLogger -t ifvxlan --"
+	else
+		lLogger=echo
+	fi
+	$lLogger $msg
+	[ -n "$err" ] && [ $err -ne 0 ] && exit 1
+}
+
+. /usr/lib/storpool/storpool_confget.sh
+
+SP_IFVXLAN_IFACES=${SP_IFVXLAN_IFACES:-ib}
+SP_IFVXLAN_IFACES=${SP_IFVXLAN_IFACES//\"/}
+SP_IFVXLAN_IFACES=${SP_IFVXLAN_IFACES//\'/}
+
+if [ -n "$SP_IFVXLAN_HARDFAIL" ]; then
+	hardfail=1
+else
+	hardfail=0
+fi
+
+if [ -n "$SP_IPROUTE2_PATH" ] && [ "${SP_IPROUTE2_PATH%/}" = "$SP_IPROUTE2_PATH" ]; then
+	SP_IPROUTE2_PATH="$SP_IPROUTE2_PATH/"
+fi
+
+${SP_IPROUTE2_PATH}ip 2>/dev/null 1>/dev/null
+[ $? -ne 255 ] && ifLog "cant find '${SP_IPROUTE2_PATH}ip' binary" 1
+
+if [ -n "$SP_IFVXLAN_BRIDGE_ENABLED" ]; then
+	${SP_IPROUTE2_PATH}bridge 2>/dev/null >/dev/null
+	[ $? -ne 255 ] && ifLog "cant find '${SP_IPROUTE2_PATH}bridge' binary" 1
+fi
+
+ifName=
+vxAction=
+while [ $# -gt 0 ]; do
+	case $1 in
+		*up*)
+			[ -n "$vxAction" ] || vxAction="up"
+			;;
+		*down*)
+			[ -n "$vxAction" ] || vxAction="down"
+			;;
+		*)
+			[ -n "$ifName" ] || ifName=$1
+			;;
+	esac
+	shift
+done
+
+ifPrefix=${ifName%[[:digit:]]*}
+unset ifMatch
+for i in $SP_IFVXLAN_IFACES; do
+	if [ "$ifPrefix" = "$i" ]; then
+		ifMatch="$i"
+		break
+	fi
+done
+
+if [ -n "$ifMatch" ]; then
+	ifCfg="/etc/sysconfig/network-scripts/ifcfg-$ifName"
+	if [ -z "$vxAction" ]; then
+		# try to guess action from file name
+		myself=${0##*/}
+		if [ "${myself/up/}" == "$0" ]; then
+			if [ "${myself/down/}" == "$0" ]; then
+				ifLog " Can't guess action for $ifName!" 1
+			else
+				vxAction="down"
+			fi
+		else
+			vxAction="up"
+		fi
+	fi
+	if [ -f "$ifCfg" ]; then
+		. "$ifCfg"
+	else
+		ifLog "configuration file $ifCfg missing!" 1
+	fi
+	
+	N=${ifName##*[[:alpha:]]}
+	vxlanID=${vxlanID:-$((N+42))}
+	vxlanNAME=${vxlanNAME:-vx$N}
+	vxlanLLADDR=${vxlanLLADDR:-00:00:00:00:00:00}
+	[ -z "$vxlanIPADDR" ] && ifLog "vxlanIPADDR missing! ($ifCfg)" 1
+	case "$vxAction" in
+		*up*)
+			[ -n "$BROADCAST" ] || BROADCAST=`${SP_IPROUTE2_PATH}ip addr list $ifName | grep 'global' | xargs | cut -d ' ' -f 4`
+			[ -z "$BROADCAST" ] && echo "BROADCAST missing! ($ifCfg)" && exit 1
+			status="up"
+
+			${SP_IPROUTE2_PATH}ip link add "$vxlanNAME" type vxlan id "$vxlanID" dev "$ifName" remote "$BROADCAST"
+			RET=$?
+			if [ $RET -ne 0 ]; then
+				ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}ip link add $vxlanNAME type vxlan id $vxlanID dev $ifName remote $BROADCAST" $hardfail
+				status="failed"
+			else
+				[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}ip link add $vxlanNAME type vxlan id $vxlanID dev $ifName remote $BROADCAST"
+			fi
+
+			${SP_IPROUTE2_PATH}ip link set "$vxlanNAME" up
+			RET=$?
+			if [ $RET -ne 0 ]; then
+				ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}ip link set $vxlanNAME up" $hardfail
+				status="failed"
+			else
+				[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}ip link set $vxlanNAME up"
+			fi
+			
+			if [ -n "$SP_IFVXLAN_BRIDGE_ENABLED" ]; then
+				${SP_IPROUTE2_PATH}bridge fdb add "$vxlanLLADDR" dev "$vxlanNAME" dst "$BROADCAST"
+				RET=$?
+				if [ $RET -ne 0 ]; then
+					ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}bridge fdb add $vxlanLLADDR dev $vxlanNAME dst $BROADCAST" $hardfail
+					status="failed"
+				else
+					[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}bridge fdb add $vxlanLLADDR dev $vxlanNAME dst $BROADCAST via $ifName"
+				fi
+			fi
+
+			${SP_IPROUTE2_PATH}ip addr add "$vxlanIPADDR" dev "$vxlanNAME"
+			RET=$?
+			if [ $RET -ne 0 ]; then
+				ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}ip addr add $vxlanIPADDR dev $vxlanNAME" $hardfail
+				status="failed"
+			else
+				[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}ip addr add $vxlanIPADDR dev $vxlanNAME"
+			fi
+
+			ifLog "${vxlanNAME} ${vxlanIPADDR} vxlan id ${vxlanID} dev $ifName remote ${BROADCAST} $status"
+			;;
+		*down*)
+			status="down"
+			${SP_IPROUTE2_PATH}ip addr del "$vxlanIPADDR" dev "$vxlanNAME"
+			RET=$?
+			if [ $RET -ne 0 ]; then
+				ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}ip addr del $vxlanIPADDR dev $vxlanNAME" $hardfail
+				status="failed"
+			else
+				[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}ip addr del $vxlanIPADDR dev $vxlanNAME"
+			fi
+
+			if [ -n "$SP_IFVXLAN_BRIDGE_ENABLED" ]; then
+				${SP_IPROUTE2_PATH}bridge fdb del "$vxlanLLADDR" dev "$vxlanNAME" 2>/dev/null
+				RET=$?
+				if [ $RET -ne 0 ]; then
+					ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}bridge fdb del $vxlanLLADDR dev $vxlanNAME via $ifName" $hardfail
+					status="failed"
+				else
+					[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}bridge fdb del $vxlanLLADDR dev $vxlanNAME via $ifName"
+				fi
+			fi
+
+			if [ -x "`which ${SP_IPROUTE2_PATH}bridge`" ]; then
+				${SP_IPROUTE2_PATH}bridge fdb show dev "$vxlanNAME" 2>/dev/null >/dev/null
+				if [ $? -eq 0 ]; then
+					ifLog "${SP_IPROUTE2_PATH}bridge fdb dev $vxlanNAME EXISTS trying to delete" 0
+					${SP_IPROUTE2_PATH}bridge fdb del "$vxlanLLADDR" dev "$vxlanNAME" 2>/dev/null
+					if [ $? -ne 0 ]; then
+						ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}bridge fdb del $vxlanLLADDR dev $vxlanNAME" $hardfail
+					else
+						[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}bridge fdb del $vxlanLLADDR dev $vxlanNAME"
+					fi
+				fi
+			fi
+			
+			${SP_IPROUTE2_PATH}ip link set "$vxlanNAME" down
+			RET=$?
+			if [ $RET -ne 0 ]; then
+				ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}ip link set $vxlanNAME down" $hardfail
+				status="failed"
+			else
+				[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}ip link set $vxlanNAME down"
+			fi
+			
+			${SP_IPROUTE2_PATH}ip link delete "$vxlanNAME" type vxlan id "$vxlanID" dev "$ifName"
+			RET=$?
+			if [ $RET -ne 0 ]; then
+				ifLog "FAILED($RET) ${SP_IPROUTE2_PATH}ip link delete $vxlanNAME type vxlan id $vxlanID dev $ifName" $hardfail
+				status="failed"
+			else
+				[ -n "SP_IFVXLAN_VERBOSE" ] && ifLog "${SP_IPROUTE2_PATH}ip link delete $vxlanNAME type vxlan id $vxlanID dev $ifName"
+			fi
+
+			ifLog "${vxlanNAME} ${vxlanIPADDR} vxlan id ${vxlanID} dev $ifName $status"
+			;;
+	esac
+fi

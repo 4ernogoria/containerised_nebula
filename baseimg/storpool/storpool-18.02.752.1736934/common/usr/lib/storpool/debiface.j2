@@ -1,0 +1,58 @@
+{#- name device #}
+auto {{item.interface}}
+{#- static method by default #}
+{%- if (item.bootproto is undefined) and (item.ipaddr is undefined) %}
+iface {{item.interface}} inet {{item.bootproto|default('manual')}}
+{%- if (item.bonding_master is defined) %}
+bond-master {{item.bonding_master}}
+{%- if (item.iftype != 'dummy') %}
+pre-up /sbin/enslavedummy {{item.bonding_master}} {{item.dummy|default('dummy0')}} || true
+{%- endif %}
+{%- endif %}
+{%- elif (item.bootproto is defined) %}
+iface {{item.interface}} inet {{item.bootproto}}
+{%- elif (item.bootproto == 'static' or (item.ipaddr is defined)) %}
+iface {{item.interface}} inet {{item.bootproto|default('static')}}
+{#- debian ipv4 family configuration #}
+address {{item.ipaddr}}
+netmask {{item.netmask|default('255.255.255.0')}}
+{%- if item.network is defined %}
+network {{item.network}}
+{%- endif %}
+{%- if item.broadcast is defined %}
+broadcast {{item.broadcast}}
+{%- endif %}
+{%- if item.gateway is defined %}
+gateway {{item.gateway}}
+{%- endif %}
+{%- endif %}
+
+{#- mtu configuration #}
+mtu {{item.mtu|default('9000')}}
+
+{#- vlan configuration #}
+{%- if (item.iftype == 'Vlan') %}
+{%- if (item.physdev is defined) %}
+vlan-raw-device {{item.physdev}}
+{%- endif %}
+{%- endif %}
+
+{#- bond config #}
+{%- if (item.iftype == 'Bond') %}
+{%- if (item.bond_mode is defined) %}
+bond-mode {{item.bond_mode}}
+{%- if (item.bond_slaves is undefined) %}
+bond-slaves none
+{%- elif (item.bond_slaves is defined) %}
+bond-slaves {% for slave in item.bond_slaves %}{{slave}}{% if not loop.last %} {% endif %}{% endfor %}
+{%- endif %}
+{%- if (item.bond_mode == 'active-backup') or (item.bond_mode == '1') %}
+bond-arp-interval {{item.arp_interval|default('500')}}
+bond-arp-all-targets  {{item.arp_all_targets|default('any')}}
+bond-arp-ip-target  {% for ip in item.arp_ip_target %}{{ip}}{% if not loop.last %} {% endif %}{% endfor %}
+{%- elif (item.bond_mode == '4') or (item.bond_mode == '802.3ad') %}
+bond-miimon {{item.miimon|default('100')}}
+bond-lacp-rate  {{item.lacp_rate|default('1')}}
+{%- endif %}
+{%- endif %}
+{%- endif %}

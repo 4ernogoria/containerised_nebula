@@ -1,0 +1,112 @@
+#!/bin/bash
+
+if [[ -n "$*" ]]; then
+	cat 1>&2 <<EOUSAGE
+	Usage: "$(basename -- "$0")"
+
+	Gets the SP_IFACE configured interfaces and attempts to
+	construct the SP_IFACE1_CFG and SP_IFACE2_CFG lines
+	required for 18.02 release
+
+	prints generated configuration on stdout, ex.:
+
+	[hostname]
+	# comment bond0.100 is on active-backup bond(bond0), slave 0 is eth0
+	# comment bond0.100 is on active-backup bond(bond0), slave 1 is eth1
+	SP_IFACE1_CFG=1:bond0.100:eth0:100:10.0.0.1:b:s:P
+	SP_IFACE1_CFG=1:bond0.100:eth1:100:10.0.0.1:b:s:P
+
+EOUSAGE
+	exit
+fi
+
+ifaces=($(storpool_showconf -ne SP_IFACE 2>/dev/null | sed -e "s@,@ @g"))
+ifaces=(${ifaces[@]/=*})
+apiip="$(storpool_showconf -ne SP_API_HTTP_HOST 2>/dev/null)"
+host="$(hostname)"
+
+if [[ -z ${ifaces[*]} ]]; then
+	echo "Could not find interfaces to translate, SP_IFACE not configured for '$host'?" 1>&2
+	exit 1
+fi
+if [[ -z $apiip ]]; then
+	echo "Could not determine SP_API_HTTP_HOST, required for proper IP detection" 1>&2
+	exit 1
+fi
+
+count=0
+cfgs=()
+comments=()
+for iface in "${ifaces[@]}"; do
+	cfg=''
+	unset bond
+	vlan="${iface##*.}"
+	ifaceonly="${iface%%.*}"
+	if [[ -z $vlan || -z $ifaceonly ]]; then
+		echo "something went wrong with $iface" 1>&2
+		exit 1
+	fi
+	if [[ $vlan == $ifaceonly ]]; then
+		vlan=0
+	fi
+	cfg+="SP_IFACE$((count+1))_CFG=1:"
+	if [[ -d /sys/class/net/${iface/.*}/bonding ]]; then
+		# ensure the second network is on the same bond
+		if [[ -n "$bond" && "$ifaceonly" != "$bond" ]]; then
+			echo "Detected bond $ifaceonly is not $bond" 1>&2
+			exit 1
+		fi
+		slaveifaces=($(xargs -n1 < "/sys/class/net/${iface/.*}/bonding/slaves" | grep -v dummy))
+		ifaceonly="${slaveifaces[$count]}"
+		bond="${iface/.*}"
+		# check mode
+		bmodefile="/sys/class/net/${iface/.*}/bonding/mode"
+		if [[ ! -r $bmodefile ]]; then
+			echo "Could not determine bond type" 1>&2
+			exit 1
+		fi
+		bondtypearray=($(<"$bmodefile"))
+		bondtype="${bondtypearray[0]}"
+		bondmode="${bondtypearray[1]}"
+		if [[ -z $bondmode ]]; then
+			echo "Could not determine bond mode for $bond" 1>&2
+			exit 1
+		fi
+		if [[ -z ${slaveifaces[*]} ]]; then
+			echo "No slaves found for bond $bond" 1>&2
+			exit 1
+		fi
+		if [[ -z ${ifaceonly} ]]; then
+			echo "Interface $count under bond empty" 1>&2
+			exit 1
+		fi
+		comments+=("# $iface is on $bondtype bond ($bond), slave $count is ${slaveifaces[$count]}")
+	fi
+	cfg+="${iface}:${ifaceonly}:${vlan}:"
+	addr="$(ip -o -4 a l dev "${iface}" | awk -F'[ /]+' -v "apiip=$apiip" '$4 != apiip { print $4 ; exit}')"
+	if [[ -z $addr ]]; then
+		echo "failed to get ipv4 address for $iface" 1>&2
+		exit 1
+	fi
+	cfg+="${addr}:"
+	if [[ -n $bond ]]; then
+		if [[ $bondmode -eq 1 ]]; then
+			cfg+="b:s:P"
+		elif [[ $bondmode -eq 4 ]]; then
+			cfg+="b:s:v"
+		else
+			echo "Unsupported bond mode $bondmode ($bondtype) for $bond, bailing out" 1>&2
+			exit 1
+		fi
+	else
+		cfg+="b:x:v"
+	fi
+	count=$((count+1))
+	cfgs+=("$cfg")
+done
+
+echo "[$host]"
+if [[ -n ${comments[*]} ]]; then
+	printf "%s\n" "${comments[@]}"
+fi
+printf "%s\n" "${cfgs[@]}"

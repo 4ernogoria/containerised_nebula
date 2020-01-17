@@ -1,0 +1,122 @@
+#!/usr/bin/python
+#
+#-
+# Copyright (c) 2018  StorPool.
+# All rights reserved.
+#
+
+from __future__ import print_function
+
+import argparse
+import os
+import sys
+
+
+do_debug = False
+
+
+def version():
+	print('fix_dir_owner 0.1.0.dev1')
+
+
+def debug(s):
+	if do_debug:
+		print('RDBG {s}'.format(s=s), file=sys.stderr)
+
+
+def bad_uid():
+	st = os.stat('/')
+	if st.st_uid == 0:
+		print('The root directory is not owned by another account')
+		exit(0)
+	return st.st_uid
+
+
+def paths_for_uid(uid):
+	bad = set()
+	checked = set()
+	paths = sys.path + ['/usr/share/doc/python-storpool']
+	for path in filter(lambda s: len(s) > 0, paths):
+		debug('checking {path}'.format(path=path))
+		while True:
+			if path not in checked:
+				checked.add(path)
+				debug('- checking {path}'.format(path=path))
+				try:
+					st = os.stat(path)
+					if st.st_uid == uid:
+						debug('  - oof!')
+						bad.add(path)
+				except OSError as e:
+					if e.errno != 2:
+						raise
+
+			newpath = os.path.dirname(path)
+			if newpath == path or newpath == '':
+				break
+			path = newpath
+
+	bad = list(sorted(bad))
+	debug('bad paths: {bad}'.format(bad=bad))
+	return bad
+
+
+def cmd_check(args):
+	uid = bad_uid()
+	print('The root directory is owned by weird uid {uid}'.format(uid=uid))
+	bad = paths_for_uid(uid)
+	if not bad:
+		exit('No bad paths... not even the root... how is this even possible?')
+	print('\n'.join(bad))
+
+
+def cmd_fix(args):
+	uid = bad_uid()
+	debug('The root directory is owned by weird uid {uid}'.format(uid=uid))
+	bad = paths_for_uid(uid)
+	if not bad:
+		exit('No bad paths... not even the root... how is this even possible?')
+	errors = 0
+	for path in bad:
+		try:
+			debug('- fixing {path}'.format(path=path))
+			if args.noop:
+				print("chown root:root '{path}'".format(path=path))
+			else:
+				os.chown(path, 0, 0)
+		except Exception as e:
+			print('Could not change the ownership of {path}: {e}'.format(path=path, e=e), file=sys.stderr)
+			errors = errors + 1
+
+	if errors:
+		exit('Could not fix all the detected bad paths')
+
+
+def main():
+	commands = {
+		'check': cmd_check,
+		'fix': cmd_fix,
+	}
+
+	parser = argparse.ArgumentParser(
+		prog='fix_dir_owner',
+		usage='''
+	fix_dir_owner [-Nv] check
+	fix_dir_owner [-Nv] fix
+	fix_dir_owner -V | -h''')
+	parser.add_argument('-N', '--noop', action='store_true', help='no-operation mode')
+	parser.add_argument('-V', '--version', action='store_true', help='display program version information and exit')
+	parser.add_argument('-v', '--verbose', action='store_true', help='verbose mode; display diagnostic output')
+	parser.add_argument('command', choices=sorted(commands.keys()))
+
+	args = parser.parse_args()
+	if args.version:
+		version()
+		exit(0)
+
+	global do_debug
+	do_debug = args.verbose
+	commands[args.command](args)
+
+
+main()

@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+
+use 5.010;
+use strict;
+use warnings;
+
+use JSON::XS;
+use Data::Dumper;
+
+sub worker($$$);
+
+sub readfile($) {
+	my ($file) = @_;
+	open my $f, '<', $file or die "Could not open $file: $!\n";
+	my $s;
+	{
+		local $/;
+		$s = <$f>;
+	}
+	close $f or die "Could not close $file: $!\n";
+	return $s;
+}
+
+sub add_nodes($$) {
+	my ($nodes, $data) = @_;
+	my @objs = [];
+	
+	if (ref($data->{data}) eq "HASH") {
+		@objs = values %{$data->{data}};
+	} else {
+		@objs = @{$data->{data}};
+	}
+	
+	for my $obj (@objs) {
+		$nodes->{$obj->{name}} = { childrenCount => 0 } if (! $nodes->{$obj->{name}});
+		
+		if (defined $obj->{parentName}) {
+			$nodes->{$obj->{name}}->{parentName} = $obj->{parentName};
+			
+			$nodes->{$obj->{parentName}} = { childrenCount => 0 } if (! $nodes->{$obj->{parentName}});
+			$nodes->{$obj->{parentName}}->{childrenCount}++;
+		}
+		
+		$nodes->{$obj->{name}}->{name}       = $obj->{name}       if (defined $obj->{name});
+		$nodes->{$obj->{name}}->{onDiskSize} = $obj->{onDiskSize} if (defined $obj->{onDiskSize});
+	}
+}
+
+sub worker($$$){
+	my ($vol, $hash, $size) = @_;
+	if ($hash->{$vol}->{parentName}) {
+		my $parentName = $hash->{$vol}->{parentName};
+		print ($hash->{$parentName}->{childrenCount} > 1 ? "* " : "  ");
+		say $hash->{$parentName}->{name} . "\t" . $hash->{$parentName}->{onDiskSize};
+		worker ($hash->{$vol}->{parentName}, $hash, $size + $hash->{$parentName}->{onDiskSize});
+	} else {
+		say '---------------------------------------------------------';
+		say "TOTAL\t". $size;
+	}
+}
+
+MAIN:
+{
+	my $jsonStatus;
+	my $jsonSnaps;
+	my $jsonVolumes;
+	
+	my $vol = $ARGV[0];
+	
+	if (@ARGV == 1) {
+		$jsonStatus = `storpool -j volume status`;
+		$jsonSnaps = `storpool -j snapshot list`;
+		$jsonVolumes = `storpool -j volume list`;
+	} else {
+		my $statusFile = $ARGV[3];
+		$jsonStatus = readfile $statusFile;
+		my $snapsFile = $ARGV[2];
+		$jsonSnaps = readfile $snapsFile;
+		my $volumesFile = $ARGV[1];
+		$jsonVolumes = readfile $volumesFile;
+	}
+	
+	my $hash = {};
+	add_nodes $hash, decode_json $jsonStatus;
+	add_nodes $hash, decode_json $jsonSnaps;
+	add_nodes $hash, decode_json $jsonVolumes;
+	
+	say $hash->{$vol}->{name} . "\t" . $hash->{$vol}->{onDiskSize};
+	say '---------------------------------------------------------';
+	worker ($vol, $hash, 0);
+}

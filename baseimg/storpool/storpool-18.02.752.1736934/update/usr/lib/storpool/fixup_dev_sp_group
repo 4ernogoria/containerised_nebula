@@ -1,0 +1,100 @@
+#!/bin/sh
+#
+# Copyright (c) 2016  StorPool
+# All rights reserved.
+
+set -e
+
+version()
+{
+	echo 'fixup_dev_sp_group 0.1.0.dev462'
+}
+
+usage()
+{
+	cat <<EOUSAGE
+Usage:	fixup_dev_sp_group [-Nv]
+	fixup_dev_sp_group -V | -h
+
+	-h	display program usage information and exit
+	-N	no operation mode; display what would have been done
+	-V	display program version information and exit
+	-v	verbose operation; display diagnostic output
+EOUSAGE
+}
+
+unset hflag noop Vflag v
+
+while getopts 'hNVv' o; do
+	case "$o" in
+		h)
+			hflag=1
+			;;
+
+		N)
+			noop='echo'
+			;;
+
+		V)
+			Vflag=1
+			;;
+
+		v)
+			v='-v'
+			;;
+
+		*)
+			usage 1>&2
+			exit 1
+			;;
+	esac
+done
+[ -z "$Vflag" ] || version
+[ -z "$hflag" ] || usage
+[ -z "$Vflag$hflag" ] || exit 0
+
+shift `expr "$OPTIND" - 1`
+if [ "$#" -ne 0 ]; then
+	echo 'No arguments expected' 1>&2
+	exit 1
+fi
+
+if [ -z "`type -p lsof`" ]; then
+	echo 'lsof not installed!' 1>&2
+	exit 1
+fi
+
+tempf=`mktemp time-bubble-qemu.txt.XXXXXX`
+trap "rm -f -- '$tempf'" HUP INT TERM QUIT EXIT
+tempf2=`mktemp time-bubble-qemu-2.txt.XXXXXX`
+trap "rm -f -- '$tempf' '$tempf2'" HUP INT TERM QUIT EXIT
+
+# Get a "pid device" pair for each device opened by a process
+lsof -n | awk '$NF ~ /\/dev\/sp-/ { print $2 " " $NF }' | sort -u > "$tempf"
+
+# Aggregate these into "pid device device device..." per process
+awk '
+	BEGIN	{
+		pid=-1
+	}
+	{
+		if (pid != $1) {
+			if (pid != -1) {
+				print pid " " res
+			};
+			pid=$1;
+			res = "";
+		};
+		res=res " " $2
+	}
+	END {
+		if (pid != -1) {
+			print pid " " res
+		}
+	}' < "$tempf" > "$tempf2"
+
+# Change the group ownership of each device to the group of the process
+while read pid devs; do
+	grp=`ps --no-headers -o group "$pid"`
+	$noop chgrp $v -- "$grp" $devs
+done < "$tempf2"

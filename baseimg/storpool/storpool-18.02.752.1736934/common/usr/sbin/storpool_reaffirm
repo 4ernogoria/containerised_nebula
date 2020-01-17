@@ -1,0 +1,218 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2016  StorPool.
+# All rights reserved.
+
+use v5.010;
+use strict;
+use warnings;
+
+use Getopt::Std;
+
+my ($debug, $noop);
+my %spconf;
+
+sub debug($)
+{
+	say STDERR $_[0] if $debug;
+}
+
+sub confget()
+{
+	undef %spconf;
+	my @a = `storpool_confget`;
+	for my $env (`storpool_confget`)
+	{
+		chomp $env;
+		my ($k, $v) = split('=', $env, 2);
+		$spconf{$k} = $v;
+	}
+}
+
+my %shell_to_regexp_sub = ( '?' => '.', '*' => '.*' );
+
+sub shell_to_regexp($)
+{
+	my ($pattern) = @_;
+
+	my $res = '^';
+	while ($pattern =~ /^
+		(?<literal> [^?*]* )
+		(?<meta> [?*] )
+		(?<rest> .* )
+		/x) {
+		$res .= quotemeta $+{literal};
+		$res .= $shell_to_regexp_sub{$+{meta}};
+		$pattern = $+{rest};
+	}
+	$res .= quotemeta($pattern).'$';
+	return qr/^$res$/;
+}
+
+sub filter($ $)
+{
+	my ($var, $sys) = @_;
+	my (%chosen, %unwanted);
+	my $all = $spconf{$var};
+	die "No $var specified in the StorPool configuration files\n"
+		unless defined $all;
+	for my $pattern (split /\s+/, $all) {
+		if (substr($pattern, 0, 1) eq '!') {
+			$pattern = shell_to_regexp substr $pattern, 1;
+			$unwanted{$_} = 1 for grep /$pattern/, keys %{$sys};
+		} else {
+			$pattern = shell_to_regexp $pattern;
+			$chosen{$_} = $sys->{$_} for grep /$pattern/, keys %{$sys};
+		}
+	}
+	delete $chosen{$_} for keys %unwanted;
+	return \%chosen;
+}
+
+sub first_line_output(@)
+{
+	my (@cmd) = @_;
+	my $name = $cmd[0];
+
+	my $pid = open my $f, '-|';
+	if (!defined $pid) {
+		die "Could not fork for $name: $!\n";
+	} elsif ($pid == 0) {
+		exec { $name } @cmd;
+		die "Could not execute '$name': $!\n";
+	}
+	my $first = <$f>;
+	if (defined $first) {
+		chomp $first;
+		# Ignore the rest
+		while (<$f>) {
+		}
+	}
+	close $f;
+	return $? == 0? $first: undef;
+}
+
+sub first_line_file($)
+{
+	my ($fname) = @_;
+
+	open my $f, '<', $fname or do {
+		return undef if $!{ENOENT};
+		die "Could not open $fname for reading: $!\n";
+	};
+	my $first = <$f>;
+	close $f;
+	chomp $first if defined $first;
+	return $first;
+}
+
+sub write_file($ $)
+{
+	my ($fname, $line) = @_;
+
+	say "echo '$line' > $fname" if $noop || $debug;
+	return if $noop;
+
+	open my $f, '>', $fname or die "Could not open $fname for writing: $!\n";
+	say $f $line or die "Could not write to $fname: $!\n";
+	close $f or die "Could not write to $fname: $!\n";
+}
+
+my %reaffirm = (
+	sysfs => {
+		list => sub {
+			{
+				'class/graphics/fbcon/cursor_blink' => '0',
+			}
+		},
+		get => sub {
+			first_line_file "/sys/$_[0]"
+		},
+		set => sub {
+			write_file "/sys/$_[0]", $_[1]
+		},
+	},
+);
+
+sub parse_handlers($)
+{
+	my ($var) = @_;
+	my @res;
+	my $all = $spconf{$var};
+	die "No $var specified in the StorPool configuration files\n"
+		unless defined $all;
+	for my $tag (split /\s+/, $all) {
+		die "Invalid $var tag '$tag'; supported: ".
+			join(' ', sort keys %reaffirm)."\n" unless defined $reaffirm{$tag};
+		push @res, $tag;
+	}
+	return @res;
+}
+
+sub parse_cmdline_handlers($ @)
+{
+	my ($base, @handlers) = @_;
+
+	my @list;
+	for my $spec (@handlers) {
+		if ($spec !~ /^
+			(?<name> [a-z]+ )
+			=
+			(?<args> .* )
+			/x) {
+			die "Invalid handler specification '$spec', should be name=args\n";
+		}
+		$spconf{$base.'_'.uc $+{name}} = $+{args};
+		push @list, $+{name};
+	}
+	$spconf{$base} = join ' ', @list;
+}
+
+sub run_handler($)
+{
+	my ($name) = @_;
+
+	my $h = $reaffirm{$name};
+	my $all = $h->{list}->();
+	my $wanted = filter "SP_REAFFIRM_".uc($name), $all;
+	for my $var (sort keys %{$wanted}) {
+		my $current = $h->{get}->($var);
+		if (!defined $current) {
+			next;
+		}
+		my $expected = $wanted->{$var};
+		next if $current eq $expected;
+		debug "$name $var: got '$current', expected '$expected'";
+		$h->{set}->($var, $expected);
+	}
+}
+
+sub usage()
+{
+		die <<'EOUSAGE'
+Usage:	storpool_reaffirm [-Nv] what='pattern [pattern...]'...
+	storpool_reaffirm [-Nv] -p
+
+Current settings sources:
+	sysfs	the /sys/class/graphics/fbcon/cursor_blink=0 setting
+EOUSAGE
+}
+
+MAIN:
+{
+	my %opts;
+	getopts 'pNv', \%opts or usage;
+	$debug = $opts{v};
+	$noop = $opts{N};
+
+	if ($opts{p}) {
+		usage if @ARGV;
+		confget;
+	} else {
+		usage unless @ARGV;
+		parse_cmdline_handlers 'SP_REAFFIRM', @ARGV;
+	}
+
+	run_handler $_ for parse_handlers 'SP_REAFFIRM';
+}

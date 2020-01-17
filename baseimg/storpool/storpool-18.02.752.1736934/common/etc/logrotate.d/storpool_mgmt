@@ -1,0 +1,8 @@
+/var/log/storpool/mgmt.log {
+	missingok
+	notifempty
+	compress
+	daily
+	maxsize 100M
+	rotate 10
+}

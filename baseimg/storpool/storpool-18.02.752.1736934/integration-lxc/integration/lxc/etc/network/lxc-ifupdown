@@ -1,0 +1,18 @@
+#!/bin/bash
+#
+
+me=${0##*/}
+logger -t "$me" "$@"
+
+[ -f /etc/lxc/storpool.containers ] && . /etc/lxc/storpool.containers
+
+if [ -n "$ovsbridge" ]; then
+	case "$3" in
+		up)
+			ovs-vsctl --may-exist add-port "$ovsbridge" "$5"
+			;;
+		down)
+			ovs-vsctl --if-exists del-port "$ovsbridge" "$5"
+			;;
+	esac
+fi

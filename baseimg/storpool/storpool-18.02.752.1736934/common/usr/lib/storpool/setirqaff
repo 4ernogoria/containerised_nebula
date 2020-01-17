@@ -1,0 +1,756 @@
+#!/usr/bin/perl
+
+use v5.10;
+use strict;
+use warnings;
+
+use autodie;
+use Config::IniFiles;
+use Fcntl qw(:flock);
+use File::Basename;
+use List::Util qw(min);
+use POSIX qw(strftime);
+
+my $VERSION="1.06";
+my @HBA_DRIVERS = qw(ahci megaraid_sas megasas mpt3sas mpt2sas);
+my $LOG_FILENAME="/var/log/storpool/setirqaff.log";
+
+my %PARAMS = map { $_ => 1 } @ARGV;
+my $DEBUG = exists $PARAMS{'debug'};
+my $DO = exists $PARAMS{'do'};
+my $LOG = exists $PARAMS{'log'};
+my $USAGE =  exists $PARAMS{'-?'} || exists $PARAMS{'-h'} || exists $PARAMS{'--help'};
+
+if ($USAGE)
+{
+	say <<END;
+Usage: /usr/lib/storpool/setirqaff [do] [debug] [log]
+  Usually invoked from /etc/cron.d/storpool_setirqaff
+  Tries to get an exclusive lock on $LOG_FILENAME and exits if it can't.
+
+  Applies CPU affinity configuration to all interrupts:
+   - VM networking - spread irqs of all physical interfaces under bridges on all NUMA-local CPUs of machine.slice
+   - StorPool networking - pin IRQs to first CPU of storpool.slice
+   - HBAs - pin IRQs to first CPU of storpool.slice/server, if present
+   - remaining IRQs - remove CPUs from storpool.slice from affinity list
+
+  Parameters
+    do - actually change smp_affinity_list files in /proc/irq/N
+    debug - print more info about what's going on
+    log - log to file in $LOG_FILENAME instead of console
+END
+	exit 0;
+}
+
+
+GET_LOCK_OPEN_LOG:
+my $logfh;
+{
+	my $lockfh;
+	open $lockfh, ">>", $LOG_FILENAME; # autodie
+	flock $lockfh, LOCK_EX|LOCK_NB; # autodie
+	
+	if ($LOG)
+	{
+		open $logfh, ">&", $lockfh;
+	}
+	else
+	{
+		open $logfh, ">&", *STDOUT;
+	}
+	
+	open STDOUT, ">&", $logfh;
+	open STDERR, ">&", $logfh;
+}
+
+use subs "log"; # replace CORE function log
+sub log(@)
+{
+	say $logfh strftime("%F %T +0000", gmtime())," ", @_;
+}
+
+INIT:
+log "";
+log "----------------------- Starting setirqaff v$VERSION ----------------------------";
+
+sub get_nodes();
+sub get_interfaces();
+sub get_interrupts();
+sub get_cgroup_cpus();
+sub get_devices();
+
+#### collect interfaces, cpus and interrupts
+my %nodes = get_nodes();              # node => [array of cpus]
+my @all_cpus = map { @$_ } values %nodes;
+my %interfaces = get_interfaces();    # interface => all info about interface
+my %interrupts = get_interrupts();    # interrupt => { smp_affinity_list: "cpulist", node: node, local_cpus: [array of cpus], : "description" }
+my %cgroup_cpus = get_cgroup_cpus();  # cgroup => [array of cpus]
+my %devices = get_devices();          # device => { driver: "drivername", irqs: [array of irqs] }
+
+
+#########################################################################################################
+
+sub logdie(@)
+{
+	log @_;
+	log "exit(1)";
+	exit 1;
+}
+
+sub remove_dotdots($)
+{
+	my ($path) = @_;
+	my @path = split "/", $path;
+	while (grep { $_ eq ".." } @path)
+	{
+		my $i = 0;
+		while ($path[$i] ne "..") { $i++; };
+		
+		splice @path, $i-1, 2;
+	}
+	
+	return join "/", @path;
+}
+
+sub slurp($)
+{
+	my ($fname) = @_;
+	
+	open my $f, "<", $fname; # autodie
+	my @result = <$f>;
+	close $f;
+	
+	chomp for @result;
+	
+	return @result;
+}
+
+# returns:
+#    true on success
+#    false on error
+sub echo_to_file($$)
+{
+	my ($line, $fname) = @_;
+	my $result;
+	
+	open my $f, ">", $fname; # autodie
+	{
+		no autodie;
+		no warnings;
+		$result = say $f $line;
+		my $result_close = close $f;
+		$result = $result && $result_close;
+	}
+	
+	return $result;
+}
+
+sub uniq(@)
+{
+	return keys %{ +{ map { $_ => 1 } @_ } };
+}
+
+sub intersect_set($$)
+{
+	my ($set1ar, $set2ar) = @_;
+	
+	my %set1 = map { $_ => 1 } @$set1ar;
+	my %set2 = map { $_ => 1 } @$set2ar;
+
+	my @result = 
+		grep { exists $set2{$_} } 
+		keys %set1; # element exists in both sets
+	
+	return @result;
+}
+
+sub subtract_set($$)
+{
+	my ($set1ar, $set2ar) = @_;
+	my %set1 = map { $_ => 1 } @$set1ar;
+	my %set2 = map { $_ => 1 } @$set2ar;
+	
+	my @result = 
+		grep { ! exists $set2{$_} }
+		keys %set1; # element exists in first set, but not in second set
+	
+	return @result;
+}
+
+sub array_from_cpulist($)
+{
+	my ($list) = @_;
+	my @result;
+	
+	my @list = split /,/, $list;
+	logdie "array_from_cpulist(): \"$list\" is not a cpulist" unless @list;
+	
+	for my $list_item (split /,/, $list)
+	{
+		my @pair = split /-/, $list_item;
+		logdie "array_from_cpulist(): non-pair" unless @pair == 1 || @pair == 2;
+		logdie "array_from_cpulist(): non-integer" if grep { ! m/^\d+$/ } @pair; # if any element is not an integer
+		
+		if (@pair == 1)
+		{
+			push @result, $pair[0];
+		}
+		else
+		{
+			push @result, $pair[0]..$pair[1];
+		}
+	}
+	return @result;
+}
+
+sub cpulist_from_array(@)
+{
+	my @arr = @_;
+	return join ",", sort {$a <=> $b} @arr;
+}
+
+sub cpulist_eq($$)
+{
+	my ($cpulist1, $cpulist2) = @_;
+	my @cpulist1ar = array_from_cpulist($cpulist1);
+	my @cpulist2ar = array_from_cpulist($cpulist2);
+	my @intersection = intersect_set(\@cpulist1ar, \@cpulist2ar);
+	
+	return @cpulist1ar == @intersection; # if they have the same number of elements
+}
+
+sub cpus_of_node($)
+# return all CPUs for $node == -1
+# return CPUs belonging to NUMA node $node
+{
+	logdie 'uninitialized @all_cpus' unless @all_cpus;
+	my ($node) = @_;
+	if ($node == -1)
+	{
+		return @all_cpus;
+	}
+	elsif (exists $nodes{$node})
+	{
+		return @{ $nodes{$node} };
+	}
+	else
+	{
+		logdie "node $node does not exist";
+	}
+}
+
+
+sub get_interfaces()
+# returns hash
+#
+# top level key -- interface name
+#
+# second level keys -- 
+#
+#	key "type" with value
+#    	phys -- physical port
+#    	bond -- bond interface
+#    	bridge -- bridge interface
+#    	vlan  -- vlan interface
+#    	lo  -- loopback
+#		other -- none of above
+#
+#  additional second-level keys
+#    device_path -- path under /sys/devices/ to find device dir
+#    phys_device_path -- path under /sys/devices/ to find physical device
+#    bridge_port -- port of a bridge, with value the name of the bridge
+#    bonding_slave -- is slave of bond, with value the name of the bond
+#    upper -- array of "upper" interfaces
+#    lower -- array of "lower" interfaces
+{
+	my %result;
+	
+	for my $if (map { basename $_ } grep { -l $_ } glob "/sys/class/net/*")
+	{
+		my $h = { name => "$if" };
+		my $device = readlink "/sys/class/net/$if";
+		$device =~ s(^.+?/devices/)();
+		$h->{device_path} = $device;
+		
+		if ( $if eq "lo" )
+		{
+			$h->{type} = "lo";
+		}
+		elsif ( -l "/sys/class/net/$if/device" )
+		{
+			$h->{type} = "phys";
+			my $phys_device_add = readlink "/sys/class/net/$if/device";
+			$h->{phys_device_path} = remove_dotdots($h->{device_path}."/".$phys_device_add);
+		}
+		elsif ( -d "/sys/class/net/$if/bonding" )
+		{
+			$h->{type} = "bond";
+		}
+		elsif ( -d "/sys/class/net/$if/bridge" )
+		{
+			$h->{type} = "bridge";
+		}
+		elsif ( -f "/proc/net/vlan/$if" )
+		{
+			$h->{type} = "vlan";
+		}
+		else
+		{
+			$h->{type} = "other";
+		}
+		
+		if ( -d "/sys/class/net/$if/brport" )
+		{
+			$h->{bridge_port} = basename(readlink "/sys/class/net/$if/brport/bridge");
+		}
+		if ( -d "/sys/class/net/$if/bonding_slave" )
+		{
+			$h->{bonding_slave} = basename(readlink "/sys/class/net/$if/master");
+		}
+		
+		my @upper_arr = map { basename readlink } glob "/sys/class/net/$if/upper_*";
+		my @lower_arr;
+
+		if ( glob "/sys/class/net/$if/lower_*" ) {
+			@lower_arr = map { basename readlink } glob "/sys/class/net/$if/lower_*";
+		} elsif ( $h->{type} eq "bond" ) {
+			@lower_arr = map { basename readlink } glob "/sys/class/net/$if/slave_*";
+		} elsif ( $h->{type} eq "bridge" ) {
+			my @brdev = map { basename $_ } glob "/sys/class/net/$if/brif/*";
+			for my $dev (@brdev) {
+				if ( -f "/proc/net/vlan/$dev" || -d "/sys/class/net/$dev/bonding" || -l "/sys/class/net/$dev/device") {
+					push @lower_arr, $dev;
+				}
+			}
+		} elsif ( $h->{type} eq "vlan" ) {
+			for my $line (slurp("/proc/net/vlan/$if")) {
+				if ($line =~ /^Device: (.+)$/) {
+					push @lower_arr, $1;
+				}
+			}
+		}
+		
+		$h->{upper} = [@upper_arr];
+		$h->{lower} = [@lower_arr];
+
+		$result{$if} = $h;
+	}
+	
+	return %result;
+}
+
+
+sub get_cgroup_cpus()
+{
+	my %result;
+	
+	my @lines = 
+		grep { 
+			my @a = split / /,$_;
+			my @b = split /,/, $a[3];
+			my %h = map { $_ => 1 } @b;
+			$h{cpuset};
+		} 
+		grep { m/^cgroup / } 
+		slurp "/proc/mounts";
+	logdie "cgroup cpuset mount not found in /proc/mounts" if @lines == 0;
+	logdie "multiple cgroup cpuset mounts found in /proc/mounts" if @lines > 1;
+	
+	my ($dir) = $lines[0] =~ m/^cgroup (\S+) /;
+	my @find = `find '$dir'/ -name cpuset.cpus`;
+	chomp for @find;
+	s/^\Q$dir\E// for @find;
+	
+	for my $filename (@find)
+	{
+		my $cgroup = dirname $filename;
+		my @cpus = slurp "$dir/$filename";
+		next unless @cpus == 1 and $cpus[0] ne "";
+		$result{$cgroup}=[array_from_cpulist($cpus[0])];
+	}
+	
+	return %result;
+}
+
+
+sub get_interrupts()
+{
+	logdie "get_interrupts(): %nodes is empty" unless %nodes;
+	
+	my %result = ();
+	my @irqs = map { basename $_ } grep { -d $_ } glob "/proc/irq/*";
+	
+	for my $irq (@irqs)
+	{
+		my @smp_affinity_list = slurp "/proc/irq/$irq/smp_affinity_list";
+		logdie "get_interrupts(): multiple lines in smp_affinity_list" unless @smp_affinity_list == 1;
+		
+		my @nodes_arr = slurp "/proc/irq/$irq/node";
+		logdie "get_interrupts(): multiple lines in /proc/irq/X/node" unless @nodes_arr == 1;
+		
+		$result{$irq}->{smp_affinity_list} = $smp_affinity_list[0];
+		$result{$irq}->{node} = $nodes_arr[0];
+		$result{$irq}->{local_cpus} = [ cpus_of_node($nodes_arr[0]) ];
+	}
+	
+	# add descriptions from /proc/interrupts
+	{
+		my @lines = slurp "/proc/interrupts";
+		s(^\s+|\s+$)()g for @lines;
+		my $cpucount = scalar @{[split(/\s+/,$lines[0])]};
+		splice @lines, 0, 1;
+		for my $line (@lines)
+		{
+			my @fields = split /\s+/,$line;
+			next unless $fields[0] =~ m/^(\d+):$/;
+			my $irq = $1;
+			next unless exists $result{$irq};
+			
+			splice @fields, 0, $cpucount+1;
+			$result{$irq}->{description} = join " ", @fields;
+		}
+	}
+	
+	# interrupts which are not found in /proc/interrupts are removed from list
+	{
+		for my $irq (keys %result)
+		{
+			if (! exists $result{$irq}->{description})
+			{
+				delete $result{$irq}; 
+			}
+		} 
+	}
+	return %result;
+}
+
+
+sub get_devices() # get all devices which have a driver
+{
+	my @find = `find /sys/devices/ -type l -name driver`;
+	chomp for @find;
+	s(^/sys/devices/|/driver$)()g for @find;
+	
+	my %result;
+	for my $device (@find)
+	{
+		my @irqs;
+		if (-d "/sys/devices/$device/msi_irqs") {
+			@irqs = map {  basename $_ }  glob "/sys/devices/$device/msi_irqs/*";
+		} elsif (-f "/sys/devices/$device/irq") {
+			@irqs = slurp "/sys/devices/$device/irq";
+		}
+		
+		$result{$device} = {
+			driver => basename( readlink "/sys/devices/$device/driver" ),
+			irqs => \@irqs
+		}
+	}
+	
+	# say Dumper \%result;
+	return %result;
+}
+
+sub get_nodes()
+{
+	my %result = 
+		map { $_ => [ array_from_cpulist( (slurp "/sys/devices/system/node/node$_/cpulist")[0] ) ]  }
+		map { m/(\d+)$/; $1 }
+		glob "/sys/devices/system/node/node*";
+	return %result
+}
+
+sub devices_under_interface($$);
+sub devices_under_interface($$)
+{
+	my ($hr, $iface) = @_;
+	
+	if ( !exists($hr->{$iface}) ) {  return ();  }
+	if ( $hr->{$iface}{type} eq "phys") {  return ($hr->{$iface}{phys_device_path})  }
+	return 
+		map { devices_under_interface($hr,$_) }
+		@{ $hr->{$iface}{lower} };
+}
+
+sub read_config()
+{
+	state $initialized;
+	state %config;
+
+	if( !$initialized )
+	{
+		my $fname = '/etc/storpool/setirqaff.conf';
+		if( -f $fname && -r $fname )
+		{
+			tie %config, 'Config::IniFiles', ( -file => $fname, -allowcontinue => 1, -allowempty => 1, -fallback => '' ) or
+				logdie "Could not read the $fname configuration file: @Config::IniFiles::errors";
+		}
+		$initialized = 1;
+	}
+
+	return \%config;
+}
+
+sub set_irq_affinity($$$$$)
+{
+	my ($irq, $type, $cpus, $local, $policy) = @_;
+	
+	state %cpuset_state;
+	
+	$DEBUG and log sprintf "    irq: %s type:%s cpus:%s local:%s policy:%s   desc:%s", $irq, $type, join(",",sort { $a <=> $b } @$cpus), $local, $policy, $interrupts{$irq}->{description};
+	my @cpus = @$cpus;
+	
+	{
+		my $config = read_config();
+		my $override = $config->{''}->{"cpus_$type"};
+		if( defined $override )
+		{
+			$DEBUG and log sprintf "        override spec:%s", $override;
+			@cpus = array_from_cpulist($override);
+			$DEBUG and log sprintf "        overridden cpus:%s", join(",",sort { $a <=> $b } @cpus);
+			$policy = "force";
+		}
+	}
+	
+	my @target_cpus;
+	if ($local && $policy ne "force")
+	{
+		@target_cpus = intersect_set( \@cpus, \@{ $interrupts{$irq}->{local_cpus} });
+	}
+	else
+	{
+		@target_cpus = @cpus;
+	}
+	@target_cpus = sort { $a <=> $b } @target_cpus;
+	
+	if (! @target_cpus)
+	{
+		if ($local eq "local desired" && $policy ne "force")
+		{
+			$DEBUG and log "        locality failed, trying without";
+			@target_cpus = @cpus;
+		}
+		elsif ($local)
+		{
+			logdie "irq $irq - could not find matching local CPUs" unless @target_cpus;
+		}
+		else
+		{
+			logdie "irq $irq - could not find matching CPUs" unless @target_cpus;
+		}
+	}
+		
+	$DEBUG and log sprintf "        target_cpus:%s", cpulist_from_array(@target_cpus);
+	
+	my $key = $policy.":".cpulist_from_array(@target_cpus);
+	if (! exists $cpuset_state{$key} ) {
+		$cpuset_state{$key}->{cpus} = \@target_cpus;
+		$cpuset_state{$key}->{idx} = 0;
+	}
+	
+	if ($policy eq "pin_first")
+	{
+		my $pin_to = min @target_cpus;
+		$interrupts{$irq}->{new_smp_affinity_list} = $pin_to;
+		$DEBUG and log "        pin to $pin_to";
+	}
+	elsif ($policy eq "spread")
+	{
+		my $pin_to = $target_cpus[ $cpuset_state{$key}->{idx} ]; # @target_cpus must be sorted
+		$cpuset_state{$key}->{idx} = ( $cpuset_state{$key}->{idx} + 1 ) % @{ $cpuset_state{$key}->{cpus} }; # wrap
+		$interrupts{$irq}->{new_smp_affinity_list} = $pin_to;
+		$DEBUG and log "        pin to $pin_to";
+	}
+	elsif ($policy eq "mask")
+	{
+		$DEBUG and log "        current smp_affinity_list: ".$interrupts{$irq}->{smp_affinity_list}; 
+		
+		my @new = intersect_set(\@target_cpus, [ array_from_cpulist( $interrupts{$irq}->{smp_affinity_list}) ] );
+		if (@new) {
+			$interrupts{$irq}->{new_smp_affinity_list} = cpulist_from_array(@new);
+			$DEBUG and log "        masked to: ", cpulist_from_array(@new);
+		} else {
+			$DEBUG and log "        trying to mask to empty intersection -> no change";
+		}
+	}
+	elsif ($policy eq "force")
+	{
+		my $force = cpulist_from_array(@target_cpus);
+		$DEBUG and log "        forcing to: $force";
+		$interrupts{$irq}->{new_smp_affinity_list} = $force;
+	} else {
+		logdie "unknown policy $policy";
+	}
+}
+
+MAIN:
+{
+	# expect storpool or storpool.slice cgroup
+	my $cgroup_storpool = "";
+	if ( exists $cgroup_cpus{"/storpool.slice"} )
+	{
+		$cgroup_storpool = "/storpool.slice";
+	}
+	if ( exists $cgroup_cpus{"/storpool"} )
+	{
+		logdie "both storpool.slice and storpool cgroups exist" if $cgroup_storpool;
+		$cgroup_storpool = "/storpool";
+	}
+	logdie "storpool or storpool.slice cgroup not found" unless $cgroup_storpool;
+	
+	my $storpool_server_exists = exists $cgroup_cpus{$cgroup_storpool."/server"};
+	if (! $storpool_server_exists) {
+		$DEBUG && log "server cgroup does not exist in $cgroup_storpool, skipping HBAs and RAID controllers"; 
+	}
+	
+	# expect machine or machine.slice cgroup
+	my $cgroup_machine = "";
+	if ( exists $cgroup_cpus{"/machine.slice"} )
+	{
+		$cgroup_machine = "/machine.slice";
+	}
+	if ( exists $cgroup_cpus{"/machine"} )
+	{
+		logdie "both machine.slice and machine cgroups exist" if $cgroup_machine;
+		$cgroup_machine = "/machine";
+	}
+	
+	# expect storpool_rdma is loaded
+	logdie "storpool_rdma is not loaded" unless -d "/sys/class/storpool_rdma/storpool_rdma/state/net0";
+	
+	my %remaining_interrupts = %interrupts;
+	
+	# VM networking 
+	#		spread irqs of all physical interfaces under bridges on all NUMA-local CPUs of machine.slice
+	
+	if ($cgroup_machine)
+	{
+		$DEBUG and log "VM networking ---------------";
+		
+		# find CPUs
+		my @cpus = @{ $cgroup_cpus{$cgroup_machine} };
+		
+		# find IRQs
+		my @irqs = 
+			map { @{ $devices{$_}->{irqs} } } 
+			uniq 
+			map { devices_under_interface(\%interfaces,$_) } 
+			grep { $interfaces{$_}->{type} eq "bridge" } 
+			keys %interfaces;
+		
+		# set IRQ affinities
+		for my $irq (sort { $a <=> $b } @irqs)
+		{
+			next unless exists $remaining_interrupts{$irq};
+			set_irq_affinity($irq, "vmnet", \@cpus, "local desired", "spread")
+		}
+		
+		delete @remaining_interrupts{@irqs};
+	}
+	else
+	{
+	    $DEBUG and log "machine or machine.slice cgroup not found. Skipping VM networking";
+	}
+	
+	# StorPool networking
+	#    pin irqs of NICs under storpool to first CPU of storpool.slice
+	{
+		$DEBUG and log "StorPool net --------------------";
+		
+		# find CPUs
+		my @cpus = @{ $cgroup_cpus{$cgroup_storpool} };
+		
+		# find IRQs
+		my @irqs = 
+			map { @{ $devices{$_}->{irqs} } }
+			uniq
+			map { devices_under_interface(\%interfaces,$_) }
+			grep { $_ ne '-' }
+			map { (split /:/, $_)[2] }
+			map { slurp $_ }
+			glob "/sys/class/storpool_rdma/storpool_rdma/state/net*/config";
+
+		# set IRQ affinities
+		for my $irq (sort { $a <=> $b } @irqs)
+		{
+			next unless exists $remaining_interrupts{$irq};
+			set_irq_affinity($irq, "spnet", \@cpus, "local desired", "pin_first")
+		}
+		
+		delete @remaining_interrupts{@irqs};
+	}
+	
+	if ($storpool_server_exists)
+	{
+		$DEBUG and log "HBA and RAID ------------------------------";
+		
+		# HBAs and RAID controllers
+		#     pin irqs of controllers with known HBA drivers to first CPU of storpool.slice/server
+		# find CPUs
+		my @cpus = @{ $cgroup_cpus{"$cgroup_storpool/server"} };
+		
+		# find IRQs
+		my %drivers = map { $_ => 1 } @HBA_DRIVERS;
+		my @irqs = 
+			map { @{ $devices{$_}->{irqs} } }
+			grep { exists $drivers{ $devices{$_}->{driver} } }
+			keys %devices;
+		
+		# set IRQ affinities
+		for my $irq (sort { $a <=> $b } @irqs)
+		{
+			next unless exists $remaining_interrupts{$irq};
+			set_irq_affinity($irq, "hba", \@cpus, 0, "pin_first")
+		}
+		
+		delete @remaining_interrupts{@irqs};
+	}
+	
+	# Remaining IRQs
+	#		pin on all CPUs, except CPUs in storpool.slice
+	{
+		$DEBUG and log "other interrupts ---------------------------------";
+		
+		my @cpus =
+			subtract_set (
+				\@all_cpus,
+				$cgroup_cpus{$cgroup_storpool}
+			);
+		
+		my @irqs = keys %remaining_interrupts;
+		
+		for my $irq (sort { $a <=> $b } @irqs)
+		{
+			set_irq_affinity($irq, "other", \@cpus, 0,  "mask");
+		}
+	}
+	
+	if ($DO)
+	{
+		$DEBUG and log "applying changes -------------------------";
+		
+		for my $irq ( sort { $a <=> $b } grep { exists $interrupts{$_}->{new_smp_affinity_list} } keys %interrupts)
+		{
+			next if $irq == 0; # skip timer interrupt
+			
+			my $old_list = $interrupts{$irq}->{smp_affinity_list};
+			my $new_list = $interrupts{$irq}->{new_smp_affinity_list};
+			if ( !cpulist_eq($old_list,$new_list) )
+			{
+				if (echo_to_file $new_list, "/proc/irq/$irq/smp_affinity_list")
+				{
+					log "        irq $irq - changed from $old_list to $new_list, description:".$interrupts{$irq}->{description};
+				}
+				else
+				{
+					log "        irq $irq - error writing to smp_affinity_list, description:".$interrupts{$irq}->{description};
+				}
+			}
+		}
+	}
+	else
+	{
+		log "Skipped applying configuration. Specify the \"do\" parameter on the command line."
+	}
+}
+

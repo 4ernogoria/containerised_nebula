@@ -1,0 +1,34 @@
+#!/usr/bin/python
+
+from __future__ import print_function
+
+from storpool import spapi
+
+def output_sdata(name, total, remote):
+    if total == 0:
+        return
+    print("{name}: {rem}/{total} objects transferred ({pct}%)".format(name=name, rem=total - remote, total=total, pct=int(100 - remote * 100 / total)))
+
+totalObj = 0
+totalRemote = 0
+
+api = spapi.Api.fromConfig()
+
+for snapshot in api.snapshotsList():
+    if not snapshot.recoveringFromRemote:
+        continue
+
+    allObj = 0
+    remoteObj = 0
+
+    for obj in api.snapshotDescribe(snapshot.name).objects:
+        if max(obj) >= (4096-64):
+            remoteObj += 1
+        allObj += 1
+
+    output_sdata(snapshot.name, allObj, remoteObj)
+
+    totalObj += allObj
+    totalRemote += remoteObj
+
+output_sdata("TOTAL", totalObj, totalRemote)

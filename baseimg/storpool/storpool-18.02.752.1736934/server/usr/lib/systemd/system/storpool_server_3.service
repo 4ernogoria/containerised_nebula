@@ -1,0 +1,31 @@
+#
+#-
+# Copyright (c) 2013 - 2016  StorPool.
+# All rights reserved.
+#
+
+[Unit]
+Description=StorPool server service
+After=syslog.target
+After=network.target
+After=storpool_beacon.service
+After=storpool_controller.service
+After=storpool_nvmed.service
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/%p.pid
+ExecStart=/usr/bin/env /usr/sbin/%p -d
+ExecStopPost=/bin/rm -f /var/run/%p.pid
+StandardInput=null
+StandardOutput=inherit
+StandardError=inherit
+KillMode=process
+TimeoutSec=180
+Slice=storpool.slice
+BlockIOAccounting=false
+CPUAccounting=false
+MemoryAccounting=false

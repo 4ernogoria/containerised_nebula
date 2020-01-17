@@ -1,0 +1,749 @@
+#!/bin/bash
+
+if [ -n "$TERM" ]; then
+  export bold=$(tput bold)
+  export norm=$(tput sgr0)
+else
+  unset bold norm
+fi
+
+defaultseq="100G"
+defaulthddrand="1G"
+defaultssdrand="10G"
+
+printiops='
+import sys
+f = sys.argv[1]
+typ = sys.argv[2]
+if len(sys.argv) > 3:
+  addendum = sys.argv[3]
+else:
+  addendum = ""
+if sys.argv[3]:
+  addendum = sys.argv[3]
+if "rand" in typ:
+  m = "IOPS"
+  div = 1
+elif "seq" in typ:
+  m = "MB/s"
+  div = 8
+else:
+  print "Unknown type {t}".format(t = typ)
+l = [ i.replace("\n","").split(",") for i in open(f).readlines() ]
+thrvals = [ int(i[1]) for i in l[2:]]
+print "{t}{a}:\n".format(t = typ, a=addendum)
+print "    Average: {a}".format(a = sum(thrvals)/len(thrvals)/div)
+print "    Minimum: {m}".format(m = min(thrvals)/div)
+print "    Maximum: {ma}\n".format(ma = max(thrvals)/div)'
+
+usage(){
+  cat <<EOUSAGE
+
+${bold}Usage1: $(basename -- "$0") [--no-sync] [--seqsize=value] [--hdd-rand-size=value] [--ssd-rand-size=value]${norm}
+${bold}Usage2: $(basename -- "$0") [--updatedb]${norm}
+
+The test includes the following stages for all the hard drives and SSDs configured in drives.txt
+ - Checks if any of the drives is in use
+ - Updates S.M.A.R.T. database
+ - Gathers S.M.A.R.T. status
+ - Sequentially writes 400G of random data (see '--seqsize' below)
+ - Randomly writes random data (defaults HDD: $defaulthddrand; SSD: $defaultssdrand, see '--hdd-rand-size' and '--ssd-rand-size' below)
+ - Collects SMART status after the stress tests
+ - Prints stats and differences between the SMART status before and after the stress tests
+
+Expects drives.txt filled with short file names for all drives to be tested in /dev, e.g.
+# cat drives.txt
+sda
+sdb
+sdf3
+
+Expects all drives to be in /dev. In case of partition (e.g. sdf3) the first 4MB have to be zeroed out. (dd if=/dev/zero of=/dev/sdf3 bs=4M count=1)
+
+Usage1:
+${bold}--no-sync${norm} - use when testing non-datacenter class drives
+${bold}--no-write${norm} - use to read-only test a drive (useful when you would like to return the drive to the cluster)
+${bold}--seqsize=value${norm}  - Use to provide different value to fio --size (Default: $defaultseq)
+${bold}--hdd-rand-size=value${norm}  - Use to provide different value to fio --size (Default: $defaulthddrand)
+${bold}--ssd-rand-size=value${norm} - Use to provide different value to fio --size (Default: $defaultssdrand)
+
+Usage2:
+${bold}--updatedb${norm} - Only install smartmontools and update its database
+
+$(basename -- $0) will fail in case of partition with non-zeroed first 4 megabytes, either zero out or remove all partitions before testing.
+
+${bold}Beware that the test **WILL EAT ALL DATA** on all configured drives in 'drives.txt'.${norm}
+
+EOUSAGE
+}
+
+check_dependencies(){
+  export fio=$(type -p fio)
+  export smartctl=$(type -p smartctl)
+  export wget=$(type -p wget)
+  if [[ -z $fio ]]; then
+    echo "I require ${bold}fio${norm}, but it's not installed." 1>&2
+    export installf=1
+  fi
+  if [[ -z $smartctl ]]; then
+    echo "I require ${bold}smartmontools${norm}, but it's not installed." 1>&2
+    export installf=1
+  fi
+  if [[ -z $wget ]]; then
+    echo "I require ${bold}wget${norm}, but it's not installed." 1>&2
+    export installf=1
+  fi
+  configOS
+}
+
+configOS(){
+  set -e
+  if [ -f '/etc/os-release' ]; then
+    . /etc/os-release
+  elif [ -f '/etc/system-release-cpe' ]; then
+    read ID VERSION_ID <<< $(cat /etc/system-release-cpe  | cut -d ":" -f 3,5 | tr ":" " ")
+  else
+    echo "ERROR: Unable to determine system version."
+    exit 128
+  fi
+  ### --- Actions by OS type
+  if [[ -n $installf ]]; then
+    echo 'attempting to install dependencies...'
+  fi
+  case ${ID} in
+    centos|virtuozzo)
+      if [[ -n $installf ]]; then
+        yum -y install wget fio smartmontools
+      fi
+      case ${VERSION_ID} in
+        6)
+          export cgroups="/cgroup/memory"
+          # updating smartmontools db
+          drvdb="/usr/share/smartmontools/drivedb.h"
+          if [[ -f $drvdb ]]; then
+            mv ${drvdb}{,.bkp}
+          fi
+          wget --quiet https://www.smartmontools.org/export/4331/branches/RELEASE_5_43_DRIVEDB/smartmontools/drivedb.h -O ${drvdb}
+          ;;
+        7)
+          export cgroups="/sys/fs/cgroup/memory"
+          # updating smartmontools db
+          drvdb="/usr/share/smartmontools/drivedb.h"
+          if [[ -f $drvdb ]]; then
+            mv ${drvdb}{,.bkp}
+          fi
+          wget --quiet https://www.smartmontools.org/export/4331/branches/RELEASE_6_2_DRIVEDB/smartmontools/drivedb.h -O ${drvdb}
+          ;;
+        *)
+          ### --- Unknown
+          echo ${bold}"Unsupported OS - ${ID} ${VERSION_ID}"${norm} 1>&2
+          exit 1
+          ;;
+      esac
+      ;;
+    ubuntu)
+      if [[ -n $installf ]]; then
+        apt --yes install wget fio smartmontools
+      fi
+      case ${VERSION_ID} in
+        14.04)
+          export cgroups="/sys/fs/cgroup/memory"
+          drvdb="/usr/share/smartmontools/drivedb.h"
+          if [[ -f $drvdb ]]; then
+            mv ${drvdb}{,.bkp}
+          fi
+          wget --quiet https://www.smartmontools.org/export/4331/branches/RELEASE_6_2_DRIVEDB/smartmontools/drivedb.h -O ${drvdb}
+          ;;
+        16.04)
+          export cgroups="/sys/fs/cgroup/memory"
+          # no 6.5 drivedb.h updates yet
+          ;;
+        18.04)
+          export cgroups="/sys/fs/cgroup/memory"
+          drvdb="/usr/share/smartmontools/drivedb.h"
+          if [[ -f $drvdb ]]; then
+            mv ${drvdb}{,.bkp}
+          fi
+          wget --quiet https://www.smartmontools.org/export/4789/branches/RELEASE_6_6_DRIVEDB/smartmontools/drivedb.h -O ${drvdb}
+          ;;
+        *)
+          ### --- Unknown
+          echo "Unsupported OS - ${ID} ${VERSION_ID}" 1>&2
+          exit 22
+          ;;
+      esac
+      ;;
+    debian)
+      if [[ -n $installf ]]; then
+        apt --yes install wget fio smartmontools
+      fi
+      case ${VERSION_ID} in
+        7)
+          export cgroups="/sys/fs/cgroup/memory"
+          drvdb="/usr/share/smartmontools/drivedb.h"
+          if [[ -f $drvdb ]]; then
+            mv ${drvdb}{,.bkp}
+          fi
+          wget --quiet https://www.smartmontools.org/export/4331/branches/RELEASE_5_41_DRIVEDB/smartmontools/drivedb.h -O ${drvdb}
+        ;;
+        8)
+          export cgroups="/sys/fs/cgroup/memory"
+          drvdb="/var/lib/smartmontools/drivedb/drivedb.h"
+          if [[ -f $drvdb ]]; then
+            mv ${drvdb}{,.bkp}
+          fi
+          wget --quiet https://www.smartmontools.org/export/4331/branches/RELEASE_6_3_DRIVEDB/smartmontools/drivedb.h -O ${drvdb}
+        ;;
+        *)
+          ### Unknown
+          echo "Unsupported OS - ${ID} ${VERSION_ID}" 1>&2
+          exit 22
+          ;;
+      esac
+      ;;
+    *)
+      echo "ERROR: Unsupported OS - ${ID}" 1>&2
+      exit 1
+      ;;
+    esac
+    set +e
+    echo "smartmontools database update, successful"
+    if [[ -n $updatedbonly ]]; then
+      exit 0
+    fi
+}
+
+check_rotational(){
+  local drv="$1"
+  if [[ $(cat /sys/block/"${drv%%[[:digit:]]*}"/queue/rotational) -eq 0 ]]; then
+    ssds="$ssds $drv"
+  else
+    hdds="$hdds $drv"
+  fi
+}
+
+check_device_is_block(){
+  local drv="$1"
+  if [[ $drv =~ nvm ]]; then
+	if [[ $drv =~ p[1-9] ]]; then
+		local chk="${drv%%p[[:digit:]]*}"
+	else
+		local chk="$drv"
+	fi
+  else
+	local chk="${drv%%[[:digit:]]*}"
+  fi
+  if [[ $(lsblk -n -d -o TYPE /dev/"$chk" ) != "disk" ]]; then
+    echo "/dev/$drv is not a disk block device, please check your drives.txt"
+    exit 1
+  fi
+}
+
+check_for_partitions(){
+  local drv="$1"
+  if [[ -n $nowrite ]]; then
+    echo "No write test selected ignoring partition tests"
+    return
+  fi
+  if lsblk -n /dev/$drv -o TYPE | fgrep -qxe 'part'; then
+    if [ $(lsblk -n /dev/${drv} -o TYPE |wc -l) -eq 1 ]; then
+      if diff -q <(dd if=/dev/zero bs=4M count=1 2>/dev/null) <(dd if=/dev/${drv} bs=4M count=1 2>/dev/null); then
+        return
+      else
+        echo "Device ${bold}/dev/${drv}${norm} is non zero partition" 1>&2
+        echo "Please ${bold}re-check${norm} that this is the ${bold}right${norm} device and zerofill first 4M of it" 1>&2
+        echo "Hint: dd if=/dev/zero of=/dev/${drv} bs=4M count=1" 1>&2
+        exit 1
+      fi
+    fi
+    echo "Device /dev/$drv has partitions, please delete any partitions from it to proceed."  1>&2
+    echo "Hint: parted -s /dev/$drv mklabel msdos #${bold} *CAREFUL* this will destroy all partitions on /dev/${drv}${norm}"  1>&2
+    exit 1
+  fi
+}
+
+check_unused(){
+  local drv="$1"
+  if mount | egrep -e "$drv"; then
+     echo "/dev/$drv mounted, '$(basename -- $0)' does not handle mounted devices, exiting..." 1>&2
+     exit 1
+  fi
+  if egrep -e "$drv" /proc/mdstat ; then
+     echo "/dev/$drv found in /proc/mdstat, '$(basename -- $0)' does not handle devices presently in use, exiting..." 1>&2
+     exit 1
+  fi
+  pvs=$(type -p pvs)
+  if [[ -n $pvs ]]; then
+    if $pvs | egrep -e "$drv" ; then
+      echo "/dev/$drv found in the output of 'pvs', device initialized as Physical Volume, bailing out..." 1>&2
+      echo "Hint: pvremove /dev/${drv} #${bold} *CAREFUL* this will destroy any LVM data on /dev/${drv}${norm}" 1>&2
+      exit 1
+    fi
+  fi
+}
+
+gen_fill_verify_jobfile(){
+  local drives=( "$1" )
+  local jobfile=./fio-fill/fill-jobfile
+  if [[ -n $nowrite ]]; then
+    local rw="rw=read"
+    local verifyparams=""
+  else
+    local rw="rw=write"
+    local verifyparams="
+verify=crc32c-intel
+# verify_backlog=10k
+verify_fatal=1
+"
+  fi
+  if [[ -z $size ]]; then
+    size="$defaultseq"
+  fi
+  cat >"$jobfile" <<EOJF
+[global]
+name=fill-verify
+ioengine=libaio
+direct=1
+iodepth=16
+bs=128k
+$rw
+$verifyparams
+size=${size}
+EOJF
+
+  for drive in ${drives[*]}; do
+    cat >>"$jobfile" <<EOJF
+
+[/dev/${drive}]
+write_iops_log=sequential-128k-QD16-${drive}
+log_avg_msec=100
+filename=/dev/${drive}
+EOJF
+  done
+}
+
+gen_random_verify_jobfile(){
+  local hdds=( "$1" )
+  local ssds=( "$2" )
+  local jobfile=./fio-rand/random-jobfile
+  if [[ -n $nosyncf ]]; then
+    local s=1
+  else
+    local s=0
+  fi
+  if [[ -n $nowrite ]]; then
+    local rw="rw=randread"
+    local verifyparams=""
+  else
+    local rw="rw=randwrite"
+    local verifyparams="
+verify=crc32c-intel
+verify_backlog=100k
+verify_fatal=1
+"
+  fi
+  cat >"$jobfile" <<EOJF
+[global]
+name=random-verify
+ioengine=libaio
+direct=1
+sync=${s}
+iodepth=32
+bs=4k
+$rw
+$verifyparams
+EOJF
+
+  if [[ -z $hddrandsize ]]; then
+    hddrandsize="$defaulthddrand"
+  fi
+  for drive in ${hdds}; do
+    cat >>"$jobfile" <<EOJF
+
+[/dev/${drive}]
+write_iops_log=random-4k-QD32-${drive}
+log_avg_msec=100
+size=${hddrandsize}
+filename=/dev/${drive}
+EOJF
+  done
+  if [[ -z $ssdrandsize ]]; then
+    ssdrandsize="$defaultssdrand"
+  fi
+  for drive in ${ssds}; do
+    cat >>"$jobfile" <<EOJF
+
+[/dev/${drive}]
+write_iops_log=random-4k-QD32-${drive}
+size=${ssdrandsize}
+filename=/dev/${drive}
+EOJF
+  done
+}
+
+getDID()
+{
+    local _dev="${1}"
+    local _bin="${2}"
+    if [[ -z "$_dev" ]]; then
+      echo "False"
+      exit 1
+    fi
+    if [[ -z $_bin ]]; then
+      # assuming storcli64
+      local _bin="storcli64"
+    fi
+    if ! type -f "$_bin" &>/dev/null; then
+      echo "False"
+      exit 1
+    fi
+    _dev="${_dev#*dev/}"
+    local _sysClass=$(readlink /sys/class/block/$_dev)
+    local _sysClassA=(${_sysClass//\// })
+    [ "${_sysClassA[${#_sysClassA[@]}-5]:0:4}" = "host" ] || continue
+    [ "${_sysClassA[${#_sysClassA[@]}-6]//:/ }" = "${_sysClassA[${#_sysClassA[@]}-6]}" ] && continue
+    local _scsiA=(${_sysClassA[${#_sysClassA[@]}-3]//:/ })
+    local _type=${_scsiA[1]} _idx=${_scsiA[2]} _pciA=(${_sysClassA[${#_sysClassA[@]}-6]//:/ })
+    local _bus=`printf "%d" 0x${_pciA[1]}`
+    local _device=`printf "%d" 0x${_pciA[2]%\.*}`
+    local _func=`printf "%d" 0x${_pciA[2]#*\.}`
+    #
+    # Get MEGARAID controller id
+    #
+    local _ctrl _b _d _f
+    while read l; do
+        a=($l)
+        case "${a[0]}" in
+            "Controller")
+                    if [ "${a[1]}" = "=" ]; then
+                        _ctrl=${a[2]}
+                        _b= && _d= && _f=
+                    fi
+                ;;
+            "Bus")
+                    _b=${a[2]}
+                ;;
+            "Device")
+                    _d=${a[2]}
+                ;;
+            "Function")
+                    _f=${a[2]}
+                ;;
+        esac
+        if [ "$_b" = "$_bus" ] && [ "$_d" = "$_device" ] && [ "$_f" = "$_func" ]; then
+            break
+        fi
+    done< <($_bin /call show pci)
+    if [ -n "$_ctrl" ]; then
+#       echo ">>>$_dev>>> controller=$_ctrl type=$_type idx=$_idx bus:$_bus device:$_device func:$_func" >&2
+        if [ "$_type" = "0" ]; then
+            _did=$_idx
+        elif [ "$_type" = "2" ]; then
+            # get DG
+            while read l; do
+                a=($l)
+                if [ "${a[1]}" = "RAID0" ]; then
+                    di=${a[0]#*/}
+                    if [ $di -eq $_idx ]; then
+                        _dg=${a[0]%/*}
+                    fi
+                fi
+            done< <($_bin /c"$_ctrl" /v"$_idx" show)
+            if [ -n "$_dg" ]; then
+                # get DID
+                while read l; do
+                    a=($l)
+                    if [ "${a[3]//:/}" != "${a[3]}" ] && [ "${a[4]//[[:digit:]]/}" = "" ]; then
+                        _did=${a[4]}
+                        break
+                    fi
+                done< <($_bin /c"$_ctrl" /d"$_dg" show)
+            fi
+        fi
+        echo "$_did"
+    fi
+}
+
+collect_smart_raid(){
+  local device="$1"
+  local name="$2"
+  local _bin="$3"
+  if [[ -z $_bin ]]; then
+    local _bin="storcli64"
+  fi
+  local didevice="${device/[0-9]}" # yes, not expecting more than 10 partitions
+  local did="$( getDID "/dev/${didevice}" "$_bin" )"
+  if [[ -z $did ]]; then
+    echo "Failed to get Disk ID for /dev/$device, bailing out"
+    exit 1
+  elif [[ ${did} == False ]]; then
+    echo "$_bin missing or not in PATH, please install it and try again"
+    exit 1
+  fi
+  $smartctl -a -d megaraid,${did} /dev/"${device}" > "$name"/"${device}".log
+}
+
+collect_smart_hpraid(){
+  local device="$1"
+  local name="$2"
+  # ensure no partition
+  local didevice="${device/[0-9]}" # yes, not expecting more than 10 partitions
+  local hpid="$( find /dev/disk/by-path -lname "*${didevice}" 2>/dev/null)"
+  if [[ -z hpid ]]; then
+    echo "Failed to get HP smart array disk id from /dev/disk/by-path, bailing out" 1>&2
+    exit 1
+  fi
+  local did="$( echo "$hpid" | awk -F: '{ print $NF }' )"
+  if [[ -z $did ]]; then
+    echo "Failed to extract cciss ID from $hpid, bailing out" 1>&2
+    exit 1
+  fi
+  $smartctl -a -d cciss,${did} /dev/"$device" > "$name"/"${device}".log
+}
+
+collect_smart_nvme(){
+  local device="$1"
+  local name="$2"
+  nvme smart-log /dev/"${device}" > "$name"/"${device}".log
+}
+
+collect_smart(){
+  local device="$1"
+  local name="$2"
+  # get vendor
+  if [[ $device =~ nvme ]]; then
+    collect_smart_nvme "$device" "$name"
+    echo "Assuming NVME for /dev/${device}"
+    return
+  fi
+  # do not remove the last digits from nvme drives
+  local rawdevice="$(printf '%s' "$device" | sed -e 's/[0-9]*$//')"
+  # get vendor here
+  local vfile="/sys/class/block/${rawdevice}/device/vendor"
+  local vendor="$(<$vfile)"
+  if [[ -z $vendor ]]; then
+    echo "Failed to obtain vendor from $vfile" 1>2
+    exit 1
+  else
+    vendor="${vendor,,}" #lowercase
+    vendor="$( printf '%s' "$vendor" | tr -d ' ' )" #remove spaces
+  fi
+  if $smartctl -i /dev/"${rawdevice}" | grep "SMART support is:\s*Disabled" ; then
+    $smartctl --smart=on /dev/"${device}"
+  fi
+  case $vendor in
+    avago|lsi)
+      # check for megaraid
+      echo "Assuming megaraid for /dev/${device}"
+      collect_smart_raid "${device}" "${name}"
+      ;;
+    dell|perc)
+      # check for Dell PERC controller
+      echo "Assuming Dell PERC for /dev/${device}"
+      collect_smart_raid "${device}" "${name}" perccli64
+      ;;
+    hp)
+      # check for HP Smart Array drive
+      echo "Assuming HP for /dev/${device}"
+      collect_smart_hpraid "${device}" "${name}"
+      ;;
+    *)
+      $smartctl -a /dev/"$device" > "$name"/"${device}".log
+  esac
+}
+
+chkmem(){
+  local cg=$(grep memory /proc/$$/cgroup | python -c "import sys ; print sys.stdin.readline().split(':')[-1].strip('\n')")
+  if [[ -z $cg ]]; then
+    echo "No cgroup limits, proceeding with tests"
+    return 0
+  fi
+  local limit=$(<${cgroups}${cg}/memory.limit_in_bytes)
+  local usage=$(<${cgroups}${cg}/memory.usage_in_bytes)
+  local avail=$(python -c "print $limit - $usage")
+  echo "Memory limit in ${cg}: ${avail}"
+  # check if there will be enough memory to test all drives
+  local fiomem=$((245780*1024)) # ~240MB for single fio worker
+  local drvmem=$((${#drives[*]}*(20*1024**2))) # (the number of drives) * ~20 MB
+  local required=$((fiomem+drvmem))
+chkmemory="if ${avail} < ${required}:
+    exit(0)
+else:
+    exit(1)"
+
+  if python -c "$chkmemory"; then
+    echo "Not enough memory to start tests" 1>&2
+    echo "cgroup: ${cgroups}${cg}; limit:  ${limit}; usage: ${usage}; available: ${avail}; required: $required" 1>&2
+    echo "${bold}Please either use another cgroup or adjust the memory limit in '${cg}'.${norm}" 1>&2
+    exit 1
+  else
+    echo "Proceeding with tests (Required memory: ~${required})"
+  fi
+}
+
+initcheck(){
+  check_dependencies
+  if [ ! -f drives.txt ]; then
+    echo "${bold}No drives.txt file found${norm}" 1>&2
+    usage
+    exit 1
+  fi
+  drives=( $(cat drives.txt) )
+  chkmem
+  for drv in ${drives[@]}; do
+    check_device_is_block "$drv"
+    check_rotational "$drv"
+    check_for_partitions "$drv"
+    check_unused "$drv"
+  done
+  echo "HDDs $hdds"
+  echo "SSDs $ssds"
+  mkdir -p results/{smart{1,2},fio-{fill,rand}}
+  cd results
+  gen_fill_verify_jobfile "${drives[*]}"
+  gen_random_verify_jobfile "${hdds}" "${ssds}"
+  for drv in ${drives[@]}; do
+    collect_smart $drv smart1
+    fgrep -ie 'model' -e 'firmware' smart1/"$drv".log
+  done
+}
+
+report(){
+  local device="$1"
+  local seqfile="$(ls ./sequential-128k-QD16-${device}_iops*.log)"
+  local randfile="$(ls ./random-4k-QD32-${device}_iops*.log)"
+  local arnum="${drivearray["$device"]}"
+  local c=0
+  if [[ -n $nowrite ]]; then
+    local addendum="(read-only)"
+  fi
+  if [[ -f $seqfile ]]; then
+    python -c "$printiops" "$seqfile" 'seq-w-128k-QD16' "$addendum"
+  else
+    echo "${bold}${seqfile} is missing...${norm}" 1>&2
+    awk -F'[,=]+' '{if(NR=='$arnum'){ printf "    Average: %d MB/s\n", $6 / 8 }}' <<<"$(grep write.*iops ./fio-fill/fill-output )" # /8 for 128k block size
+  fi
+  if [[ -f $randfile ]]; then
+    python -c "$printiops" "$randfile" 'rand-w-4k-QD32' "$addendum"
+  else
+    echo "${bold}${randfile} is missing...${norm}" 1>&2
+    awk -F'[,=]+' '{if(NR=='$arnum'){ print "    Average: ", $6, " IOPS" }}' <<<"$(grep write.*iops ./fio-rand/random-output )"
+  fi
+  echo -e "seq-r-128k-QD16 (might be empty with --no-write, check combined sequential reads)\navg"
+  awk -F'[,=]+' '{if(NR=='$arnum'){ printf "    Average: %d MB/s\n", $6 / 8 }}' <<<"$(grep read.*iops ./fio-fill/fill-output )" # /8 for 128k block size
+  excludes="Power_On_Hours|Total_LBAs_Written|Total_LBAs_Read|Local Time"
+  echo -e "\n--------------------------"
+  echo -e "S.M.A.R.T. differences START - diff smart1/"$device".log smart2/"$device".log | egrep -v '$excludes'"
+  diff smart1/"$device".log smart2/"$device".log | egrep -v "$excludes"
+  echo "S.M.A.R.T. differences END"
+  echo "--------------------------"
+}
+
+reportsum(){
+  echo "Combined sequential reads all drives"
+  local rsrc="$( grep -i read.*iops ./fio-fill/fill-output )"
+  result="$( echo "$rsrc" | awk -F'[,=]+' '{sum += $6} ; END { printf "%d", sum/8 }')" # 1024/128 = 8 for 128k block size
+  if [[ $result -eq 0 ]]; then
+    # check with fio 3.1+ format
+    result="$( echo "$rsrc" | awk -F'[:,=]+' '{sum += $3} ; END { printf "%d", sum/8 }')" # 1024/128 = 8 for 128k block size
+  fi
+  echo "$result MB/s"
+  echo "Combined sequential writes all drives"
+  local wsrc="$( grep -i write.*iops ./fio-fill/fill-output )"
+  wresult="$( echo "$wsrc" | awk -F'[,=]+' '{sum += $6} ; END { printf "%d",  sum/8 }' )" # 1024/128 = 8 for 128k block size
+  if [[ $wresult -eq 0 ]]; then
+    # try with fio 3.1+ format
+    wresult="$(echo "$wsrc" | awk -F'[:,=]+' '{sum += $3} ; END { printf "%d",  sum/8 }')" # 1024/128 = 8 for 128k block size
+  fi
+  echo "$wresult MB/s"
+}
+
+main(){
+  initcheck
+  echo 'initcheck finished'
+  for drv in ${drives[*]}; do
+    if [[ -f ${drv}-completed ]]; then
+      echo "${bold}Looks like $drv tests were completed, to re-test, please either remove ./$drv-completed or remove $drv from drives.txt ${norm}" 1>&2
+      exit 1
+    fi
+  done
+  echo "Starting fill workload..."
+  $fio --output=./fio-fill/fill-output ./fio-fill/fill-jobfile
+  if [[ $? -ne 0 ]]; then
+    echo "${bold}Fill workload failed. Results might be incomplete.${norm}" 1>&2
+  else
+    echo "Fill workload succeeded."
+  fi
+  # check again for all drives before proceeding, as some of them might not be available
+  for drv in ${drives[*]}; do
+    check_device_is_block "$drv"
+  done
+  echo "Starting random workload..."
+  $fio --output=./fio-rand/random-output ./fio-rand/random-jobfile
+  if [[ $? -ne 0 ]]; then
+    echo "${bold}Random workload failed. Results might be incomplete.${norm}" 1>&2
+  else
+    echo "Random workload succeeded."
+  fi
+  # enumerate drives for lines in fio output in fill-verify
+  declare -A drivearray
+  count=1
+  for drv in ${drives[@]}; do
+    drivearray["$drv"]="$count"
+    count=$((count+1))
+  done
+  for drv in ${drives[*]}; do
+    collect_smart "$drv" smart2
+    echo "/dev/$drv finished" | tee "$drv"-completed
+    date | tee -a "$drv"-completed
+    report "$drv" | tee -a "$drv"-completed
+  done
+  reportsum | tee -a all-completed
+}
+
+if [[ -n $* ]]; then
+  while test -n "$1"; do
+    case "$1" in
+      '-h'|'--help'|'help'|'usage')
+          usage
+          exit 0
+          shift
+          ;;
+      '--no-sync')
+        nosyncf=1
+        echo '--no-sync=1 flag added to fio parameters'
+        shift
+        ;;
+      '--no-write')
+        nowrite=1
+        echo 'fio parameters now updated with --rw=read/--rw=randread'
+        shift
+        ;;
+      --seqsize=*)
+        size="${1##*=}"
+        echo "New size for sequential workload - ${size}"
+        shift
+        ;;
+      --hdd-rand-size=*)
+        hddrandsize="${1##*=}"
+        echo "New size for HDD random workload - ${hddrandsize}"
+        shift
+        ;;
+      --ssd-rand-size=*)
+        ssdrandsize="${1##*=}"
+        echo "New size for SSD random workload - ${ssdrandsize}"
+        shift
+        ;;
+      --updatedb)
+        echo "Updating smartmontools database only"
+        updatedbonly=1
+        shift
+        ;;
+      *)
+        usage 1>&2
+        exit 1
+        ;;
+    esac
+  done
+fi
+
+main

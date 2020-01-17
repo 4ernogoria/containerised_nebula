@@ -1,0 +1,85 @@
+#!/bin/bash
+
+# Copyright (c) 2018 StorPool.
+# All rights reserved.
+#
+
+
+TECH_SUPPORT=/var/tmp/storpool_tech_support-$(date +%Y%m%d-%H%M%S)
+
+exec_log(){
+
+    unset TIMEOUT
+    if [ "$1" == "-t" ] ; then
+        TIMEOUT="timeout $2"
+        shift 2
+    fi
+    echo
+    echo '=================================================================='
+    echo "$@"
+    echo '=================================================================='
+
+    $TIMEOUT "$@"
+
+    if [ $? == 124 ] ; then
+        echo "Timeout!"
+    fi
+
+} >> $TECH_SUPPORT 2>&1
+
+syslog() {
+    if [ -f /var/log/messages ] ; then
+        LOGFILE=/var/log/messages
+    else
+        LOGFILE=/var/log/syslog
+    fi
+    egrep 'storpool\S*:' $LOGFILE | egrep -v -f <(cat <<EOF
+GET /ctrl/1.0
+ systemd:
+\[info\] got cfgReadDisk
+\[info\] send cfgReadDisk
+\[info\] closing session
+SP_CRASH_REMOTE_USER is not set
+EOF
+    )
+}
+
+host_info(){
+    date
+    uname -a
+}
+
+service_status() {
+    if type -p systemctl >/dev/null ; then
+        systemctl status 'storpool*'
+    else
+        for s in storpool_{beacon,server{,_1,_2,_3},block,mgmt,controller,bridge} ; do
+            service $s status
+        done
+    fi
+}
+
+ls_modules() {
+    lsmod | grep storpool
+    for module in storpool_{disk,rdma,bd} ; do
+        echo
+        modinfo $module
+    done
+}
+
+exec_log host_info
+exec_log -t 3 storpool service list
+exec_log -t 3 storpool net list
+exec_log -t 5 storpool disk list
+exec_log storpool_confshow
+exec_log ip -d -s link
+exec_log service_status
+exec_log storpool_revision
+exec_log ls_modules
+exec_log -t 10 storpool_initdisk --list
+exec_log -t 3 storpool task list
+exec_log iostat -xm 1 4
+exec_log dmesg
+exec_log syslog
+
+gzip $TECH_SUPPORT && echo "Please send $TECH_SUPPORT.gz to StorPool support"

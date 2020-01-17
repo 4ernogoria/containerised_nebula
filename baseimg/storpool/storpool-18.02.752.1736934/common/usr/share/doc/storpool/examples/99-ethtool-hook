@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# to be used with Ubuntu 18.04 LTS netplan, to enable please copy into
+# /usr/lib/networkd-dispatcher/routable.d/ and reload networkd-dispatcher service
+
+ETHTOOL=/sbin/ethtool
+SHOWCONF=/usr/sbin/storpool_showconf
+
+test -x $ETHTOOL || exit 0
+
+apply(){
+	local template="$1"
+	local IFACE="$2"
+	eval "$("$SHOWCONF" -ne "$template" | sed -e "s@__ETHTOOL__@$ETHTOOL@g" -e "s@__IFACE__@$IFACE@g")"
+}
+
+spiface1="$($SHOWCONF -ne SP_IFACE1_CFG | cut -d: -f3)"
+spiface2="$($SHOWCONF -ne SP_IFACE2_CFG | cut -d: -f3)"
+
+case "$IFACE" in
+	"${spiface1}")
+		apply SP_IFACE1_ETHTOOLOPTS_TEMPLATE "$IFACE"
+		;;
+	"${spiface2}")
+		apply SP_IFACE2_ETHTOOLOPTS_TEMPLATE "$IFACE"
+		;;
+esac

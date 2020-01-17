@@ -1,0 +1,13 @@
+#
+#-
+# Copyright (c) 2013  StorPool.
+# All rights reserved.
+#
+### SUBSYSTEM!="block", GOTO="sp_end"
+### ACTION=="add", GOTO="sp_program"
+### ACTION=="change", GOTO="sp_program"
+### GOTO="sp_end"
+### LABEL="sp_program"
+### PROGRAM!="/usr/lib/storpool/udev_helper.py", GOTO="sp_end"
+### RESULT=="?*", SYMLINK+="%c"
+### LABEL="sp_end"

@@ -1,0 +1,11 @@
+common	/etc/cron.d/storpool_cgmove_cron
+beacon	/etc/cron.d/spiface_stats
+beacon	/etc/logrotate.d/spiface_stats
+common	/etc/machine-cgsetup.conf
+common	/lib/systemd/system/machine-cgsetup.service
+beacon	/usr/lib/storpool/spiface_stats
+beacon	/usr/lib/storpool/storpool_stat
+common	/usr/lib/systemd/system/machine-cgsetup.service
+common	/usr/sbin/machine-cgsetup.sh
+common	/usr/sbin/update-machine-cgsetup.sh
+common	/usr/share/doc/storpool/examples/cgconfig/centos6/etc/rc.d/init.d/storpool_cgmove

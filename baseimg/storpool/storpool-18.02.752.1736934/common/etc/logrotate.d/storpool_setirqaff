@@ -1,0 +1,9 @@
+/var/log/storpool/setirqaff.log
+{
+    daily
+    rotate 64
+    missingok
+    compress
+    dateext
+    sharedscripts
+}

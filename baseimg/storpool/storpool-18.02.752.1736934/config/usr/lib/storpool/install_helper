@@ -1,0 +1,960 @@
+#!/usr/bin/perl
+#
+# Copyright (c) 2016, 2017  StorPool.
+# All rights reserved.
+#
+
+use v5.10;
+use strict;
+use warnings;
+
+use File::Basename qw(basename dirname);
+use File::Temp;
+use Getopt::Std;
+use JSON::XS;
+use List::Util qw(first max reduce);
+
+use constant usage_message => <<EOUSAGE ;
+Usage:	install_helper [-Nq] -m modules check
+	install_helper [-Nq] -m modules preinst
+	install_helper [-Nq] -m modules postinst
+	install_helper -V | -h
+
+	-h	display program usage information and exit
+	-m	specify which StorPool modules are being installed
+	-N	no operation mode; display what would have been done
+	-q	quiet operation; suppress progress output
+	-V	display program version information and exit
+EOUSAGE
+
+use constant version_message => 'install_helper 0.2.0';
+
+my $cfg_fname = '/var/run/install-storpool.json';
+
+my %config = (
+	scrub_cron => {
+		old => {
+			old => 1,
+			filename => '/etc/cron.d/sp-disk-scrub-cron',
+			command => 'sp-disk-scrub',
+			script_filename => '/usr/lib/storpool/sp-disk-scrub',
+		},
+		new => {
+			old => 0,
+			filename => '/etc/cron.d/storpool_scrub_disks',
+			command => 'scrub_disks',
+			template => '/usr/share/doc/storpool/examples/etc/cron.d/storpool_scrub_disks',
+		},
+	},
+);
+
+sub prepare_output($ $)
+{
+	my ($code, $text) = @_;
+	(my $noeol = $text) =~ s/\r*\n$//;
+
+	[$code, $noeol]
+}
+
+sub ok($)
+{
+	prepare_output(0, $_[0])
+}
+
+sub err($)
+{
+	prepare_output(1, $_[0])
+}
+
+sub version()
+{
+	ok(version_message)
+}
+
+sub usage()
+{
+	err(usage_message)
+}
+
+sub json()
+{
+	JSON::XS->new->utf8->pretty->canonical
+}
+
+sub jbool($)
+{
+	$_[0]
+		? JSON::XS::true
+		: JSON::XS::false
+}
+
+sub slurp($)
+{
+	my ($fh) = @_;
+	my $contents;
+	{
+		local $/;
+		$contents = <$fh>;
+	}
+	$contents
+}
+
+sub slurp_json($ $)
+{
+	my ($fname, $callback) = @_;
+
+	my $f;
+	open($f, '<', $fname)
+		? do {
+			my $contents = slurp $f;
+			close($f)
+				? do {
+					my $jdata = eval { json->decode($contents) };
+
+					$@
+						? err("Could not parse the JSON data in $fname: $@")
+						: $callback->($jdata)
+				}
+				: err("Could not close $fname after reading: $!")
+		}
+		: err("Could not open $fname for reading: $!")
+}
+
+sub files_differ($ $ $ $)
+{
+	my ($src, $dst, $cb_ok, $cb_err) = @_;
+	my ($fh_src, $fh_dst);
+
+	open($fh_src, '<', $src)
+		? do {
+			my $c_src = slurp $fh_src;
+			close($fh_src);
+
+			my $fh_dst;
+			open($fh_dst, '<', $dst)
+				? do {
+					my $c_dst = slurp $fh_dst;
+					close($fh_dst);
+
+					$cb_ok->($c_src ne $c_dst)
+				}
+				: $cb_err->(err("Could not open $dst for reading: $!"))
+		}
+		: $cb_err->(err("Could not open $src for reading: $!"))
+}
+
+sub try_unlink($ $ $)
+{
+	my ($cfg, $fname, $callback) = @_;
+
+	(-f $fname)
+		? $cfg->{noop}->("remove $fname",
+			sub {
+				unlink($fname) || $!{ENOENT}
+					? (
+						$cfg->{verbose}->("Removed $fname"),
+						$_[0]->()
+					)
+					: err("Could not remove $fname: $!")
+			},
+			$callback)
+		: $callback->()
+}
+
+sub scrub_parse_crontab($ $ $ $ $)
+{
+	my ($cfg, $fname, $cmd, $cb_ok, $cb_err) = @_;
+
+	my $handle_line = sub {
+		my ($data, $line) = @_;
+		chomp $line;
+
+		$line =~ m{^
+			\s*
+			(?<disabled>
+				[#] \s*
+			)?
+			(?<timespec>
+				(?:
+				(?:
+					[0-9]+ | [*]
+				)
+				\s+
+				) {5}
+			)
+			(?<username>
+				\S+
+				\s+
+			)
+			(?<exec>
+				(?<prefix>
+					(?:
+						# e.g. [ -f /etc/storpool.conf ] &&
+						.*?
+						(?:
+							\&\& | \|\| | ;
+						)
+						\s*
+					)?
+					/usr/lib/storpool/
+				)
+				\Q$cmd\E
+				(?<args>
+					\s+
+					-a
+					\s+
+					-- (?<action>
+						start | stop
+					)
+				)
+			)
+			\s*
+		$}x
+			? $data->{$+{action}}
+				? { err => "duplicate '$+{action}' line" }
+				: do {
+					my $attr = {
+						type => $+{action},
+						disabled => $+{disabled} // '',
+						timespec => $+{timespec},
+						username => $+{username},
+						exec => $+{exec},
+						prefix => $+{prefix},
+						args => $+{args},
+					};
+					my $result = {
+						%{$data},
+						lines => [
+							@{$data->{lines}},
+							$attr,
+						],
+						$+{action} => $attr,
+					};
+					$result
+				}
+			: $line =~ m{^ \s* (?: [#] .* )? $}x
+				? {
+					%{$data},
+					lines => [
+						@{$data->{lines}},
+						{
+							type => 'copy',
+							line => $line,
+						},
+					],
+				}
+				: { err => "unrecognized line '$line'" }
+	};
+
+	my $f;
+	open($f, '<', $fname)
+		? do {
+			my @lines = <$f>;
+			close($f);
+			my $res = reduce {
+				$a->{err}
+					? $a
+					: $handle_line->($a, $b)
+			} { lines => [], }, @lines;
+			$res->{err}
+				? $cb_ok->({ weird => $res->{err} })
+				: $cb_ok->($res)
+		}
+		: $cfg->{opts}->{N}
+			? ok("No-operation mode and no $fname - not updating the crontab file")
+			: $cb_err->(err("Could not open $fname for reading: $!"))
+}
+
+sub scrub_check_crontab($)
+{
+	my ($cfg) = @_;
+
+	my @checks = map {
+		my ($type, $c) = ($_, $config{scrub_cron}->{$_});
+
+		-f $c->{filename}
+			? scrub_parse_crontab($cfg, $c->{filename}, $c->{command},
+				sub {
+					{
+						data => {
+							type => $_,
+							filename => $c->{filename},
+							command => $c->{command},
+							old => $c->{old},
+							data => $_[0],
+						}
+					}
+				}, sub {
+					{
+						bad => 1,
+						output => [ @_ ],
+					}
+				}
+			)
+			: ()
+	} keys %{$config{scrub_cron}};
+	my %data = map {
+		$_->{data}
+			? ($_->{data}->{type} => $_->{data})
+			: ()
+	} @checks;
+
+	scalar(keys %data) > 1
+		? {
+			bad => 1,
+			output => [
+				err("More than one crontab file found: ".
+					join(' ', map { $_->{filename} } values %data)),
+			],
+		}
+		: {
+			bad => jbool(first { $_->{bad} } @checks),
+			output => [ map { @{$_->{output} // []} } @checks ],
+			(%data
+				? (
+					data => { file => (values %data)[0] }
+				)
+				: (),
+			),
+		}
+}
+
+sub scrub_crontab_differs($ $)
+{
+	my ($local, $template) = @_;
+	my $l_local = $local->{data}->{lines};
+	my $l_template = $template->{lines};
+
+	my $differs_start_stop = sub { $_[0]->{exec} ne $_[1]->{exec} };
+	my %differs = (
+		copy => sub { $_[0]->{line} ne $_[1]->{line} },
+		start => $differs_start_stop,
+		stop => $differs_start_stop,
+	);
+
+	@{$l_local} != @{$l_template}
+		? 1
+		: reduce {
+			$a
+				? $a
+				: do {
+					my ($ll, $lc) = ($l_local->[$b], $l_template->[$b]);
+
+					$ll->{type} ne $lc->{type}
+						? 1
+						: $differs{$ll->{type}}->($ll, $lc)
+				}
+		} 0, (0..$#{$l_local})
+}
+
+sub scrub_update_crontab($ $)
+{
+	my ($cfg, $data) = @_;
+
+	my $generate_file = sub {
+		my ($local, $tpl) = @_;
+		my $lines = $tpl->{lines};
+
+		my $copy_start_stop = sub {
+			my ($line) = @_;
+			my $act = $local->{data}->{$line->{type}} || $line;
+
+			join('',
+				$act->{disabled},
+				$act->{timespec},
+				$act->{username},
+				$line->{exec},
+			)
+		};
+
+		my %copy = (
+			'copy' => sub { $_[0]->{line} },
+			'start' => $copy_start_stop,
+			'stop' => $copy_start_stop,
+		);
+
+		my $contents = join('', map {
+			my $line = $lines->[$_];
+
+			$copy{$line->{type}}->($line)."\n"
+		} (0..$#{$lines}));
+
+		my $fname = $config{scrub_cron}->{new}->{filename};
+		$cfg->{noop}->("create $fname containing:\n$contents",
+			sub {
+				my $temp = eval {
+					File::Temp->new(
+						TEMPLATE => '.'.basename($fname).'.tmp.XXXXXX',
+						DIR => dirname($fname),
+						UNLINK => 1)
+				};
+
+				$@
+					? err("Could not create a temporary file for $fname: $@")
+					: do {
+						my $res = print $temp $contents;
+						$res
+							? rename($temp, $fname)
+								? do {
+									$temp->unlink_on_destroy(0);
+									$temp->close;
+									(
+										$cfg->{verbose}->("Created $fname"),
+										$_[0]->()
+									)
+								}
+								: err("Could not rename the temporary file $temp to $fname: $!")
+							: err("Could not write to the temporary file $temp: $!")
+					}
+			},
+			sub {
+				try_unlink(
+					$cfg,
+					$config{scrub_cron}->{old}->{script_filename},
+					sub {
+						$local->{old}
+							? try_unlink($cfg, $local->{filename}, sub { () })
+							: ()
+					})
+			}
+		)
+	};
+
+	my @output = scrub_parse_crontab(
+		$cfg,
+		$config{scrub_cron}->{new}->{template},
+		$config{scrub_cron}->{new}->{command},
+		sub {
+			my ($tpl) = @_;
+			$cfg->{sc}
+				? do {
+					my $local = $cfg->{sc}->{file};
+
+					$local->{data}->{weird}
+						? ok("Warning: not replacing $local->{filename}: $local->{data}->{weird}")
+						: ($local->{old} || scrub_crontab_differs($local, $tpl))
+							? $generate_file->($local, $tpl)
+							: ($cfg->{verbose}->("No need to regenerate $local->{filename}"))
+				}
+				: $generate_file->(
+					{
+						filename => $config{scrub_cron}->{new}->{filename},
+						old => 0,
+						type => 'new',
+						data => {},
+					},
+					$tpl
+				)
+		},
+		sub { @_ }
+	);
+
+	{
+		bad => defined(first { $_->[0] } @output),
+		output => \@output,
+	}
+}
+
+sub dracut_parse_old_conf($)
+{
+	my ($fname) = @_;
+
+	-f $fname
+		? do {
+			my $f;
+			open($f, '<', $fname)
+				? do {
+					my $data = slurp $f;
+					my $expected_1 = <<'EOEXPECTED';
+omit_drivers+="qlcnic cxgb4 ixgbe sfc mlx4 mlx4_core mlx5 mlx5_core ib_qib i40e storpool_.*"
+add_drivers+="ahci isci mpt2sas mpt3sas mvsas megaraid_sas aacraid 3w-9xxx igb e1000e"
+EOEXPECTED
+					my $expected_2 = <<'EOEXPECTED';
+omit_drivers+=" qlcnic cxgb4 ixgbe sfc mlx4 mlx4_core mlx5 mlx5_core ib_qib i40e storpool_.* "
+add_drivers+=" ahci isci mpt2sas mpt3sas mvsas megaraid_sas aacraid 3w-9xxx igb e1000e "
+EOEXPECTED
+
+					close($f)
+						? $data eq $expected_1 || $data eq $expected_2
+							? {}
+							: {
+								bad => 1,
+								output => [ err "Unexpected content in $fname; ".
+									"expected exactly one of the following:\n".
+									"$expected_1\n...or...\n$expected_2" ],
+							}
+						: {
+							bad => 1,
+							output => [ err "Could not read $fname: $!" ],
+						}
+				}
+				: {
+					bad => 1,
+					output => [ err "Could not open $fname: $!" ],
+				}
+		}
+		: undef
+}
+
+sub dracut_parse_conf($)
+{
+	my ($fname) = @_;
+	
+	-f $fname
+		? do {
+			my $f;
+			open($f, '<', $fname)
+				? do {
+					my $data = slurp $f;
+					close($f)
+						? $data =~ m{
+							^
+							# The first line
+							[#] .* Autogenerated .* StorPool .* \n
+
+							# Ignore any more comment or empty lines
+							(?:
+								\s* \n
+								|
+								[#] .* \n
+							)*
+
+							# Okay, let's see some actual data here
+							omit_drivers [+]= "
+								(?<omit> [^"]* )
+							" \n
+
+							add_drivers  [+]= "
+								(?<add>  [^"]* )
+							" \n
+							$
+						}mx
+							?  {
+								bad => 0,
+								data => {
+									omit => $+{omit},
+									add  => $+{add},
+								},
+							}
+							: {
+								bad => 1,
+								output => [ err "Local changes detected in $fname, please examine the file and restore or remove it as necessary!" ],
+							}
+						: {
+							bad => 1,
+							output => [ err "Could not read $fname: $!" ],
+						}
+				}
+				: {
+					bad => 1,
+					output => [ err "Could not open $fname: $!" ],
+				}
+		}
+		: {}
+}
+
+sub re_matches_any($ $)
+{
+	my ($patterns, $string) = @_;
+	
+	reduce {
+		$a
+			? $a
+			: $string eq $b || $string =~ $patterns->{$b}
+	} 0, keys %{$patterns}
+}
+
+sub dracut_update_modules($ $)
+{
+	my ($cfg, $data) = @_;
+
+	my $confdir = '/etc/dracut.conf.d';
+	my $old_conffile = "$confdir/spdracut.conf";
+	my $conffile = "$confdir/storpool.conf";
+	-d $confdir
+		? do {
+			my $old = dracut_parse_old_conf $old_conffile;
+			(defined $old && $old->{bad})
+				? $old
+				: do {
+					my $prev = dracut_parse_conf($conffile);
+					$prev->{bad}
+						? $prev
+						: do {
+							my %needed = (
+								omit => [
+									(-f $conffile
+										? ()
+										: 'mlx[45].*'
+									),
+									qw(qlcnic cxgb4 ixgbe sfc ib_qib i40e storpool_.*)
+								],
+								add => [
+									qw(ahci isci mpt2sas mpt3sas mvsas megaraid_sas aacraid 3w-9xxx igb e1000e)
+								],
+							);
+							my @handled = (@{$needed{omit}}, @{$needed{add}});
+							my %re_handled = map { $_ => qr{$_} } @handled;
+
+							my @more_omit = grep { !re_matches_any \%re_handled, $_ }
+								split /\s+/, $prev->{data}{omit} // '';
+							my $new_omit = join ' ', @{$needed{omit}}, @more_omit;
+
+							my @more_add  = grep { !re_matches_any \%re_handled, $_ }
+								split /\s+/, $prev->{data}{add } // '';
+							my $new_add  = join ' ', @{$needed{add }}, @more_add;
+
+							my $tstamp = localtime().'';
+							my $output = <<"EODRACUT";
+# Autogenerated by the StorPool installation script!
+# $tstamp
+#
+# ANY CHANGES TO THIS FILE WILL BE OVERWRITTEN!
+
+omit_drivers+=" $new_omit "
+add_drivers+=" $new_add "
+EODRACUT
+							my $outf;
+							open($outf, '>', $conffile)
+								? do {
+									my $res = print $outf $output;
+									$res
+										? close($outf)
+											? defined $old
+												? unlink($old_conffile)
+													? {}
+													: {
+														bad => 1,
+														output => [ err "Could not remove the old config file $old_conffile" ],
+													}
+												: {}
+											: {
+												bad => 1,
+												output => [ err "Could not write to $conffile: $!" ],
+											}
+										: {
+											bad => 1,
+											output => [ err "Could not write to $conffile: $!" ],
+										}
+								}
+								: {
+									bad => 1,
+									output => [ err "Could not create $conffile: $!" ],
+								}
+						}
+				}
+		}
+		: {}
+	
+}
+
+my %stages = (
+	dracut_modules => {
+		postinst => \&dracut_update_modules,
+	},
+	
+	scrub_cron => {
+		preinst => \&scrub_check_crontab,
+
+		postinst => \&scrub_update_crontab,
+	},
+);
+
+my %modules = (
+	common => [ qw(
+		dracut_modules
+	)],
+
+	mgmt => [ qw(
+		scrub_cron
+	)],
+);
+
+sub do_preinst($)
+{
+	my ($cfg) = @_;
+	my $f;
+
+	open($f, '>', $cfg_fname)
+		? do {
+			my $data = reduce {
+				my ($data, $stage) = ($a, $b);
+				$data->{bad}
+					? $data
+					: do {
+						my $sub = $stages{$stage}->{preinst};
+
+						defined($sub)
+							? do {
+								my $stage_config = $config{$stage};
+								my $scfg = %{$stage_config // {}}
+									? {
+										%{$cfg},
+										sc => $stage_config,
+									}
+									: $cfg;
+								my $res = $sub->($scfg, $data);
+
+								{
+									bad => $res->{bad},
+									output => @{$res->{output} // []}
+										? [
+											@{$data->{output}},
+											@{$res->{output}},
+										]:
+										$data->{output},
+									data => defined $res->{data}
+										? {
+											%{$data->{data}},
+											$stage => $res->{data},
+										}
+										: $data->{data},
+								}
+							}
+							: $data
+					}
+			} {
+				bad => 0,
+				output => [],
+				data => {},
+			}, @{$cfg->{stages}};
+
+			$data->{bad}
+				? @{$data->{output}}
+				: do {
+					my $res = print $f json->encode($data->{data});
+					$res
+						? close($f)
+							? $cfg->{verbose}->("Created $cfg_fname")
+							: err("Could not close $cfg_fname after writing: $!")
+						: err("Could not write the configuration data to $cfg_fname: $!")
+				}
+		}
+		: err("Could not create $cfg_fname: $!")
+}
+
+sub do_postinst($)
+{
+	my ($cfg) = @_;
+	
+	slurp_json($cfg_fname, sub {
+		my ($stored) = @_;
+		my $total = reduce {
+			my ($data, $stage) = ($a, $b);
+			$data->{bad}
+				? $data
+				: do {
+					my $sub = $stages{$stage}->{postinst};
+
+					defined($sub)
+						? do {
+							my $stage_config = $stored->{$stage};
+							my $scfg = defined $stage_config
+								? {
+									%{$cfg},
+									sc => $stage_config,
+								}
+								: $cfg;
+							my $res = $sub->($scfg, $data);
+
+							{
+								bad => $res->{bad},
+								output => @{$res->{output} // []}
+									? [
+										@{$data->{output}},
+										@{$res->{output}},
+									]:
+									$data->{output},
+							}
+						}
+						: $data
+				}
+		} {
+			bad => 0,
+			output => [],
+		}, @{$cfg->{stages}};
+
+		@{$total->{output}}
+	})
+}
+
+my %actions = (
+	check => sub {
+		my ($cfg) = @_;
+
+		$cfg->{verbose}->("Ready to install the '@{$cfg->{modules}}' StorPool modules; stages to be executed: @{$cfg->{stages}}")
+	},
+	preinst => \&do_preinst,
+	postinst => \&do_postinst,
+);
+
+sub check_option_modules($ $ $)
+{
+	my ($opts, $args, $callback) = @_;
+
+	my $validate_modules = sub {
+		my ($cb) = @_;
+
+		my @mods = split /\s+/, $opts->{m};
+		my @valid = grep { defined $modules{$_} } @mods;
+		my @missing = grep ! -d, @valid;
+
+		@missing?
+			err("Missing installation modules '@missing'"):
+			$cb->(@valid)
+	};
+
+	defined($opts->{m})?
+		$opts->{m} eq 'list'?
+			(
+				ok('Available StorPool modules:'),
+				map { ok("\t$_") } sort keys %modules
+			):
+			$validate_modules->(sub {
+				my @mods = @_;
+				my @stages = map { @{$modules{$_}} } @mods;
+				my $uniq = reduce {
+					my ($data, $stage) = ($a, $b);
+
+					defined($data->{seen}->{$stage})?
+						$data:
+						{
+							seen => {
+								%{$data->{seen}},
+								$stage => 1,
+							},
+							stages => [
+								@{$data->{stages}},
+								$stage,
+							],
+						}
+				} {
+					seen => {},
+					stages => [],
+				}, @stages;
+
+				$callback->(\@mods, $uniq->{stages})
+			}):
+		(
+			err('No modules list (-m) specified'),
+			usage,
+		)
+}
+
+sub parse_options($ $ $)
+{
+	my ($opts, $args, $callback) = @_;
+
+	check_option_modules($opts, $args, sub {
+		my ($mods, $stages) = @_;
+
+		@{$args} == 1?
+			do {
+				my $action = $args->[0];
+				my $verbose = $opts->{q}? sub { () }: sub { ok($_[0]) };
+
+				defined($actions{$action})?
+					$callback->({
+						action => $action,
+						verbose => $verbose,
+						modules => $mods,
+						noop => $opts->{N}? sub {
+							my ($desc, $doit, $next) = @_;
+
+							(
+								$verbose->("Would $desc"),
+								$next->(),
+							)
+						}: sub {
+							my ($desc, $doit, $next) = @_;
+
+							$doit->($next)
+						},
+						opts => $opts,
+						stages => $stages,
+					}):
+					(
+						err("Unknown action '$action'"),
+						usage,
+					)
+			}:
+			(
+				err('Exactly one positional parameter (a command) expected'),
+				usage,
+			)
+	})
+}
+
+sub get_options($)
+{
+	my ($callback) = @_;
+
+	my %opts;
+	getopts('hm:NqV-:', \%opts)?
+		$callback->(\%opts, \@ARGV):
+		usage
+}
+
+sub parse_opts_ver_help($ $ $)
+{
+	my ($opts, $args, $callback) = @_;
+	my $has_dash = defined $opts->{'-'};
+	my $dash_help = $has_dash && $opts->{'-'} eq 'help';
+	my $dash_version = $has_dash && $opts->{'-'} eq 'version';
+	my @msg = (
+		($opts->{V} || $dash_version? version: ()),
+		($opts->{h} || $dash_help? usage: ()),
+	);
+
+	$has_dash && !$dash_help && !$dash_version?
+		err("Invalid long option '".$opts->{'-'}."' specified"):
+		@msg?
+			@msg:
+			$callback->($opts, $args)
+}
+
+sub part(& @)
+{
+	my ($sub, @list) = @_;
+
+	@{
+		; reduce {
+			my $idx = $sub->($b);
+			my $prev = $idx - 1;
+			my $next = $idx + 1;
+			my $collected = [ @{ $a->[$idx] // [] }, $b ];
+
+			[
+				@{$a}[0..$prev],
+				$collected,
+				@{$a}[$next..$#{$a}]
+			]
+		} [], @list
+	}
+}
+
+sub display_and_exit(@)
+{
+	my @res = @_;
+	exit 0 unless @res;
+
+	my @by_res = part { $_->[0]? 1: 0 } @res;
+
+	say STDERR $_->[1] for @{$by_res[1] || []};
+	say $_->[1] for @{$by_res[0] || []};
+	exit max map $_->[0], @res;
+}
+
+MAIN:
+{
+	display_and_exit get_options sub {
+		# opts, args -- output
+		parse_opts_ver_help $_[0], $_[1], sub {
+			# opts, args -- output
+			parse_options $_[0], $_[1], sub {
+				# cfg -- output
+				$actions{$_[0]->{action}}->($_[0])
+			}
+		}
+	};
+}

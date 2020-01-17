@@ -1,0 +1,136 @@
+#!/bin/bash
+#
+#-
+# Copyright (c) 2013, 2014  StorPool.
+# All rights reserved.
+#
+
+# Usage: /usr/lib/storpool/diskid-helper <path_to_device>
+#
+#   example: /usr/lib/storpool/diskid-helper /dev/sda1
+#
+#   If device partition is given, then the partition index is removed
+#
+#   Config variables:
+#    cmdOrder - space-separated list of commands to execute:
+#    ATA_ID_CMD - command to execute for handling ata_id
+#    SCSI_ID_CMD - command to execute for handling scsi_id
+#    STORCLI_CMD - command to execute for handling LSI MegaRAID via storcli tool
+#
+#   String substitutions in *_CMD before execution
+#    _DEV_ --> dev_path (ex: /dev/sda)
+#    _DEVNAME_ --> device name only (ex: sda)
+#
+#   Config file(optional):
+#    /etc/storpool/diskid-helper.conf - to extend/tweak diskid-helper
+#
+
+
+me=${0##*/}
+
+SCSI_ID_CMD="/lib/udev/scsi_id --export --whitelisted -p 0x80 -d _DEV_"
+ATA_ID_CMD="/lib/udev/ata_id --export _DEV_"
+ATA_ID_CMD_MODULES="ahci isci mpt2sas mpt3sas"
+STORCLI_CMD="/usr/lib/storpool/storcli-helper.pl _DEV_"
+STORCLI_CMD_MODULES="megaraid_sas"
+PERCCLI_CMD="/usr/lib/storpool/storcli-helper.pl -p perccli64 _DEV_"
+PERCCLI_CMD_MODULES="$STORCLI_CMD_MODULES"
+HPSACLI_CMD="/usr/lib/storpool/hpssacli-helper.pl _DEV_"
+HPSACLI_CMD_MODULES="hpsa"
+cmdOrder="ATA_ID_CMD STORCLI_CMD PERCCLI_CMD HPSACLI_CMD SCSI_ID_CMD"
+
+[ -f "/etc/storpool/${me}.conf" ] && . "/etc/storpool/${me}.conf"
+
+splog()
+{
+	logger -t "$me" "$*"
+}
+
+getPciDriver()
+{
+	local sysPath="$1" driver subsystem
+	if [ -n "$sysPath" ]; then
+		if [ -L "$sysPath"/subsystem ]; then
+			subsystem="$(readlink -f "$sysPath"/subsystem)"
+		fi
+		if [ -L "$sysPath"/driver ]; then
+			driver="$(readlink -f "$sysPath"/driver)"
+			if [ "${subsystem##*/}" = "pci" ]; then
+				splog "$sysPath $driver ($subsystem)"
+				echo "${driver##*/}"
+				return 0
+			fi
+		fi
+		if [ "${sysPath%/*}" != "$sysPath" ]; then
+			getPciDriver "${sysPath%/*}"
+		fi
+	fi
+}
+
+getBlockDriver()
+{
+	local disk="${1##*/}"
+	if [ -L "/sys/class/block/$disk" ]; then
+		getPciDriver $(readlink -f "/sys/class/block/$disk")
+	fi
+}
+
+getModuleCmd()
+{
+	local _module="$1" _cmd _modules _m
+	for _cmd in $cmdOrder; do
+		_modules="${_cmd}_MODULES"
+		if [ -n "${!_modules}" ]; then
+			for _m in ${!_modules}; do
+				if [ "${_m}" = "${_module}" ]; then
+					echo "${_cmd}"
+					return
+				fi
+			done
+		fi
+	done
+}
+
+runCmd()
+{
+	cmd="${!method}"
+	cmd="${cmd//_DEV_/$dev}"
+	cmd="${cmd//_DEVNAME_/$devName}"
+	unset ID_MODEL ID_SERIAL ID_SERIAL_SHORT
+	eval `$cmd | sed -e 's/[[:space:]]/_/g' 2>/dev/null`
+	MODEL="$ID_MODEL"
+	SERIAL="${ID_SERIAL_SHORT:-${ID_SERIAL}}"
+	if [ -n "$MODEL" ]; then
+		splog "$method $dev MODEL=$MODEL SERIAL=$SERIAL"
+		echo "MODEL=$MODEL"
+		echo "SERIAL=$SERIAL"
+		echo "METHOD=$method"
+		echo "MODULE=$module"
+		exit 0
+	fi
+}
+
+MODEL=
+SERIAL=
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:$PATH
+
+dev=`readlink -s -n -f $1`
+
+if [ -n "$dev" ]; then
+	devName="${dev##*/}"
+	if [ -f "/sys/class/block/${devName}/partition" ]; then
+		dev="${dev%%[[:digit:]]*}"
+		devName="${devName%%[[:digit:]]*}"
+	fi
+	module="$(getBlockDriver "$dev")"
+	method="$(getModuleCmd "$module")"
+	if [ -n "$method" ]; then
+		runCmd
+	else
+		splog "Unknown module '$module'! Walking $cmdOrder"
+	fi
+	for method in $cmdOrder; do
+		runCmd
+	done
+fi

@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# shellcheck disable=SC2059
+export LC_ALL=C
+
+updcmdtmpl(){
+	if command -v systemctl &>/dev/null; then
+		cmdtmpl="systemctl status %s"
+	elif command -v chkconfig &>/dev/null; then
+		cmdtmpl="service %s status"
+	else
+		echo 'Distribution not supported, expects systemd or chkconfig based one' 1>&2
+		exit 1
+	fi
+}
+
+enabledarerunning(){
+	echo "# check all enabled services are running:"
+	updcmdtmpl
+	if command -v systemctl &>/dev/null; then
+		mapfile -t services <<<"$(systemctl list-unit-files | awk '/storpool_.*enabled/ && !/cgmove|flushwbc/ { print $1 }')"
+	elif command -v chkconfig &>/dev/null; then
+		mapfile -t services <<<"$(chkconfig --list | awk '/storpool_.*3:on/ && !/cgmove|flushwbc/ { print $1 }')"
+	fi
+	for s in "${services[@]}"; do
+		cmd="$(printf "${cmdtmpl}" "$s")"
+		if ! $cmd >/dev/null; then
+			echo "$s not running but enabled on boot" 1>&2
+		fi
+	done
+}
+
+
+runningareenabled(){
+	echo "# check that running services are enabled:"
+	mapfile -t running <<<"$( while read -r pid ; do \
+		read -ra parr <<< "$(xargs -0 < "/proc/$pid/cmdline")" ; \
+		for word in "${parr[@]}" ; do \
+			if [[ ${word} =~ /var/run/storpool_ ]] ; then \
+				read -ra namearr <<< "${word//\// }" ; \
+				echo "${namearr[2]/.bin.pid}" ; \
+			fi ; \
+		done ; \
+	done <<<"$(pgrep -f 'storpool_.*\.bin')")"
+	updcmdtmpl
+	for r in "${running[@]}"; do
+		cmd="$(printf "${cmdtmpl}" "$s")"
+		if ! $cmd >/dev/null; then
+			echo "$r running, but is not enabled on boot" 1>&2
+		fi
+	done
+}
+
+installedarerunning(){
+	echo "# check that installed services are running:"
+	updcmdtmpl
+	installed=($(for s in /usr/sbin/storpool_*.bin ; do sarr=(${s//\// }) ; name=${sarr[2]/.bin} ; echo "$name" ; done ))
+	for i in "${installed[@]}"; do
+		if [[ $i == 'storpool_nvmed' && -z $(storpool_showconf -ne SP_NVME_PCI_ID) ]]; then
+			# skip checking NVMe if no NVMe drives configured
+			continue
+		fi
+		cmd="$(printf "${cmdtmpl}" "$i")"
+		if ! $cmd >/dev/null; then
+			echo "$i installed, but is not running" 1>&2
+		fi
+		if [[ $i == 'storpool_server' ]]; then
+			# check other instances as well
+			numinstances="$(storpool_initdisk --list 2>/dev/null | awk -F'[ ,]' '{ print $11 }' | sort -nu | tail -n 1)"
+			for s in $(seq 1 "$numinstances"); do
+				cmd="$(printf "${cmdtmpl}" "${i}_$s")"
+				if ! $cmd >/dev/null; then
+					echo "${i}_$s is installed, but is not running" 1>&2
+				fi
+			done
+		fi
+	done
+}
+
+enabledarerunning
+runningareenabled
+installedarerunning

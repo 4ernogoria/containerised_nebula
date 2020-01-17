@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -e
+
+: ${STORPOOL_MODULES:=storpool_bd storpool_disk storpool_pci storpool_rdma}
+
+res=0
+for module in $STORPOOL_MODULES; do
+	if ! egrep -qe "^$module[[:space:]]" /proc/modules; then
+		continue
+	fi
+	echo "storpool_unload: $module"
+	rmmod "$module" || res="$?"
+done
+
+exit "$res"

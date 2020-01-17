@@ -1,0 +1,126 @@
+#!/bin/bash
+usage(){
+	cat <<EOUSAGE
+Usage: $0 path/to/install.sh [args...]
+
+To be used by 'storpool_replacebd'. Ex.:
+
+	storpool_replacebd $0 /root/storpool/storpool-4092-7-15.02.1291.efa53c0/install.sh
+
+Attempts to:
+- stop all StorPool services
+- unload 'storpool_{bd,disk,vf,rdma}'
+- start services back.
+In case of failure to unload any of the modules, will install the release in [/path/to/install.sh] prior starting back the services.
+EOUSAGE
+}
+
+if [[ -z $1 ]]; then
+	usage 1>&2
+	exit 1
+fi
+
+if [[ -z $@ || $1 == help || $1 == usage || $1 == -h || $1 == --help || $1 == --usage ]]; then
+	usage
+	exit 0
+fi
+
+install_path=$1
+shift
+
+unset errs
+for s in mgmt server bridge block beacon; do
+	n="storpool_$s"
+	if ! /usr/lib/storpool/check_prelinked "$n" "/var/run/$n.pid"; then
+		errs=1
+	fi
+done
+[ -z "$errs" ] || exit 1
+
+echo -e " Check for running Storpool services..."
+service storpool_mgmt status &>/dev/null ; m=$?
+servers=
+for server in storpool_server{,_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11} ; do
+  if [[ -x /usr/sbin/$server ]]; then
+    if service $server status ; then
+      servers="$servers $server"
+    fi
+  fi
+done
+service storpool_iscsi status  &>/dev/null ; i=$?
+service storpool_block status  &>/dev/null ; b=$?
+service storpool_bridge status  &>/dev/null ; r=$?
+service storpool_controller status &>/dev/null ; controller=$?
+service storpool_nvmed status &>/dev/null; nvmed=$?
+
+if [ "$b" -eq 0 ]; then
+	if ! lsmod | awk '$1 == "storpool_bd" && $3 != 1 { exit 1 }'; then
+		echo "storpool_bd usecount != 1, aborting upgrade"
+		lsmod | grep -Fe storpool_bd
+		exit 1
+	fi
+fi
+
+cd -- "$install_path" || {
+	echo "Could not change into the $install_path directory" 1>&2
+	exit 1
+}
+
+echo -e " Attempting to stop all Storpool services..."
+# attempt to stop all services
+for server in $servers; do
+	service $server stop
+done
+service storpool_bridge stop
+service storpool_block stop
+service storpool_iscsi stop
+service storpool_mgmt stop
+service storpool_beacon stop
+service storpool_controller stop
+service storpool_nvmed stop
+/usr/lib/storpool/unload
+workingmodules=$(lsmod | fgrep storpool_)
+if [ -n "$workingmodules" ]; then
+	echo -e " ${bold}The following modules failed to unload:\n	${workingmodules}${norm}\n"
+	echo 'Reinstalling the previous release before starting the services'
+	if fgrep -qwe nosync install.sh; then
+		nosync_opt='-S'
+	else
+		nosync_opt=''
+	fi
+	./install.sh $nosync_opt "$@"
+fi
+
+# attempt to start all the services that were running
+echo -e " Starting storpool_beacon..."
+service storpool_beacon start
+if [ "$b" -eq 0 ]; then
+	echo -e " storpool_block was running, starting..."
+	service storpool_block start
+fi
+if [ "$i" -eq 0 ]; then
+	echo -e " storpool_iscsi was running, starting..."
+	service storpool_iscsi start
+fi
+if [ "$nvmed" -eq 0 ]; then
+	echo -e " storpool_nvmed was running, starting..."
+	service storpool_nvmed start
+fi
+if [ -n "$servers" ]; then
+  for server in $servers ; do
+    echo -e " $server was running, starting..."
+    service $server start
+  done
+fi
+if [ "$r" -eq 0 ]; then
+	echo -e " storpool_bridge was running, starting..."
+	service storpool_bridge start
+fi
+if [ "$m" -eq 0 ]; then
+	echo -e " storpool_mgmt was running, starting..."
+	service storpool_mgmt start
+fi
+if [ "$controller" -eq 0 ]; then
+	echo -e " storpool_controller was running, starting..."
+	service storpool_controller start
+fi

@@ -1,0 +1,115 @@
+#!/bin/sh
+#
+#-
+# Copyright (c) 2016  StorPool.
+# All rights reserved.
+#
+# Authors:
+#  Anton Todorov <a.todorov@storpool.com>
+#  Peter Pentchev Todorov <pp@storpool.com>
+#
+# chkconfig: - 21 69
+# description: Reaffirm the StorPool configuration settings
+#
+#
+### BEGIN INIT INFO
+# Provides: storpool_reaffirm
+# Required-Start:
+# Required-Stop:
+# Should-Start: approx
+# Should-Stop: approx
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: Reaffirm the StorPool configuration settings
+# Description: Set the sysctl values again if they have been
+#  modified by other tools.
+#  Currently mostly useful for Ubuntu 16.04's approx setting
+#  its own kernel.core_pattern.
+
+### END INIT INFO
+NAME=storpool_reaffirm
+
+# rpm based distros
+if [ -d /etc/sysconfig ]; then
+        [ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
+fi
+
+[ -n "$SP_LOCK_FILE" ] || SP_LOCK_FILE="/var/lock/subsys/${NAME}"
+
+# set secure PATH
+PATH="/sbin:/bin:/usr/sbin:/usr/bin"
+
+success()
+{
+        echo -ne "[  OK  ]\r"
+}
+
+failure()
+{
+        echo -ne "[FAILED]\r"
+}
+
+# rpm based distros
+if [ -d /etc/sysconfig ]; then
+	[ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
+fi
+
+start()
+{
+	echo -n "${NAME}:  "
+	storpool_reaffirm -p
+	local RET=$?
+	if [ "$RET" -eq 0 ]; then
+		local sp_lock_dir=`dirname -- "$SP_LOCK_FILE"`
+		[ -d "$sp_lock_dir" ] && touch "$SP_LOCK_FILE"
+		success
+	else
+		failure
+	fi
+	echo
+	return "$RET"
+}
+
+stop()
+{
+	
+	echo -n "${NAME}: not implemented "
+	success
+	rm -f -- "$SP_LOCK_FILE"
+	echo
+	return 0
+}
+
+reload()
+{
+	stop
+	start
+}
+
+status()
+{
+	echo -n "${NAME}: not implemented "
+	success
+	echo
+	return 0
+}
+
+case "$1" in
+	start)
+			start
+			;;
+	stop)
+			stop
+			;;
+	restart)
+			reload
+			;;
+	reload)
+			reload
+			;;
+	status)
+			status
+			;;
+	*)
+			echo "$0 [start|stop|restart|reload|status]"
+esac

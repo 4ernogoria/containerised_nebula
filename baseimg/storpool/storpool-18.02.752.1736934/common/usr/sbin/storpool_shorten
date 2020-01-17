@@ -1,0 +1,342 @@
+#!/usr/bin/perl
+#
+#-
+# Copyright (c) 2016 - 2018  StorPool.
+# All rights reserved.
+#
+
+use 5.010;
+use strict;
+use warnings;
+
+use Getopt::Std;
+use JSON::XS;
+
+use constant ROGUE_PENDING => 0;
+use constant ROGUE_BLACKLISTED => 1;
+
+my $SOS = 0;
+
+my $forceOutput = 0;
+my @REBASE_CMDS = ();
+my $OUTPUT="";
+my %ROGUE;
+my $debug;
+
+sub output ();
+
+sub usage($) {
+	my ($err) = @_;
+	my $s = <<'EOUSAGE' ;
+Usage:	storpool_shorten limit [volumes.json snapshots.json]
+	limit:	The threshold that should be maintained for chains.
+	volumes.json:	The name of a JSON file containing the output of "storpool -j volume list"
+	snapshots.json:	The name of a JSON file containing the output of "storpool -j snapshot list"
+EOUSAGE
+
+	if( $err ) {
+		die $s;
+	} else {
+		print $s;
+	}
+}
+
+sub debug($) {
+	say STDERR $_[0] if $debug;
+}
+
+sub readfile($) {
+	my ($file) = @_;
+	open my $f, '<', $file or die "Could not open $file: $!\n";
+	my $s;
+	{
+		local $/;
+		$s = <$f>;
+	}
+	close $f or die "Could not close $file: $!\n";
+	return $s;
+}
+
+# Generate a parent-child representation of the volumes.
+sub processRaw($$) {
+	my ($volumes, $data) = @_;
+	my @objs = @{$data->{data}};
+	
+	for my $obj (@objs) {
+		# If THIS is not yet recorded, initialize it with a child count of zero
+		$volumes->{$obj->{name}} = { children => [] } if (! $volumes->{$obj->{name}});
+		
+		# If THIS has a parent
+		if (defined $obj->{parentName} && $obj->{parentName} ne '') {
+			# Populate the parent name in this record
+			$volumes->{$obj->{name}}->{parentName} = $obj->{parentName};
+			
+			# If PARENT is not yet recorded, initialize it with a child count of zero (actually, 1 because of the next line)
+			$volumes->{$obj->{parentName}} = { children => [] } if (! $volumes->{$obj->{parentName}});
+			
+			# Increase the child count
+			push @{$volumes->{$obj->{parentName}}->{children}}, $obj->{name};
+		}
+		
+		# Store the name inside as well for easy reference
+		$volumes->{$obj->{name}}->{name} = $obj->{name}  if (defined $obj->{name});
+	}
+}
+
+sub clearDepths ($) {
+	my ($volumes) = @_;
+	
+	# Clear depths
+	foreach my $volName (keys %$volumes) {
+		delete $volumes->{$volName}->{depth};
+	}
+	
+	# Clear the rogue volumes list. Leave blacklisted volumes though. We do not want to attempt on them again.
+	debug 'in clearDepths, the rogue volumes are '.join(', ', map { "$_ => $ROGUE{$_}" } sort keys %ROGUE);
+	delete $ROGUE{$_} for grep { $ROGUE{$_} != ROGUE_BLACKLISTED } keys %ROGUE;
+}
+
+sub calculateDepths ($$) {
+	my ($volumes, $limit) = @_;
+	my @toProcess;
+	my @processing;
+	my $depth=1;
+	
+	debug 'calculating the depth of the volume/snapshot chains';
+
+	# Add all the first level volumes to be processed first.
+	foreach my $volName (keys %$volumes) {
+		my $vol=$volumes->{$volName};
+		unless ($vol->{parentName}) {
+			push @toProcess, $volName;
+		}
+	}
+	
+	
+	while (@toProcess) {
+		@processing = @toProcess;
+		@toProcess = ();
+		
+		foreach my $volName (@processing) {
+			my $vol=$volumes->{$volName};
+			
+			# Unless already processed ...
+			unless ($vol->{depth}) {
+				
+				$vol->{depth} = $depth;
+				
+				# Enlist all children to be processed in the next iteration.
+				push @toProcess, @{$vol->{children}};
+				
+				# Enlist as rogue if the volume is last in the chain and the chain is >= to the specified limit.
+				if (@{$vol->{children}} == 0 && $depth >= $limit) {
+					debug "oooff, found $volName: no children, depth $depth limit $depth ROGUE ".($ROGUE{$volName} // '(none)');
+					$ROGUE{$volName} //= ROGUE_PENDING;
+				}
+			}
+		}
+		# With every iteration we are one level deeper.
+		$depth++;
+	}
+	debug 'done calculating the depth';
+}
+
+# Simulate the rebase only in the hash
+sub simulateRebase ($$$$) {
+	my ($migrName, $newParent, $volumes, $limit) = @_;
+
+	my $oldParent = $volumes->{$migrName}->{parentName};
+	
+	# These 3 lines mean "delete $migrName from the current parrent's 'children' array"
+	my $index = 0;
+	$index++ until $volumes->{ $oldParent }->{children}[$index] eq $migrName;
+	splice(@{$volumes->{ $oldParent }->{children}}, $index, 1);
+	
+	# Add to the new parrent
+	push @{$volumes->{ $newParent }->{children}}, $migrName;
+	
+	$volumes->{$migrName}->{parentName} = $newParent;
+	
+	# We have done some disruptive things, so a quick way to fix the depths is to just re-calculate them all.
+	clearDepths($volumes);
+	calculateDepths($volumes, $limit);
+}
+
+sub performRebase () {
+	foreach my $cmd ( @REBASE_CMDS ) {
+		out ("Executing: $cmd");
+		my $out = `$cmd 2>&1`;
+		out ("$out");
+		out ('');
+	}
+}
+
+sub findFirstGoodParent ($$) {
+	my ($volName, $volumes) = @_;
+	my $selectedParent;
+	my $parent = $volumes->{$volName}->{parentName};
+	
+	# Start going up from the last in the chain until you reach the second volume.
+	# Yes, we avoid the first. There might really be no reason to do though.
+	debug "firstGoodParent invoked for $volName";
+	while ($volumes->{$parent}->{depth} > 1) {
+		# While going through them, mark the last one that's found that only has a single child.
+		debug "- parent $parent depth ".$volumes->{$parent}->{depth}.' children '.scalar(@{$volumes->{$parent}->{children}}).': '.join(', ', @{$volumes->{$parent}->{children}});
+		if (@{$volumes->{$parent}->{children}} == 1) {
+			debug '- whee, found it!';
+			$selectedParent = $parent;
+		}
+		$parent = $volumes->{$parent}->{parentName};
+	}
+	return $selectedParent;
+}
+
+sub findParentByDepth ($$$) {
+	my ($volName, $depth, $volumes) = @_;
+	my $parent = $volumes->{$volName}->{parentName};
+	
+	# Go up the chain, and find the volume at the given depth.
+	
+	while ($volumes->{$parent}->{depth} > $depth) {
+		$parent = $volumes->{$parent}->{parentName};
+	}
+	
+	if ($volumes->{$parent}->{depth} == $depth) {
+		return $parent;
+	}
+}
+
+sub findRebaseVol ($$$$) {
+	my ($firstGood, $rogue, $volumes, $limit) = @_;
+	
+	# We are looking for a rebase parent that has:
+	#   * a depth between 75% and 100% (excl.) of the limit (exluding 100% guarantees we do not
+	#     rebase the last in the chain, hence a volume, hence we do not need
+	#     to implement volume rebase)
+	#   * a distance (depth) from the first good that is at least limit/2
+	
+	my $firstEligDepth = $volumes->{$firstGood}->{depth} + ($limit/2);
+	my $firstLimitDepth = int($limit*0.75);
+	my $selectedDepth = ($firstEligDepth, $firstLimitDepth)[$firstEligDepth < $firstLimitDepth];
+	my $currentDepth = $volumes->{$rogue}->{depth};
+	debug "eligible $firstEligDepth limit-depth $firstLimitDepth selected $selectedDepth limit $limit";
+	debug "rogue $rogue depth $volumes->{$rogue}->{depth}";
+	
+	if ($selectedDepth >= $limit && $currentDepth <= $limit ) {
+		out ("	There are no suitable snapshots to rebase on below the limit");
+		$ROGUE{$rogue} = ROGUE_BLACKLISTED;
+		return undef;
+	} elsif ($volumes->{$firstGood}->{depth} >= $limit*0.5) {
+		out ("	I will rebase snapshot ".$selectedDepth." on ".$volumes->{$firstGood}->{depth}." even though it's getting close to the limit.");
+	} else {
+		out ("	I will rebase snapshot ".$selectedDepth." on ".$volumes->{$firstGood}->{depth});
+	}
+	return findParentByDepth($rogue, $selectedDepth, $volumes);
+}
+
+# Store the output ...
+sub out ($) {
+	my $text = shift;
+	$OUTPUT .= $text . "\n";
+}
+
+# ... print as necessary (only when we have performed any rebases)
+sub output () {
+	if (@REBASE_CMDS || $forceOutput) {
+		print $OUTPUT;
+	}
+}
+
+MAIN:
+{
+	
+	my $volumes = {};
+	my $jsonVolumes;
+	my $jsonSnaps;
+	my $limit = 0;
+	
+	my %opts;
+	getopts('hNv-:', \%opts) or usage(1);
+	if( $opts{h} || defined( $opts{'-'} ) && $opts{'-'} eq 'help' ) {
+		usage(0);
+		exit(0);
+	}
+	my $noop = $opts{N};
+	$debug = $opts{v};
+
+	if (@ARGV != 1 && @ARGV != 3) {
+		usage(1);
+	}
+	
+	$limit = $ARGV[0];
+	if( $limit !~ /^[1-9][0-9]*$/ ) {
+		usage(1);
+	} elsif ($limit<16) {
+		die "A limit less than 16 does not make sense. The suggested value is 64.\n";
+	}
+	
+	out ("You have set the limit to $limit so I will rebase every " . int ($limit * 0.75) . " (3/4 of the limit)");
+	out ('-----------------------------------------------');
+	out ('');
+	out ('Running simulation ...');
+	out ('----------------------');
+	
+	if (@ARGV == 1) {
+		$jsonSnaps = `storpool -j snapshot list`;
+		$jsonVolumes = `storpool -j volume list`;
+	} else {
+		my $snapsFile = $ARGV[2];
+		$jsonSnaps = readfile $snapsFile;
+		my $volumesFile = $ARGV[1];
+		$jsonVolumes = readfile $volumesFile;
+	}
+	
+	
+	processRaw $volumes, decode_json $jsonSnaps;
+	processRaw $volumes, decode_json $jsonVolumes;
+	calculateDepths ($volumes, $limit);
+	
+	my @rogueList = grep { $ROGUE{$_} == ROGUE_PENDING } keys %ROGUE;
+	while (@rogueList) {
+		debug scalar(@rogueList).' rogue volumes';
+		my $rogueVol = $rogueList[0];
+		out "Starting with $rogueVol ...";
+		debug "Trying $rogueVol";
+
+		my $firstGood=findFirstGoodParent($rogueVol, $volumes);
+		debug "firstGood is $firstGood";
+		my $rebaseVol=findRebaseVol($firstGood, $rogueVol, $volumes, $limit) if $firstGood;
+		if ($rebaseVol) {
+			debug "rebaseVol is $rebaseVol";
+			my ($rebaseVolS, $firstGoodS) = ($rebaseVol, $firstGood);
+			$rebaseVolS =~ s/^[*]//;
+			$firstGoodS =~ s/^[*]//;
+			out ("	OK, will rebase " . $rebaseVolS . " on " . $firstGoodS);
+			push @REBASE_CMDS, "storpool snapshot " . $rebaseVolS . " rebase " . $firstGoodS;
+			simulateRebase ($rebaseVol, $firstGood, $volumes, $limit) ;
+		} else {
+			debug 'no rebaseVol';
+			out ("	Nothing more I can do. Sorry.");
+			last;
+		}
+		out ("");
+		@rogueList = grep { $ROGUE{$_} == ROGUE_PENDING } keys %ROGUE;
+	}
+
+	debug 'done with the rogue list';
+
+	if( !$noop ) {
+		out ('');
+		out ('Performing rebases ...');
+		out ('----------------------');
+	
+		performRebase;
+	} else {
+		out ('');
+		out ('No-operation mode, not performing the rebase');
+		out ('--------------------------------------------');
+		out ($_) for @REBASE_CMDS;
+	}
+	
+	output;
+}
