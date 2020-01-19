@@ -43,27 +43,27 @@ then logvol=log
 fi
 read -p 'base image name? (default=4ernogoria/baseimg): ' basenm
 if [ -z $basenm ]
-then basenm=4ernogoria/baseimg
+then basenm=4ernogoria/baseimg-sp
 fi
 read -p 'oned container img name? (default=4ernogoria/baseimg): ' onednm
 if [ -z $onednm ]
-then onednm=4ernogoria/oned
+then onednm=4ernogoria/oned-sp
 fi
 read -p 'scheduler container img name? (default=4ernogoria/sched): ' schednm
 if [ -z $schednm ]
-then schednm=4ernogoria/sched
+then schednm=4ernogoria/sched-sp
 fi
 read -p 'nginx container img name? (default=4ernogoria/nginx): ' nginxnm
 if [ -z $nginxnm ]
-then nginxnm=4ernogoria/nginx
+then nginxnm=4ernogoria/nginx-sp
 fi
 read -p 'flow container img name? (default=4ernogoria/flow): ' flownm
 if [ -z $flownm ]
-then flownm=4ernogoria/flow
+then flownm=4ernogoria/flow-sp
 fi
 read -p 'gate container img name? (default=4ernogoria/gate): ' gatenm
 if [ -z $gatenm ]
-then gatenm=4ernogoria/gate
+then gatenm=4ernogoria/gate-sp
 fi
 read -p 'folder to store etc/one files into? (default=etc):' etcfiles
 if [ -z $etcfiles ]
@@ -118,8 +118,8 @@ if [ -z $configcrt ]
         	chmod 770 "$deffold" "$deffold"/"$logvol" "$deffold"/"$varfiles" "$deffold"/"$etcfiles" "$deffold"/"$mdbvol" "$deffold"/"$varfiles"/.one "$deffold"/"$mbackvol"
         	echo "oneadmin:$onedpass" > "$deffold"/"$varfiles"/.one/one_auth
         	useradd -u 9869 -M -s /sbin/nologin oneadmin 2>&1 | logger
-        	cd "$deffold"/"$etcfiles" && tar -xvf $currpath/etcdraft.tar 2>&1 | logger
-        	cd "$deffold"/"$varfiles" && tar -xvf $currpath/vardraft.tar 2>&1 | logger
+        	cd "$deffold" && tar -xvf $currpath/etcdraft.tar 2>&1 | logger
+        	cd "$deffold" && tar -xvf $currpath/vardraft.tar 2>&1 | logger
         	chown -R 9869:9869 "$deffold"/"$etcfiles" "$deffold"/"$varfiles"
 #else
 #	echo "file has not been found, no need to do anything, just start containers" 2>&1 | logger
