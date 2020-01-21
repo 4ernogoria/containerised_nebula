@@ -4,7 +4,7 @@ MAINTAINER SharxDC
 COPY mariadb.repo /etc/yum.repos.d/mariadb.repo
 COPY temp.sh /home/oneadmin/temp
 COPY entrypoint.sh /entrypoint.sh
-RUN yum -y install --setopt=tsflags=nodocs rsyslog MariaDB-backup MariaDB-client cronie && yum clean all && chmod +x /entrypoint.sh /home/oneadmin/temp
+RUN yum -y install --setopt=tsflags=nodocs rsyslog MariaDB-backup MariaDB-client cronie && yum clean all && chmod +x /entrypoint.sh /home/oneadmin/temp && touch /var/log/cron
 
 #USER 9869 
 ENTRYPOINT ["/entrypoint.sh"]
