@@ -21,4 +21,4 @@ COPY crontab /etc/crontabs/root
 USER 9869
 WORKDIR /opt/mysql/backup # should be set by a variable
 
-ENTRYPOINT ["init"]
+ENTRYPOINT ["crond -f"]
