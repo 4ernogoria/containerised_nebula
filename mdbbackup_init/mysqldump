@@ -9,6 +9,5 @@ MUSER=oneadmin
 BFOLD=/backup/daily
 DFOLD=/backup/hourly
 DATABASE=opennebula
-touch "$BFOLD"/test-daily-"$NOW"
 $MYSQLDUMP -h $MHOST -u $MUSER --log-error=/var/log/mariadb/mdbdump.log --databases $DATABASE | $GZIP -9 > $BFOLD/backup-$NOW.sql.gz
 rm -rf "$DFOLD"/*
