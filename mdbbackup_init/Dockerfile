@@ -1,24 +1,25 @@
 FROM alpine:latest
-COPY backupmdb /etc/periodic/hourly/
-COPY check.sh /check.sh
-ARG dbpass 
-ENV userpass Sonic2005
-RUN apk update && \
-    apk add --no-cache mariadb-client \
+
+COPY crontab /home/oneadmin/crontab
+COPY  test /home/oneadmin/periodic/15min/test
+COPY  mariabackup /home/oneadmin/periodic/hourly/mariabackup
+COPY  mysqldump /home/oneadmin/periodic/daily/mysqldump
+COPY  cleaner /home/oneadmin/periodic/weekly/cleaner
+COPY entrypoint.sh /entrypoint.sh
+
+RUN /sbin/apk update && \
+    /sbin/apk add --no-cache mariadb-client \
                        tzdata \
                        sudo \
+                       busybox-suid \
                        mariadb-backup && \
-    adduser -u 9869 -D  oneadmin && \
-    echo -e "oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/crond" > /etc/sudoers.d/onedamin && \
-    mkdir -p /var/log/mariadb/ /xtrabackup_backupfiles && \
-    chown -R oneadmin /xtrabackup_backupfiles && \
-    chmod 777 /var/log/mariadb && \
-    chmod a+x /etc/periodic/hourly/* && \
-    chmod a+x /check.sh && \
-    echo -e "[mysqldump] \nhost=127.0.0.1 \nuser=oneadmin \npassword=Sonic2005 \n[client] \nhost=127.0.0.1 \nuser=oneadmin \npassword=Sonic2005" > /etc/my.cnf.d/mysqldump.cnf
-COPY crontab /etc/crontabs/root
+    /usr/sbin/adduser -u 9869 -D oneadmin -s /bin/sh && \
+#    /bin/echo -e "oneadmin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/onedamin && \
+    /bin/mkdir -p /var/log/mariadb/ /backup /home/oneadmin/periodic/15min /home/oneadmin/periodic/hourly /home/oneadmin/periodic/daily /home/oneadmin/periodic/weekly && \
+    /bin/chown -R oneadmin:oneadmin /backup /home/oneadmin && \
+    /bin/chmod 777 /var/log/mariadb && \
+    /bin/chmod a+x /entrypoint.sh /home/oneadmin/periodic/hourly/* /home/oneadmin/periodic/daily/* /home/oneadmin/periodic/weekly/* /home/oneadmin/periodic/15min/*  && \
+#    /usr/bin/crontab -u oneadmin -l /etc/crontabs/oneadmin | /usr/bin/crontab - && \
+    /bin/echo -e "[mysqldump] \nhost=127.0.0.1 \nuser=oneadmin \npassword=Sonic2005 \n[client] \nhost=127.0.0.1 \nuser=oneadmin \npassword=Sonic2005" > /etc/my.cnf.d/mysqldump.cnf
 
-USER 9869
-WORKDIR /opt/mysql/backup # should be set by a variable
-
-ENTRYPOINT ["crond -f"]
+ENTRYPOINT ["/entrypoint.sh"]

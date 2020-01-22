@@ -1,0 +1,17 @@
+#!/bin/sh
+folder_w=/backup
+filename=$(find "$folder_w"/daily -type f -mtime +7)
+#echo $filename
+
+#basically it gradually moves backups week by week starting from the oldest, then chooses the 7days old backup from
+#the daily/folder(which is supposed to have 7 backups according to the number of week days)  and puts in the last_week/
+
+rm -rf "$folder_w"/4weeks_before/*
+mv "$folder_w"/3weeks_before/* "$folder_w"/4weeks_before/
+mv "$folder_w"/week_before/* "$folder_w"/3weeks_before/
+mv "$folder_w"/last_week/* "$folder_w"/week_before/
+mv "folder_w"/daily/"$filename" "$folder_w"/last_week/
+rm -rf "$folder_w"/daily/* 2&>/dev/null
+
+#the backup folder structure looks like
+# root: hourly/ daily/ last_week/ week_before/ 3weeks_before/ 4weeks_before/

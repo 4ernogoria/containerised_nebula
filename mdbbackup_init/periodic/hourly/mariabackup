@@ -1,0 +1,11 @@
+#!/bin/sh
+#define the variables beneath
+GZIP=$(which gzip)
+MARIABACKUP=$(which mariabackup)
+USER=oneadmin
+DB=opennebula
+NOW=$(date '+%M%H%d')
+FILE=mbackup-$NOW.sql.gz
+BDIR=/backup/hourly/
+touch "$BDIR"/test-horly-"$NOW"
+$MARIABACKUP --backup --databases=$DB --target-dir=$BDIR --user=$USER --stream=xbstream | $GZIP > $FILE

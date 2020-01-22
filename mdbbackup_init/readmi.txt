@@ -1,0 +1,3 @@
+Dockerfile defines the  my.cnf content which is important for backups, it has access credentials for the databse backups
+backupmdb.sh makes daily backups to the predefined inside the script forlder
+cleaner_weekly.sh just moves and places archives accordingly to the backup scheme
