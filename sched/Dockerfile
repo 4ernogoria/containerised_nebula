@@ -1,9 +1,5 @@
-ARG image
-FROM "$image"
+FROM 4ernogoria/baseimg 
 MAINTAINER SharxDC
 
-COPY stnebula.sh /entrypoint.sh
-RUN /bin/chmod +x /entrypoint.sh
-
 USER 9869
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/mm_sched"]

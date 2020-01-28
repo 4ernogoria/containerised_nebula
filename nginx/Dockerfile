@@ -1,10 +1,8 @@
-ARG image
-FROM "$image"
+FROM 4ernogoria/baseimg
 MAINTAINER SharxDC
 
-COPY *.repo /etc/yum.repos.d/
+COPY passenger.repo /etc/yum.repos.d/
 COPY stnebula.sh /entrypoint.sh
-#COPY memcached /etc/sysconfig/
 RUN /bin/chmod +x /entrypoint.sh
 
 RUN yum -y install --setopt=tsflags=nodocs epel-release && \
@@ -22,6 +20,8 @@ RUN yum -y install --setopt=tsflags=nodocs epel-release && \
 COPY passenger.conf /etc/nginx/conf.d/
 COPY nginx.conf /etc/nginx/
 
-EXPOSE 80, 29876 
+EXPOSE 80 29876
+ 
+STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/entrypoint.sh"]
